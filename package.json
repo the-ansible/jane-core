@@ -1,0 +1,9 @@
+{
+  "name": "jane-core",
+  "private": true,
+  "description": "Jane's core infrastructure — communication pipeline, event processing, and safety systems",
+  "scripts": {
+    "test": "pnpm -r test:run",
+    "typecheck": "pnpm -r typecheck"
+  }
+}
