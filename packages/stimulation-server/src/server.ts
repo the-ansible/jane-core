@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { uuidv7 } from '@the-ansible/life-system-shared';
 import { getMetrics } from './metrics.js';
 import { getRecentEvents } from './events.js';
+import { getClassifierMetrics } from './classifier/index.js';
 import type { NatsClient } from './nats/client.js';
 import type { SafetyGate } from './safety/index.js';
 
@@ -28,6 +29,7 @@ export function createApp(deps: ServerDeps): Hono {
     return c.json({
       ...getMetrics(),
       safety: deps.safety?.status() ?? null,
+      classification: getClassifierMetrics(),
     });
   });
 

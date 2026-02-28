@@ -1,6 +1,7 @@
 export interface Metrics {
   received: number;
   validated: number;
+  classified: number;
   validationErrors: number;
   errors: number;
   startedAt: string;
@@ -9,6 +10,7 @@ export interface Metrics {
 const metrics: Metrics = {
   received: 0,
   validated: 0,
+  classified: 0,
   validationErrors: 0,
   errors: 0,
   startedAt: new Date().toISOString(),
@@ -28,6 +30,7 @@ export function getMetrics(): Metrics & { uptimeSeconds: number } {
 export function resetMetrics(): void {
   metrics.received = 0;
   metrics.validated = 0;
+  metrics.classified = 0;
   metrics.validationErrors = 0;
   metrics.errors = 0;
   metrics.startedAt = new Date().toISOString();

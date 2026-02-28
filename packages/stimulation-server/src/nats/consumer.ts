@@ -8,6 +8,7 @@ import { communicationEventSchema } from '@the-ansible/life-system-shared';
 import { increment } from '../metrics.js';
 import { pushEvent } from '../events.js';
 import type { SafetyGate } from '../safety/index.js';
+import { classify, type ClassificationResult } from '../classifier/index.js';
 
 const STREAM = 'COMMUNICATION';
 const DURABLE_NAME = 'stimulation-server';
@@ -19,7 +20,7 @@ export function setSafetyGate(gate: SafetyGate): void {
   safetyGate = gate;
 }
 
-export function processMessage(msg: JsMsg): void {
+export async function processMessage(msg: JsMsg): Promise<ClassificationResult | null> {
   increment('received');
 
   let data: unknown;
@@ -34,7 +35,7 @@ export function processMessage(msg: JsMsg): void {
     }));
     increment('validationErrors');
     msg.ack();
-    return;
+    return null;
   }
 
   const result = communicationEventSchema.safeParse(data);
@@ -49,12 +50,27 @@ export function processMessage(msg: JsMsg): void {
     }));
     increment('validationErrors');
     msg.ack(); // ack even on validation failure — invalid messages won't become valid on retry
-    return;
+    return null;
   }
 
   increment('validated');
   safetyGate?.recordProcess();
   safetyGate?.recordSuccess();
+
+  // Classify the event
+  let classification: ClassificationResult | null = null;
+  try {
+    classification = await classify(result.data.content, result.data.channelType, safetyGate);
+    increment('classified');
+  } catch (err) {
+    console.log(JSON.stringify({
+      level: 'error',
+      msg: 'Classification failed',
+      error: String(err),
+      ts: new Date().toISOString(),
+    }));
+  }
+
   pushEvent(result.data, msg.subject);
   console.log(JSON.stringify({
     level: 'info',
@@ -66,11 +82,19 @@ export function processMessage(msg: JsMsg): void {
       sessionId: result.data.sessionId,
       contentPreview: result.data.content.slice(0, 100),
     },
+    classification: classification ? {
+      urgency: classification.urgency,
+      category: classification.category,
+      routing: classification.routing,
+      confidence: classification.confidence,
+      tier: classification.tier,
+    } : null,
     subject: msg.subject,
     ts: new Date().toISOString(),
   }));
 
   msg.ack();
+  return classification;
 }
 
 export async function startConsumer(js: JetStreamClient): Promise<void> {

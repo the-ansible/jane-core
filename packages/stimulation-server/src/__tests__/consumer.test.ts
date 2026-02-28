@@ -17,7 +17,7 @@ const validEvent = {
   channelType: 'message',
   direction: 'inbound',
   contentType: 'markdown',
-  content: 'Test message',
+  content: 'Hello!',  // Use a greeting so rules classifier handles it instantly (no Ollama needed)
   metadata: {},
   timestamp: '2026-02-28T12:00:00.000Z',
 };
@@ -25,9 +25,9 @@ const validEvent = {
 describe('processMessage', () => {
   beforeEach(() => resetMetrics());
 
-  it('processes a valid message and increments counters', () => {
+  it('processes a valid message and increments counters', async () => {
     const msg = makeMockMsg(validEvent);
-    processMessage(msg);
+    await processMessage(msg);
 
     const metrics = getMetrics();
     expect(metrics.received).toBe(1);
@@ -36,9 +36,9 @@ describe('processMessage', () => {
     expect(msg.ack).toHaveBeenCalledOnce();
   });
 
-  it('handles validation failure and still acks', () => {
+  it('handles validation failure and still acks', async () => {
     const msg = makeMockMsg({ id: 'bad' });
-    processMessage(msg);
+    await processMessage(msg);
 
     const metrics = getMetrics();
     expect(metrics.received).toBe(1);
@@ -47,13 +47,13 @@ describe('processMessage', () => {
     expect(msg.ack).toHaveBeenCalledOnce();
   });
 
-  it('handles invalid JSON and still acks', () => {
+  it('handles invalid JSON and still acks', async () => {
     const msg = {
       data: new TextEncoder().encode('not json{{{'),
       subject: 'communication.inbound.message',
       ack: vi.fn(),
     };
-    processMessage(msg as any);
+    await processMessage(msg as any);
 
     const metrics = getMetrics();
     expect(metrics.received).toBe(1);
@@ -61,10 +61,10 @@ describe('processMessage', () => {
     expect(msg.ack).toHaveBeenCalledOnce();
   });
 
-  it('processes multiple messages and accumulates counts', () => {
-    processMessage(makeMockMsg(validEvent));
-    processMessage(makeMockMsg(validEvent));
-    processMessage(makeMockMsg({ bad: true }));
+  it('processes multiple messages and accumulates counts', async () => {
+    await processMessage(makeMockMsg(validEvent));
+    await processMessage(makeMockMsg(validEvent));
+    await processMessage(makeMockMsg({ bad: true }));
 
     const metrics = getMetrics();
     expect(metrics.received).toBe(3);
