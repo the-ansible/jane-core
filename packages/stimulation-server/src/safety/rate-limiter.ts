@@ -10,6 +10,8 @@ export interface RateLimitConfig {
   windowMs: number;
   /** Human-readable name for logging */
   name: string;
+  /** If true, log warnings but don't block. Default: false */
+  alertOnly?: boolean;
 }
 
 export interface RateLimitStatus {
@@ -19,6 +21,9 @@ export interface RateLimitStatus {
   limit: number;
   windowMs: number;
   resetsInMs: number;
+  alertOnly: boolean;
+  /** True if limit is exceeded (regardless of alertOnly mode) */
+  exceeded: boolean;
 }
 
 export class RateLimiter {
@@ -36,10 +41,15 @@ export class RateLimiter {
     return this.timestamps.length <= this.config.limit;
   }
 
-  /** Check if an action would be allowed without recording it */
+  /** Check if an action would be allowed without recording it.
+   *  In alertOnly mode, always returns true but logs a warning when exceeded. */
   check(now = Date.now()): boolean {
     this.prune(now);
-    return this.timestamps.length < this.config.limit;
+    const withinLimit = this.timestamps.length < this.config.limit;
+    if (!withinLimit && this.config.alertOnly) {
+      return true; // alert-only: allow but caller can check exceeded via status()
+    }
+    return withinLimit;
   }
 
   /** Get current status */
@@ -49,14 +59,17 @@ export class RateLimiter {
     const resetsInMs = oldest
       ? Math.max(0, oldest + this.config.windowMs - now)
       : 0;
+    const exceeded = this.timestamps.length >= this.config.limit;
 
     return {
       name: this.config.name,
-      allowed: this.timestamps.length < this.config.limit,
+      allowed: this.config.alertOnly ? true : !exceeded,
       current: this.timestamps.length,
       limit: this.config.limit,
       windowMs: this.config.windowMs,
       resetsInMs,
+      alertOnly: this.config.alertOnly ?? false,
+      exceeded,
     };
   }
 
@@ -73,8 +86,12 @@ export class RateLimiter {
   }
 }
 
-// --- Default rate limiters per spec ---
+// --- Default rate limiters ---
+// Alert-only mode: track usage and warn when exceeded, but don't block.
+// No cost concern on Max 5x — worst case is hitting API throughput limits.
+// These thresholds exist to establish baselines and detect anomalies, not to enforce budgets.
 
+const ONE_MINUTE = 60 * 1000;
 const ONE_HOUR = 60 * 60 * 1000;
 
 export function createDefaultLimiters() {
@@ -82,22 +99,26 @@ export function createDefaultLimiters() {
     outboundMessages: new RateLimiter({
       name: 'outbound_messages',
       limit: 30,
-      windowMs: ONE_HOUR,
+      windowMs: ONE_MINUTE,
+      alertOnly: true,
     }),
     llmLocal: new RateLimiter({
       name: 'llm_local',
       limit: 100,
-      windowMs: ONE_HOUR,
+      windowMs: ONE_MINUTE,
+      alertOnly: true,
     }),
     llmClaude: new RateLimiter({
       name: 'llm_claude',
       limit: 10,
-      windowMs: ONE_HOUR,
+      windowMs: ONE_MINUTE,
+      alertOnly: true,
     }),
     totalEvents: new RateLimiter({
       name: 'total_events',
       limit: 500,
       windowMs: ONE_HOUR,
+      alertOnly: true,
     }),
   };
 }

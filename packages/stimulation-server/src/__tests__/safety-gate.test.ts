@@ -2,12 +2,26 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { SafetyGate } from '../safety/index.js';
 import { createDefaultBreakers } from '../safety/circuit-breaker.js';
 import { MemoryMonitor } from '../safety/circuit-breaker.js';
+import { RateLimiter } from '../safety/rate-limiter.js';
 
 function createTestGate() {
   const breakers = createDefaultBreakers();
   // Use a very high memory threshold so tests don't fail due to Vitest RSS
   (breakers as any).memory = new MemoryMonitor(4096);
   return new SafetyGate({ breakers });
+}
+
+/** Create a gate with enforcing (non-alertOnly) rate limiters for testing blocking behavior */
+function createEnforcingGate() {
+  const breakers = createDefaultBreakers();
+  (breakers as any).memory = new MemoryMonitor(4096);
+  const limiters = {
+    outboundMessages: new RateLimiter({ name: 'outbound_messages', limit: 30, windowMs: 60_000, alertOnly: false }),
+    llmLocal: new RateLimiter({ name: 'llm_local', limit: 100, windowMs: 60_000, alertOnly: false }),
+    llmClaude: new RateLimiter({ name: 'llm_claude', limit: 10, windowMs: 60_000, alertOnly: false }),
+    totalEvents: new RateLimiter({ name: 'total_events', limit: 500, windowMs: 3_600_000, alertOnly: false }),
+  };
+  return new SafetyGate({ limiters, breakers });
 }
 
 describe('SafetyGate', () => {
@@ -41,18 +55,25 @@ describe('SafetyGate', () => {
     });
   });
 
-  describe('canSend', () => {
+  describe('canSend (alert-only mode — default)', () => {
     it('allows sends within rate limit', () => {
       expect(gate.canSend().allowed).toBe(true);
     });
 
-    it('blocks after outbound rate limit exceeded', () => {
+    it('still allows when rate limit exceeded in alert-only mode', () => {
+      // Spread sends across time to avoid triggering flood detector (10/min circuit breaker)
+      // Rate limit is 30/min, flood is 10/min — so we need to exceed 30 without 11 in one minute
       const now = Date.now();
+      // Send 10 in minute 1, 10 in minute 2, 10 in minute 3 — 30 within the 1-min rate window won't work
+      // Instead: just record directly to the rate limiter to test alert-only behavior
       for (let i = 0; i < 30; i++) {
-        gate.recordSend(now);
+        gate.limiters.outboundMessages.record(now);
       }
-      expect(gate.canSend(now).allowed).toBe(false);
-      expect(gate.canSend(now).reasons[0]).toContain('Outbound rate limit');
+      // Alert-only: allowed is still true, but status shows exceeded
+      expect(gate.canSend(now).allowed).toBe(true);
+      const status = gate.status(now);
+      expect(status.rateLimits.outbound_messages.exceeded).toBe(true);
+      expect(status.rateLimits.outbound_messages.alertOnly).toBe(true);
     });
 
     it('blocks when consecutive error breaker is open', () => {
@@ -74,20 +95,35 @@ describe('SafetyGate', () => {
     });
   });
 
+  describe('canSend (enforcing mode)', () => {
+    it('blocks after outbound rate limit exceeded', () => {
+      const enforcing = createEnforcingGate();
+      const now = Date.now();
+      for (let i = 0; i < 30; i++) {
+        enforcing.recordSend(now);
+      }
+      expect(enforcing.canSend(now).allowed).toBe(false);
+      expect(enforcing.canSend(now).reasons[0]).toContain('Outbound rate limit');
+    });
+  });
+
   describe('canCallLocalLlm', () => {
     it('allows within limits', () => {
       expect(gate.canCallLocalLlm('chat').allowed).toBe(true);
     });
 
-    it('blocks when rate limited', () => {
+    it('still allows in alert-only mode when rate exceeded', () => {
       const now = Date.now();
       for (let i = 0; i < 100; i++) {
-        gate.recordLlmCall('local', 'chat', now);
+        gate.recordLlmCall('local', `type-${i}`, now); // different types to avoid loop detection
       }
-      expect(gate.canCallLocalLlm('chat', now).allowed).toBe(false);
+      // Alert-only: still allowed
+      expect(gate.canCallLocalLlm('new-type', now).allowed).toBe(true);
+      const status = gate.status(now);
+      expect(status.rateLimits.llm_local.exceeded).toBe(true);
     });
 
-    it('blocks when LLM loop detected', () => {
+    it('blocks when LLM loop detected (circuit breaker, not rate limit)', () => {
       const now = Date.now();
       // 3 calls per event type threshold
       gate.recordLlmCall('local', 'chat', now);
@@ -100,12 +136,24 @@ describe('SafetyGate', () => {
   });
 
   describe('canCallClaude', () => {
-    it('blocks after Claude rate limit', () => {
+    it('still allows in alert-only mode when rate exceeded', () => {
       const now = Date.now();
       for (let i = 0; i < 10; i++) {
-        gate.recordLlmCall('claude', `type-${i}`, now); // different types to avoid loop detection
+        gate.recordLlmCall('claude', `type-${i}`, now);
       }
-      expect(gate.canCallClaude('new-type', now).allowed).toBe(false);
+      // Alert-only: still allowed
+      expect(gate.canCallClaude('new-type', now).allowed).toBe(true);
+      const status = gate.status(now);
+      expect(status.rateLimits.llm_claude.exceeded).toBe(true);
+    });
+
+    it('blocks in enforcing mode when rate exceeded', () => {
+      const enforcing = createEnforcingGate();
+      const now = Date.now();
+      for (let i = 0; i < 10; i++) {
+        enforcing.recordLlmCall('claude', `type-${i}`, now);
+      }
+      expect(enforcing.canCallClaude('new-type', now).allowed).toBe(false);
     });
   });
 
@@ -114,12 +162,15 @@ describe('SafetyGate', () => {
       expect(gate.canProcess().allowed).toBe(true);
     });
 
-    it('blocks after total event limit exceeded', () => {
+    it('still allows in alert-only mode when total exceeded', () => {
       const now = Date.now();
       for (let i = 0; i < 500; i++) {
         gate.recordProcess(now);
       }
-      expect(gate.canProcess(now).allowed).toBe(false);
+      // Alert-only: still allowed
+      expect(gate.canProcess(now).allowed).toBe(true);
+      const status = gate.status(now);
+      expect(status.rateLimits.total_events.exceeded).toBe(true);
     });
   });
 

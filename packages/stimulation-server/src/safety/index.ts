@@ -8,6 +8,7 @@ import {
   createDefaultBreakers,
   type CircuitBreakers,
 } from './circuit-breaker.js';
+import type { NatsClient } from '../nats/client.js';
 
 export interface SafetyCheckResult {
   allowed: boolean;
@@ -16,7 +17,7 @@ export interface SafetyCheckResult {
 
 export interface SafetyStatus {
   paused: boolean;
-  rateLimits: Record<string, { allowed: boolean; current: number; limit: number }>;
+  rateLimits: Record<string, { allowed: boolean; current: number; limit: number; alertOnly: boolean; exceeded: boolean }>;
   circuitBreakers: Record<string, { state: string; failures?: number; tripped?: boolean }>;
   llmLoop: { blockedTypes: string[] };
   memory: { rssBytes: number; underPressure: boolean };
@@ -36,6 +37,7 @@ export class SafetyGate {
   readonly limiters: RateLimiters;
   readonly breakers: CircuitBreakers;
   private paused = false;
+  private nats: NatsClient | null = null;
 
   constructor(opts?: {
     limiters?: RateLimiters;
@@ -43,6 +45,32 @@ export class SafetyGate {
   }) {
     this.limiters = opts?.limiters || createDefaultLimiters();
     this.breakers = opts?.breakers || createDefaultBreakers();
+  }
+
+  /** Set NATS client for publishing alert events */
+  setNats(nats: NatsClient): void {
+    this.nats = nats;
+  }
+
+  /** Publish an alert event to NATS for visibility */
+  private async publishAlert(alertType: string, details: Record<string, unknown>): Promise<void> {
+    if (!this.nats?.isConnected()) return;
+    try {
+      await this.nats.publish('communication.internal.safety-alert', {
+        id: `alert-${Date.now()}`,
+        sessionId: 'system',
+        channelType: 'internal',
+        direction: 'outbound' as const,
+        contentType: 'markdown' as const,
+        content: `Safety alert: ${alertType}`,
+        sender: { id: 'safety-gate', type: 'system' },
+        recipients: [{ id: 'jane', type: 'agent' }],
+        metadata: { alertType, ...details },
+        timestamp: new Date().toISOString(),
+      });
+    } catch {
+      // Don't let alert publishing failures cascade
+    }
   }
 
   // --- Manual override ---
@@ -68,9 +96,20 @@ export class SafetyGate {
     const reasons: string[] = [];
 
     if (this.paused) reasons.push('System paused by manual override');
-    if (!this.limiters.outboundMessages.check(now)) reasons.push('Outbound rate limit exceeded (30/hr)');
+
+    const outboundStatus = this.limiters.outboundMessages.status(now);
+    if (outboundStatus.exceeded) {
+      const msg = `Outbound rate limit exceeded (${outboundStatus.current}/${outboundStatus.limit} per window)`;
+      if (outboundStatus.alertOnly) {
+        log('RATE ALERT: ' + msg, { limiter: 'outbound_messages', current: outboundStatus.current, limit: outboundStatus.limit });
+        this.publishAlert('rate-limit-exceeded', { limiter: 'outbound_messages', current: outboundStatus.current, limit: outboundStatus.limit });
+      } else {
+        reasons.push(msg);
+      }
+    }
+
     if (!this.breakers.consecutiveErrors.isAllowed(now)) reasons.push('Circuit breaker open: consecutive errors');
-    if (this.breakers.outboundFlood.isTripped()) reasons.push('Outbound flood detected (>10/min)');
+    if (this.breakers.outboundFlood.isTripped()) reasons.push('Outbound flood detected');
     if (this.breakers.memory.isUnderPressure()) reasons.push('Memory pressure — shedding load');
 
     return { allowed: reasons.length === 0, reasons };
@@ -90,7 +129,18 @@ export class SafetyGate {
     const reasons: string[] = [];
 
     if (this.paused) reasons.push('System paused by manual override');
-    if (!this.limiters.llmLocal.check(now)) reasons.push('Local LLM rate limit exceeded (100/hr)');
+
+    const localStatus = this.limiters.llmLocal.status(now);
+    if (localStatus.exceeded) {
+      const msg = `Local LLM rate limit exceeded (${localStatus.current}/${localStatus.limit} per window)`;
+      if (localStatus.alertOnly) {
+        log('RATE ALERT: ' + msg, { limiter: 'llm_local', current: localStatus.current, limit: localStatus.limit });
+        this.publishAlert('rate-limit-exceeded', { limiter: 'llm_local', current: localStatus.current, limit: localStatus.limit });
+      } else {
+        reasons.push(msg);
+      }
+    }
+
     if (this.breakers.llmLoop.isBlocked(eventType)) reasons.push(`LLM loop detected for event type: ${eventType}`);
     if (this.breakers.memory.isUnderPressure()) reasons.push('Memory pressure — shedding load');
 
@@ -102,7 +152,18 @@ export class SafetyGate {
     const reasons: string[] = [];
 
     if (this.paused) reasons.push('System paused by manual override');
-    if (!this.limiters.llmClaude.check(now)) reasons.push('Claude rate limit exceeded (10/hr)');
+
+    const claudeStatus = this.limiters.llmClaude.status(now);
+    if (claudeStatus.exceeded) {
+      const msg = `Claude rate limit exceeded (${claudeStatus.current}/${claudeStatus.limit} per window)`;
+      if (claudeStatus.alertOnly) {
+        log('RATE ALERT: ' + msg, { limiter: 'llm_claude', current: claudeStatus.current, limit: claudeStatus.limit });
+        this.publishAlert('rate-limit-exceeded', { limiter: 'llm_claude', current: claudeStatus.current, limit: claudeStatus.limit });
+      } else {
+        reasons.push(msg);
+      }
+    }
+
     if (this.breakers.llmLoop.isBlocked(eventType)) reasons.push(`LLM loop detected for event type: ${eventType}`);
     if (!this.breakers.consecutiveErrors.isAllowed(now)) reasons.push('Circuit breaker open: consecutive errors');
 
@@ -114,7 +175,17 @@ export class SafetyGate {
     const reasons: string[] = [];
 
     if (this.paused) reasons.push('System paused by manual override');
-    if (!this.limiters.totalEvents.check(now)) reasons.push('Total event rate limit exceeded (500/hr)');
+
+    const totalStatus = this.limiters.totalEvents.status(now);
+    if (totalStatus.exceeded) {
+      const msg = `Total event rate limit exceeded (${totalStatus.current}/${totalStatus.limit} per window)`;
+      if (totalStatus.alertOnly) {
+        log('RATE ALERT: ' + msg, { limiter: 'total_events', current: totalStatus.current, limit: totalStatus.limit });
+        this.publishAlert('rate-limit-exceeded', { limiter: 'total_events', current: totalStatus.current, limit: totalStatus.limit });
+      } else {
+        reasons.push(msg);
+      }
+    }
 
     return { allowed: reasons.length === 0, reasons };
   }
@@ -166,10 +237,10 @@ export class SafetyGate {
     return {
       paused: this.paused,
       rateLimits: {
-        outbound_messages: { allowed: outboundStatus.allowed, current: outboundStatus.current, limit: outboundStatus.limit },
-        llm_local: { allowed: llmLocalStatus.allowed, current: llmLocalStatus.current, limit: llmLocalStatus.limit },
-        llm_claude: { allowed: llmClaudeStatus.allowed, current: llmClaudeStatus.current, limit: llmClaudeStatus.limit },
-        total_events: { allowed: totalStatus.allowed, current: totalStatus.current, limit: totalStatus.limit },
+        outbound_messages: { allowed: outboundStatus.allowed, current: outboundStatus.current, limit: outboundStatus.limit, alertOnly: outboundStatus.alertOnly, exceeded: outboundStatus.exceeded },
+        llm_local: { allowed: llmLocalStatus.allowed, current: llmLocalStatus.current, limit: llmLocalStatus.limit, alertOnly: llmLocalStatus.alertOnly, exceeded: llmLocalStatus.exceeded },
+        llm_claude: { allowed: llmClaudeStatus.allowed, current: llmClaudeStatus.current, limit: llmClaudeStatus.limit, alertOnly: llmClaudeStatus.alertOnly, exceeded: llmClaudeStatus.exceeded },
+        total_events: { allowed: totalStatus.allowed, current: totalStatus.current, limit: totalStatus.limit, alertOnly: totalStatus.alertOnly, exceeded: totalStatus.exceeded },
       },
       circuitBreakers: {
         consecutive_errors: { state: errorStatus.state, failures: errorStatus.failures },

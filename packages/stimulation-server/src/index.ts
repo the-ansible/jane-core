@@ -25,6 +25,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
 (async () => {
   try {
     deps.nats = await createNatsClient(NATS_URL);
+    safety.setNats(deps.nats);
     // Start consumer in background (infinite loop)
     startConsumer(deps.nats.js).catch((err) => {
       console.log(JSON.stringify({
