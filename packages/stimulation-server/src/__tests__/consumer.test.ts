@@ -1,4 +1,28 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Mock pipeline and agent/composer to prevent Claude CLI spawns during tests
+vi.mock('../pipeline.js', () => ({
+  processPipeline: vi.fn().mockResolvedValue({
+    action: 'reply',
+    reason: 'test',
+    responded: false,
+  }),
+}));
+
+vi.mock('../agent/index.js', () => ({
+  invokeAgent: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../composer/index.js', () => ({
+  compose: vi.fn().mockResolvedValue(null),
+}));
+
+import { mkdtempSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+process.env.SESSIONS_DIR = mkdtempSync(join(tmpdir(), 'consumer-test-'));
+
 import { processMessage } from '../nats/consumer.js';
 import { resetMetrics, getMetrics } from '../metrics.js';
 

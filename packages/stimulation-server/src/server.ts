@@ -3,6 +3,7 @@ import { uuidv7 } from '@the-ansible/life-system-shared';
 import { getMetrics } from './metrics.js';
 import { getRecentEvents } from './events.js';
 import { getClassifierMetrics } from './classifier/index.js';
+import { listSessions, getMessageCount } from './sessions/store.js';
 import type { NatsClient } from './nats/client.js';
 import type { SafetyGate } from './safety/index.js';
 
@@ -26,10 +27,15 @@ export function createApp(deps: ServerDeps): Hono {
   });
 
   app.get('/metrics', (c) => {
+    const sessionIds = listSessions();
     return c.json({
       ...getMetrics(),
       safety: deps.safety?.status() ?? null,
       classification: getClassifierMetrics(),
+      sessions: {
+        active: sessionIds.length,
+        totalMessages: sessionIds.reduce((sum, id) => sum + getMessageCount(id), 0),
+      },
     });
   });
 
@@ -107,15 +113,27 @@ export function createApp(deps: ServerDeps): Hono {
     const body = await c.req.json<{
       message?: string;
       channelType?: string;
+      sessionId?: string;
+      senderName?: string;
     }>();
 
     const event = {
       id: uuidv7(),
-      sessionId: 'loopback-test',
-      channelType: body.channelType || 'message',
+      sessionId: body.sessionId || 'loopback-test',
+      channelType: body.channelType || 'realtime',
       direction: 'inbound' as const,
       contentType: 'markdown' as const,
       content: body.message || 'Test inbound message from admin API',
+      sender: {
+        id: 'admin',
+        displayName: body.senderName || 'Admin',
+        type: 'person' as const,
+      },
+      recipients: [{
+        id: 'jane',
+        displayName: 'Jane',
+        type: 'agent' as const,
+      }],
       metadata: { loopback: true },
       timestamp: new Date().toISOString(),
     };

@@ -205,7 +205,7 @@ describe('POST /api/test/inbound', () => {
     const body = await res.json();
     expect(res.status).toBe(200);
     expect(body.published).toBe(true);
-    expect(body.subject).toBe('communication.inbound.message');
+    expect(body.subject).toBe('communication.inbound.realtime');
     expect(mockNats.publish).toHaveBeenCalledOnce();
   });
 });
