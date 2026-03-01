@@ -11,6 +11,7 @@ import type { SafetyGate } from './safety/index.js';
 import { route, type RouteDecision } from './router/index.js';
 import { invokeAgent, type AgentIntent } from './agent/index.js';
 import { compose } from './composer/index.js';
+import { recordPipelineOutcome } from './pipeline-stats.js';
 import {
   getSession,
   appendMessage,
@@ -66,17 +67,27 @@ export async function processPipeline(
   });
 
   // 3. Dispatch based on route decision
+  const pipelineStart = Date.now();
+
   switch (decision.action) {
-    case 'log':
-      return { action: 'log', reason: decision.reason, responded: false };
+    case 'log': {
+      const result = { action: 'log', reason: decision.reason, responded: false };
+      recordPipelineOutcome({ action: 'log', responded: false, totalMs: Date.now() - pipelineStart });
+      return result;
+    }
 
     case 'reply':
     case 'think':
-    case 'escalate':
-      return await handleAgentResponse(event, classification, decision, senderName, deps);
+    case 'escalate': {
+      const result = await handleAgentResponse(event, classification, decision, senderName, deps, pipelineStart);
+      return result;
+    }
 
-    default:
-      return { action: decision.action, reason: decision.reason, responded: false };
+    default: {
+      const result = { action: decision.action, reason: decision.reason, responded: false };
+      recordPipelineOutcome({ action: decision.action, responded: false, totalMs: Date.now() - pipelineStart });
+      return result;
+    }
   }
 }
 
@@ -85,7 +96,8 @@ async function handleAgentResponse(
   classification: ClassificationResult,
   decision: RouteDecision,
   senderName: string,
-  deps: PipelineDeps
+  deps: PipelineDeps,
+  pipelineStart: number
 ): Promise<PipelineResult> {
   // Safety check before Claude calls
   if (deps.safety) {
@@ -98,6 +110,10 @@ async function handleAgentResponse(
         reasons: claudeCheck.reasons,
         ts: new Date().toISOString(),
       }));
+      recordPipelineOutcome({
+        action: decision.action, responded: false, totalMs: Date.now() - pipelineStart,
+        error: 'Blocked by safety',
+      });
       return {
         action: decision.action,
         reason: 'Blocked by safety: ' + claudeCheck.reasons.join(', '),
@@ -111,14 +127,20 @@ async function handleAgentResponse(
 
   // 4. Invoke Agent
   deps.safety?.recordLlmCall('claude', event.channelType);
+  const agentStart = Date.now();
   const intent = await invokeAgent({
     content: event.content,
     senderName,
     classification,
     sessionHistory,
   });
+  const agentMs = Date.now() - agentStart;
 
   if (!intent) {
+    recordPipelineOutcome({
+      action: decision.action, responded: false, agentMs, totalMs: Date.now() - pipelineStart,
+      error: 'Agent returned no intent',
+    });
     return {
       action: decision.action,
       reason: decision.reason,
@@ -130,13 +152,19 @@ async function handleAgentResponse(
 
   // 5. Compose in Jane's voice
   deps.safety?.recordLlmCall('claude', event.channelType);
+  const composerStart = Date.now();
   const composedMessage = await compose({
     intent,
     sessionHistory,
     senderName,
   });
+  const composerMs = Date.now() - composerStart;
 
   if (!composedMessage) {
+    recordPipelineOutcome({
+      action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
+      error: 'Composer returned no message',
+    });
     return {
       action: decision.action,
       reason: decision.reason,
@@ -148,6 +176,10 @@ async function handleAgentResponse(
 
   // 6. Publish outbound response
   if (!deps.nats?.isConnected()) {
+    recordPipelineOutcome({
+      action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
+      error: 'NATS not connected',
+    });
     return {
       action: decision.action,
       reason: decision.reason,
@@ -222,6 +254,10 @@ async function handleAgentResponse(
       });
     }
 
+    recordPipelineOutcome({
+      action: decision.action, responded: true, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
+    });
+
     return {
       action: decision.action,
       reason: decision.reason,
@@ -237,6 +273,11 @@ async function handleAgentResponse(
       error: String(err),
       ts: new Date().toISOString(),
     }));
+
+    recordPipelineOutcome({
+      action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
+      error: `Publish failed: ${err}`,
+    });
 
     return {
       action: decision.action,

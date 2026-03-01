@@ -1,7 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+process.env.SESSIONS_DIR = mkdtempSync(join(tmpdir(), 'server-test-'));
+
 import { createApp, type ServerDeps } from '../server.js';
 import { resetMetrics, increment } from '../metrics.js';
 import { pushEvent, clearEvents } from '../events.js';
+import { appendMessage, clearAllSessions } from '../sessions/store.js';
+import { recordPipelineOutcome, resetPipelineStats } from '../pipeline-stats.js';
 import type { NatsClient } from '../nats/client.js';
 
 function makeMockNats(connected: boolean): NatsClient {
@@ -207,5 +215,88 @@ describe('POST /api/test/inbound', () => {
     expect(body.published).toBe(true);
     expect(body.subject).toBe('communication.inbound.realtime');
     expect(mockNats.publish).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Session endpoints', () => {
+  beforeEach(() => {
+    clearAllSessions();
+  });
+
+  it('lists active sessions', async () => {
+    appendMessage('sess-a', { role: 'user', content: 'hi', timestamp: new Date().toISOString() });
+    appendMessage('sess-b', { role: 'user', content: 'hey', timestamp: new Date().toISOString() });
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/sessions');
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.count).toBe(2);
+    expect(body.sessions.map((s: any) => s.sessionId).sort()).toEqual(['sess-a', 'sess-b']);
+  });
+
+  it('returns session details with messages', async () => {
+    appendMessage('sess-detail', { role: 'user', content: 'Hello Jane', timestamp: '2026-03-01T00:00:00Z' });
+    appendMessage('sess-detail', { role: 'assistant', content: 'Hey!', timestamp: '2026-03-01T00:00:01Z' });
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/sessions/sess-detail');
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.sessionId).toBe('sess-detail');
+    expect(body.messageCount).toBe(2);
+    expect(body.messages.length).toBe(2);
+    expect(body.messages[0].content).toBe('Hello Jane');
+    expect(body.messages[1].content).toBe('Hey!');
+  });
+
+  it('respects limit parameter', async () => {
+    for (let i = 0; i < 10; i++) {
+      appendMessage('sess-limit', { role: 'user', content: `msg ${i}`, timestamp: new Date().toISOString() });
+    }
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/sessions/sess-limit?limit=3');
+    const body = await res.json();
+    expect(body.messages.length).toBe(3);
+    expect(body.messageCount).toBe(10); // total is still 10
+  });
+});
+
+describe('Pipeline stats endpoint', () => {
+  beforeEach(() => {
+    resetPipelineStats();
+  });
+
+  it('returns pipeline stats', async () => {
+    recordPipelineOutcome({ action: 'reply', responded: true, agentMs: 6000, composerMs: 4000, totalMs: 10000 });
+    recordPipelineOutcome({ action: 'log', responded: false, totalMs: 2 });
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/pipeline');
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.total).toBe(2);
+    expect(body.responded).toBe(1);
+    expect(body.latency.agent.count).toBe(1);
+    expect(body.latency.agent.avg).toBe(6000);
+    expect(body.byAction.reply).toEqual({ count: 1, responded: 1 });
+    expect(body.byAction.log).toEqual({ count: 1, responded: 0 });
+  });
+
+  it('appears in /metrics too', async () => {
+    recordPipelineOutcome({ action: 'reply', responded: true, agentMs: 5000, composerMs: 3000, totalMs: 8000 });
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/metrics');
+    const body = await res.json();
+    expect(body.pipeline).toBeDefined();
+    expect(body.pipeline.total).toBe(1);
+    expect(body.pipeline.latency.agent.avg).toBe(5000);
   });
 });

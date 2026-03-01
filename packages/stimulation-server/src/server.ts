@@ -3,7 +3,8 @@ import { uuidv7 } from '@the-ansible/life-system-shared';
 import { getMetrics } from './metrics.js';
 import { getRecentEvents } from './events.js';
 import { getClassifierMetrics } from './classifier/index.js';
-import { listSessions, getMessageCount } from './sessions/store.js';
+import { listSessions, getMessageCount, getSession, getContextMessages } from './sessions/store.js';
+import { getPipelineStats } from './pipeline-stats.js';
 import type { NatsClient } from './nats/client.js';
 import type { SafetyGate } from './safety/index.js';
 
@@ -32,6 +33,7 @@ export function createApp(deps: ServerDeps): Hono {
       ...getMetrics(),
       safety: deps.safety?.status() ?? null,
       classification: getClassifierMetrics(),
+      pipeline: getPipelineStats(),
       sessions: {
         active: sessionIds.length,
         totalMessages: sessionIds.reduce((sum, id) => sum + getMessageCount(id), 0),
@@ -155,6 +157,44 @@ export function createApp(deps: ServerDeps): Hono {
       subject,
       note: 'Check GET /api/events/recent to see it arrive',
     });
+  });
+
+  // --- Session inspection endpoints ---
+
+  app.get('/api/sessions', (c) => {
+    const sessionIds = listSessions();
+    const sessions = sessionIds.map(id => {
+      const session = getSession(id);
+      return {
+        sessionId: id,
+        messageCount: session.messages.length,
+        createdAt: session.createdAt,
+        lastActivityAt: session.lastActivityAt,
+      };
+    });
+    return c.json({ sessions, count: sessions.length });
+  });
+
+  app.get('/api/sessions/:id', (c) => {
+    const sessionId = c.req.param('id');
+    const limit = parseInt(c.req.query('limit') || '50', 10);
+    const session = getSession(sessionId);
+    const messages = getContextMessages(sessionId, limit);
+
+    return c.json({
+      sessionId: session.sessionId,
+      messageCount: session.messages.length,
+      createdAt: session.createdAt,
+      lastActivityAt: session.lastActivityAt,
+      metadata: session.metadata,
+      messages,
+    });
+  });
+
+  // --- Pipeline stats endpoint ---
+
+  app.get('/api/pipeline', (c) => {
+    return c.json(getPipelineStats());
   });
 
   // --- Safety control endpoints ---
