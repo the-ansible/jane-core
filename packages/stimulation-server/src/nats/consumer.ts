@@ -16,6 +16,32 @@ const STREAM = 'COMMUNICATION';
 const DURABLE_NAME = 'stimulation-server';
 const FILTER_SUBJECT = 'communication.inbound.>';
 
+// Deduplication: track recently processed event IDs to prevent reprocessing on redelivery
+const DEDUP_MAX_SIZE = 500;
+const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const processedEvents = new Map<string, number>(); // eventId → timestamp
+
+function isDuplicate(eventId: string): boolean {
+  const now = Date.now();
+
+  // Prune expired entries periodically (every 100 checks)
+  if (processedEvents.size > DEDUP_MAX_SIZE) {
+    for (const [id, ts] of processedEvents) {
+      if (now - ts > DEDUP_TTL_MS) processedEvents.delete(id);
+    }
+  }
+
+  if (processedEvents.has(eventId)) return true;
+
+  processedEvents.set(eventId, now);
+  return false;
+}
+
+/** Clear dedup cache (for testing) */
+export function clearDedupCache(): void {
+  processedEvents.clear();
+}
+
 let safetyGate: SafetyGate | null = null;
 let natsClient: NatsClient | null = null;
 
@@ -61,6 +87,21 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
   }
 
   increment('validated');
+
+  // Deduplication check — skip redelivered messages
+  if (isDuplicate(result.data.id)) {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'Duplicate event skipped',
+      eventId: result.data.id,
+      subject: msg.subject,
+      ts: new Date().toISOString(),
+    }));
+    increment('deduplicated');
+    msg.ack();
+    return null;
+  }
+
   safetyGate?.recordProcess();
   safetyGate?.recordSuccess();
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, beforeAll } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -202,6 +202,77 @@ describe('Session Store', () => {
 
     it('returns 0 for unknown session', () => {
       expect(getMessageCount('unknown')).toBe(0);
+    });
+
+    it('discovers sessions from disk not yet in memory', () => {
+      // Create a session file on disk manually (simulating a previous run)
+      const sessDir = process.env.SESSIONS_DIR!;
+      writeFileSync(
+        join(sessDir, 'disk-only-session.jsonl'),
+        JSON.stringify({ type: 'meta', createdAt: '2026-03-01T00:00:00Z', metadata: {} }) + '\n' +
+        JSON.stringify({ type: 'message', message: { role: 'user', content: 'from disk', timestamp: '2026-03-01T00:00:01Z' } }) + '\n'
+      );
+
+      // Also create an in-memory session
+      getSession('in-memory-session');
+
+      const ids = listSessions();
+      expect(ids).toContain('disk-only-session');
+      expect(ids).toContain('in-memory-session');
+    });
+
+    it('ignores .tmp files during disk discovery', () => {
+      const sessDir = process.env.SESSIONS_DIR!;
+      writeFileSync(join(sessDir, 'real-session.jsonl'), '{}');
+      writeFileSync(join(sessDir, 'partial-write.jsonl.tmp'), '{}');
+
+      const ids = listSessions();
+      expect(ids).toContain('real-session');
+      expect(ids).not.toContain('partial-write.jsonl');
+      expect(ids).not.toContain('partial-write');
+    });
+  });
+
+  describe('atomic writes', () => {
+    it('compaction does not leave .tmp files behind', async () => {
+      for (let i = 0; i < 45; i++) {
+        appendMessage('sess-atomic', {
+          role: i % 2 === 0 ? 'user' : 'assistant',
+          content: `Message ${i}`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const mockSummarize = async (msgs: SessionMessage[]) =>
+        `Summary of ${msgs.length} messages`;
+
+      await compactSession('sess-atomic', mockSummarize);
+
+      const sessDir = process.env.SESSIONS_DIR!;
+      expect(existsSync(join(sessDir, 'sess-atomic.jsonl'))).toBe(true);
+      expect(existsSync(join(sessDir, 'sess-atomic.jsonl.tmp'))).toBe(false);
+    });
+
+    it('session data survives compaction (can reload from disk)', async () => {
+      for (let i = 0; i < 45; i++) {
+        appendMessage('sess-reload', {
+          role: 'user',
+          content: `Msg ${i}`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      const mockSummarize = async (msgs: SessionMessage[]) =>
+        `Summarized ${msgs.length} messages`;
+
+      await compactSession('sess-reload', mockSummarize);
+
+      // Clear memory and reload from disk
+      clearAllSessions();
+      const reloaded = getSession('sess-reload');
+      expect(reloaded.messages.length).toBe(11); // 1 summary + 10 recent
+      expect(reloaded.messages[0].role).toBe('system');
+      expect(reloaded.messages[0].content).toContain('Summarized 35 messages');
     });
   });
 });

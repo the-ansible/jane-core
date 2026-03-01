@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os';
 
 process.env.SESSIONS_DIR = mkdtempSync(join(tmpdir(), 'consumer-test-'));
 
-import { processMessage } from '../nats/consumer.js';
+import { processMessage, clearDedupCache } from '../nats/consumer.js';
 import { resetMetrics, getMetrics } from '../metrics.js';
 
 function makeMockMsg(data: unknown): any {
@@ -47,7 +47,10 @@ const validEvent = {
 };
 
 describe('processMessage', () => {
-  beforeEach(() => resetMetrics());
+  beforeEach(() => {
+    resetMetrics();
+    clearDedupCache();
+  });
 
   it('processes a valid message and increments counters', async () => {
     const msg = makeMockMsg(validEvent);
@@ -86,13 +89,37 @@ describe('processMessage', () => {
   });
 
   it('processes multiple messages and accumulates counts', async () => {
-    await processMessage(makeMockMsg(validEvent));
-    await processMessage(makeMockMsg(validEvent));
+    await processMessage(makeMockMsg({ ...validEvent, id: '019502e4-1234-7000-8000-000000000001' }));
+    await processMessage(makeMockMsg({ ...validEvent, id: '019502e4-1234-7000-8000-000000000002' }));
     await processMessage(makeMockMsg({ bad: true }));
 
     const metrics = getMetrics();
     expect(metrics.received).toBe(3);
     expect(metrics.validated).toBe(2);
     expect(metrics.validationErrors).toBe(1);
+  });
+
+  it('deduplicates messages with the same event ID', async () => {
+    const msg1 = makeMockMsg(validEvent);
+    const msg2 = makeMockMsg(validEvent); // same event ID
+
+    await processMessage(msg1);
+    await processMessage(msg2);
+
+    const metrics = getMetrics();
+    expect(metrics.validated).toBe(2); // both pass validation
+    expect(metrics.deduplicated).toBe(1); // second one is deduped
+    expect(metrics.classified).toBe(1); // only first is classified
+    expect(msg1.ack).toHaveBeenCalledOnce();
+    expect(msg2.ack).toHaveBeenCalledOnce(); // deduped messages are still acked
+  });
+
+  it('processes messages with different IDs independently', async () => {
+    await processMessage(makeMockMsg({ ...validEvent, id: '019502e4-aaaa-7000-8000-000000000001' }));
+    await processMessage(makeMockMsg({ ...validEvent, id: '019502e4-bbbb-7000-8000-000000000002' }));
+
+    const metrics = getMetrics();
+    expect(metrics.deduplicated).toBe(0);
+    expect(metrics.classified).toBe(2);
   });
 });

@@ -1,6 +1,7 @@
 export interface Metrics {
   received: number;
   validated: number;
+  deduplicated: number;
   classified: number;
   pipelineProcessed: number;
   validationErrors: number;
@@ -11,6 +12,7 @@ export interface Metrics {
 const metrics: Metrics = {
   received: 0,
   validated: 0,
+  deduplicated: 0,
   classified: 0,
   pipelineProcessed: 0,
   validationErrors: 0,
@@ -32,6 +34,7 @@ export function getMetrics(): Metrics & { uptimeSeconds: number } {
 export function resetMetrics(): void {
   metrics.received = 0;
   metrics.validated = 0;
+  metrics.deduplicated = 0;
   metrics.classified = 0;
   metrics.pipelineProcessed = 0;
   metrics.validationErrors = 0;

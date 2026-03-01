@@ -4,7 +4,7 @@
  * Supports auto-compaction when message count exceeds threshold.
  */
 
-import { readFileSync, appendFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, appendFileSync, writeFileSync, renameSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 export interface SessionMessage {
@@ -42,6 +42,16 @@ function sessionFilePath(sessionId: string): string {
   // Sanitize sessionId for filesystem safety
   const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
   return join(getSessionsDir(), `${safe}.jsonl`);
+}
+
+/**
+ * Atomic write: write to a temp file, then rename.
+ * rename() is atomic on POSIX systems when src and dest are on the same filesystem.
+ */
+function atomicWriteFileSync(filePath: string, data: string): void {
+  const tmpPath = filePath + '.tmp';
+  writeFileSync(tmpPath, data);
+  renameSync(tmpPath, filePath);
 }
 
 /** Load session from disk if not in memory */
@@ -173,14 +183,14 @@ export async function compactSession(
     ...toKeep,
   ];
 
-  // Rewrite the session file
+  // Rewrite the session file atomically (write to .tmp, then rename)
   ensureDir();
   const filePath = sessionFilePath(sessionId);
   const lines = [
     JSON.stringify({ type: 'meta', createdAt: session.createdAt, metadata: session.metadata }),
     ...session.messages.map(m => JSON.stringify({ type: 'message', message: m })),
   ];
-  writeFileSync(filePath, lines.join('\n') + '\n');
+  atomicWriteFileSync(filePath, lines.join('\n') + '\n');
 
   console.log(JSON.stringify({
     level: 'info',
@@ -193,9 +203,28 @@ export async function compactSession(
   }));
 }
 
-/** List active session IDs (in-memory only) */
+/**
+ * List all session IDs — in-memory + any on disk not yet loaded.
+ * Returns deduplicated sorted list.
+ */
 export function listSessions(): string[] {
-  return Array.from(sessions.keys());
+  const inMemory = new Set(sessions.keys());
+
+  // Discover sessions on disk
+  const dir = getSessionsDir();
+  if (existsSync(dir)) {
+    try {
+      for (const file of readdirSync(dir)) {
+        if (file.endsWith('.jsonl') && !file.endsWith('.tmp')) {
+          inMemory.add(file.replace(/\.jsonl$/, ''));
+        }
+      }
+    } catch {
+      // If we can't read the dir, just return in-memory sessions
+    }
+  }
+
+  return Array.from(inMemory).sort();
 }
 
 /** Get message count for a session */
