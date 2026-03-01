@@ -11,38 +11,13 @@
 import { spawn } from 'node:child_process';
 import {
   type Classification,
+  type ClassificationContext,
   isValidClassification,
 } from './types.js';
 import { parseClassificationResponse } from './ollama.js';
+import { buildClassificationPrompt } from './prompt.js';
 
 const CLAUDE_TIMEOUT_MS = 60_000; // 1 minute max for classification
-
-const CLASSIFICATION_PROMPT = `You are a message classifier for a personal assistant named Jane. Classify this message into three dimensions. Be precise.
-
-URGENCY:
-- "immediate" — time-sensitive, needs response now
-- "normal" — should respond soon
-- "low" — no time pressure
-- "ignore" — not actionable
-
-CATEGORY:
-- "question" — asking for information
-- "task_request" — requesting an action be performed
-- "social" — greeting, thanks, small talk
-- "alert" — system alert, error, warning
-- "informational" — sharing info, FYI, status update
-
-ROUTING:
-- "reflexive_reply" — quick simple response
-- "deliberate_thought" — needs reasoning or complex action
-- "log_only" — just record, no response needed
-- "escalate" — needs human attention
-
-Respond with ONLY a JSON object:
-{"urgency":"...","category":"...","routing":"..."}
-
-MESSAGE:
-`;
 
 interface ClaudeResult {
   classification: Classification;
@@ -54,10 +29,10 @@ interface ClaudeResult {
  * Uses --print mode with prompt via stdin to leverage OAuth session.
  */
 export async function classifyByClaude(
-  content: string
+  ctx: ClassificationContext
 ): Promise<ClaudeResult | null> {
   const start = Date.now();
-  const prompt = CLASSIFICATION_PROMPT + content;
+  const prompt = buildClassificationPrompt(ctx);
 
   const args = [
     '--print',

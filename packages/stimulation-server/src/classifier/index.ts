@@ -8,10 +8,10 @@ import { classifyByRules } from './rules.js';
 import { classifyByConsensus } from './ollama.js';
 import { classifyByClaude } from './claude.js';
 import { recordClassification, getClassifierMetrics, resetClassifierMetrics } from './classifier-metrics.js';
-import type { ClassificationResult } from './types.js';
+import type { ClassificationResult, ClassificationContext } from './types.js';
 import type { SafetyGate } from '../safety/index.js';
 
-export type { ClassificationResult } from './types.js';
+export type { ClassificationResult, ClassificationContext } from './types.js';
 export { getClassifierMetrics, resetClassifierMetrics } from './classifier-metrics.js';
 
 /** Default classification when all tiers fail */
@@ -39,14 +39,13 @@ function log(msg: string, data?: Record<string, unknown>) {
  * Rules → Ollama consensus → Claude escalation → fallback.
  */
 export async function classify(
-  content: string,
-  channelType: string,
+  ctx: ClassificationContext,
   safety: SafetyGate | null,
 ): Promise<ClassificationResult> {
   const start = Date.now();
 
   // --- Tier 1: Rules ---
-  const rulesResult = classifyByRules(content, channelType);
+  const rulesResult = classifyByRules(ctx);
   if (rulesResult) {
     const latencyMs = Date.now() - start;
     const result: ClassificationResult = {
@@ -64,10 +63,10 @@ export async function classify(
 
   // --- Tier 2: Ollama Consensus ---
   // Check safety gate before making LLM calls
-  const localCheck = safety?.canCallLocalLlm(channelType) ?? { allowed: true, reasons: [] };
+  const localCheck = safety?.canCallLocalLlm(ctx.channelType) ?? { allowed: true, reasons: [] };
   if (localCheck.allowed) {
     try {
-      const consensusResult = await classifyByConsensus(content);
+      const consensusResult = await classifyByConsensus(ctx);
       if (consensusResult) {
         const result: ClassificationResult = {
           ...consensusResult.classification,
@@ -81,9 +80,9 @@ export async function classify(
           ...result,
         });
         // Record 3 LLM calls for rate limiting
-        safety?.recordLlmCall('local', channelType);
-        safety?.recordLlmCall('local', channelType);
-        safety?.recordLlmCall('local', channelType);
+        safety?.recordLlmCall('local', ctx.channelType);
+        safety?.recordLlmCall('local', ctx.channelType);
+        safety?.recordLlmCall('local', ctx.channelType);
         recordClassification(
           'local_consensus', result.urgency, result.category, result.routing,
           result.confidence, result.latencyMs, consensusResult.agreement
@@ -99,10 +98,10 @@ export async function classify(
   }
 
   // --- Tier 3: Claude Escalation ---
-  const claudeCheck = safety?.canCallClaude(channelType) ?? { allowed: true, reasons: [] };
+  const claudeCheck = safety?.canCallClaude(ctx.channelType) ?? { allowed: true, reasons: [] };
   if (claudeCheck.allowed) {
     try {
-      const claudeResult = await classifyByClaude(content);
+      const claudeResult = await classifyByClaude(ctx);
       if (claudeResult) {
         const result: ClassificationResult = {
           ...claudeResult.classification,
@@ -111,7 +110,7 @@ export async function classify(
           latencyMs: claudeResult.latencyMs,
         };
         log('Classified by Claude escalation', result);
-        safety?.recordLlmCall('claude', channelType);
+        safety?.recordLlmCall('claude', ctx.channelType);
         recordClassification(
           'claude_escalation', result.urgency, result.category, result.routing,
           result.confidence, result.latencyMs

@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.9",
-    "@the-ansible/life-system-shared": "^0.5.0",
+    "@the-ansible/life-system-shared": "file:../../../../packages/life-system-shared",
     "hono": "^4.0.0",
     "nats": "^2.29.0"
   },

@@ -9,8 +9,9 @@ import { increment } from '../metrics.js';
 import { pushEvent } from '../events.js';
 import type { SafetyGate } from '../safety/index.js';
 import type { NatsClient } from './client.js';
-import { classify, type ClassificationResult } from '../classifier/index.js';
+import { classify, type ClassificationResult, type ClassificationContext } from '../classifier/index.js';
 import { processPipeline, type PipelineDeps } from '../pipeline.js';
+import { getMessageCount } from '../sessions/store.js';
 
 const STREAM = 'COMMUNICATION';
 const DURABLE_NAME = 'stimulation-server';
@@ -105,10 +106,22 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
   safetyGate?.recordProcess();
   safetyGate?.recordSuccess();
 
+  // Build classification context from the full event
+  const sessionState: ClassificationContext['sessionState'] =
+    getMessageCount(result.data.sessionId) > 0 ? 'active_conversation' : 'cold_start';
+
+  const ctx: ClassificationContext = {
+    content: result.data.content,
+    channelType: result.data.channelType,
+    hints: result.data.hints,
+    sender: result.data.sender,
+    sessionState,
+  };
+
   // Classify the event
   let classification: ClassificationResult | null = null;
   try {
-    classification = await classify(result.data.content, result.data.channelType, safetyGate);
+    classification = await classify(ctx, safetyGate);
     increment('classified');
   } catch (err) {
     console.log(JSON.stringify({

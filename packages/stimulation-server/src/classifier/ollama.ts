@@ -6,54 +6,28 @@
 
 import {
   type Classification,
+  type ClassificationContext,
   type Confidence,
   isValidClassification,
   VALID_URGENCY,
   VALID_CATEGORY,
   VALID_ROUTING,
 } from './types.js';
+import { buildClassificationPrompt } from './prompt.js';
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_CLASSIFIER_MODEL || 'gemma3:12b';
 const CONSENSUS_COUNT = 3;
 const OLLAMA_TIMEOUT_MS = 30_000;
 
-const CLASSIFICATION_PROMPT = `You are a message classifier for a personal assistant system. Classify the following message into exactly three dimensions.
-
-URGENCY (how soon does this need attention):
-- "immediate" — needs response right now (emergencies, time-sensitive requests)
-- "normal" — should be handled soon but not urgent (questions, task requests)
-- "low" — can wait, no time pressure (FYI, social, informational)
-- "ignore" — noise, empty, or not actionable
-
-CATEGORY (what kind of message is this):
-- "question" — asking for information or an answer
-- "task_request" — asking to do something, perform an action
-- "social" — greeting, thanks, small talk, emotional expression
-- "alert" — system alert, error report, warning
-- "informational" — sharing info, FYI, status update, link sharing
-
-ROUTING (how should the assistant respond):
-- "reflexive_reply" — quick, simple response (greetings, thanks, acknowledgments)
-- "deliberate_thought" — needs reasoning, research, or complex action
-- "log_only" — just record it, no response needed
-- "escalate" — needs human attention or is beyond assistant capabilities
-
-Respond with ONLY a JSON object, no other text:
-{"urgency":"...","category":"...","routing":"..."}
-
-MESSAGE:
-`;
-
 /**
  * Call Ollama once and parse the JSON response.
  * Returns a Classification or null if the response can't be parsed.
  */
 async function callOllamaOnce(
-  content: string,
+  prompt: string,
   fetchFn: typeof fetch = globalThis.fetch
 ): Promise<Classification | null> {
-  const prompt = CLASSIFICATION_PROMPT + content;
 
   const response = await fetchFn(`${OLLAMA_URL}/api/generate`, {
     method: 'POST',
@@ -173,14 +147,15 @@ export interface ConsensusResult {
  * Returns null if no consensus could be reached (all disagree or all fail).
  */
 export async function classifyByConsensus(
-  content: string,
+  ctx: ClassificationContext,
   fetchFn: typeof fetch = globalThis.fetch
 ): Promise<ConsensusResult | null> {
   const start = Date.now();
+  const prompt = buildClassificationPrompt(ctx);
 
   // Run N calls in parallel
   const promises = Array.from({ length: CONSENSUS_COUNT }, () =>
-    callOllamaOnce(content, fetchFn).catch(() => null)
+    callOllamaOnce(prompt, fetchFn).catch(() => null)
   );
 
   const votes = await Promise.all(promises);

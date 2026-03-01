@@ -41,7 +41,8 @@ const validEvent = {
   channelType: 'message',
   direction: 'inbound',
   contentType: 'markdown',
-  content: 'Hello!',  // Use a greeting so rules classifier handles it instantly (no Ollama needed)
+  content: 'Daily health check report',
+  hints: { category: 'informational', urgency: 'low', routing: 'log_only' }, // Complete hints → rules tier, no Ollama needed
   metadata: {},
   timestamp: '2026-02-28T12:00:00.000Z',
 };

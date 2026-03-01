@@ -26,6 +26,14 @@ export const VALID_URGENCY: Urgency[] = ['immediate', 'normal', 'low', 'ignore']
 export const VALID_CATEGORY: Category[] = ['question', 'task_request', 'social', 'alert', 'informational'];
 export const VALID_ROUTING: Routing[] = ['reflexive_reply', 'deliberate_thought', 'log_only', 'escalate'];
 
+export interface ClassificationContext {
+  content: string;
+  channelType: string;
+  hints?: { category?: string; urgency?: string; routing?: string };
+  sender?: { id: string; displayName?: string; type: string };
+  sessionState: 'cold_start' | 'active_conversation';
+}
+
 export function isValidClassification(obj: unknown): obj is Classification {
   if (typeof obj !== 'object' || obj === null) return false;
   const c = obj as Record<string, unknown>;

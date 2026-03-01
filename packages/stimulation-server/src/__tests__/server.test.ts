@@ -5,12 +5,20 @@ import { tmpdir } from 'node:os';
 
 process.env.SESSIONS_DIR = mkdtempSync(join(tmpdir(), 'server-test-'));
 
+// Mock the composer to avoid spawning Claude CLI in tests
+vi.mock('../composer/index.js', () => ({
+  compose: vi.fn(),
+}));
+
+import { compose } from '../composer/index.js';
 import { createApp, type ServerDeps } from '../server.js';
 import { resetMetrics, increment } from '../metrics.js';
 import { pushEvent, clearEvents } from '../events.js';
 import { appendMessage, clearAllSessions } from '../sessions/store.js';
 import { recordPipelineOutcome, resetPipelineStats } from '../pipeline-stats.js';
 import type { NatsClient } from '../nats/client.js';
+
+const mockCompose = vi.mocked(compose);
 
 function makeMockNats(connected: boolean): NatsClient {
   return {
@@ -184,7 +192,7 @@ describe('POST /api/send', () => {
     expect(res.status).toBe(200);
     expect(body.sent).toBe(true);
     expect(body.eventId).toBeTruthy();
-    expect(body.subject).toBe('communication.outbound.message');
+    expect(body.subject).toBe('communication.outbound.realtime');
     expect(mockNats.publish).toHaveBeenCalledOnce();
   });
 });
@@ -215,6 +223,29 @@ describe('POST /api/test/inbound', () => {
     expect(body.published).toBe(true);
     expect(body.subject).toBe('communication.inbound.realtime');
     expect(mockNats.publish).toHaveBeenCalledOnce();
+  });
+
+  it('passes hints through to the published event', async () => {
+    const mockNats = makeMockNats(true);
+    const deps: ServerDeps = { nats: mockNats, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/test/inbound', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'Scheduled report',
+        hints: { category: 'informational', urgency: 'low', routing: 'log_only' },
+      }),
+    });
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.published).toBe(true);
+    expect(mockNats.publish).toHaveBeenCalledWith(
+      'communication.inbound.realtime',
+      expect.objectContaining({
+        hints: { category: 'informational', urgency: 'low', routing: 'log_only' },
+      })
+    );
   });
 });
 
@@ -263,6 +294,102 @@ describe('Session endpoints', () => {
     const body = await res.json();
     expect(body.messages.length).toBe(3);
     expect(body.messageCount).toBe(10); // total is still 10
+  });
+});
+
+describe('POST /api/compose-and-send', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearAllSessions();
+  });
+
+  it('returns 503 when NATS is not connected', async () => {
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/compose-and-send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'test' }),
+    });
+    expect(res.status).toBe(503);
+  });
+
+  it('returns 400 when message is missing', async () => {
+    const deps: ServerDeps = { nats: makeMockNats(true), safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/compose-and-send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('composes message and publishes to NATS', async () => {
+    mockCompose.mockResolvedValue('Voiced version of the message');
+    const mockNats = makeMockNats(true);
+    const deps: ServerDeps = { nats: mockNats, safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/compose-and-send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Raw report from scheduled job' }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.sent).toBe(true);
+    expect(body.composed).toBe(true);
+    expect(mockCompose).toHaveBeenCalledOnce();
+    expect(mockNats.publish).toHaveBeenCalledWith(
+      'communication.outbound.realtime',
+      expect.objectContaining({
+        content: 'Voiced version of the message',
+        sender: expect.objectContaining({ id: 'jane' }),
+      })
+    );
+  });
+
+  it('falls back to raw message when composer returns null', async () => {
+    mockCompose.mockResolvedValue(null);
+    const mockNats = makeMockNats(true);
+    const deps: ServerDeps = { nats: mockNats, safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/compose-and-send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Fallback content' }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.sent).toBe(true);
+    expect(body.composed).toBe(false);
+    expect(mockNats.publish).toHaveBeenCalledWith(
+      'communication.outbound.realtime',
+      expect.objectContaining({ content: 'Fallback content' })
+    );
+  });
+
+  it('records message in session for continuity', async () => {
+    mockCompose.mockResolvedValue('Composed');
+    const mockNats = makeMockNats(true);
+    const deps: ServerDeps = { nats: mockNats, safety: null };
+    const app = createApp(deps);
+
+    await app.request('/api/compose-and-send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Test', sessionId: 'job-session' }),
+    });
+
+    const { getSession } = await import('../sessions/store.js');
+    const session = getSession('job-session');
+    expect(session.messages.length).toBe(1);
+    expect(session.messages[0].role).toBe('assistant');
+    expect(session.messages[0].content).toBe('Composed');
   });
 });
 

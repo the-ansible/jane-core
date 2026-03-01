@@ -33,8 +33,8 @@ importers:
         specifier: ^1.19.9
         version: 1.19.9(hono@4.12.3)
       '@the-ansible/life-system-shared':
-        specifier: ^0.4.1
-        version: 0.4.1
+        specifier: file:../../../../packages/life-system-shared
+        version: file:../../packages/life-system-shared
       hono:
         specifier: ^4.0.0
         version: 4.12.3
@@ -505,8 +505,8 @@ packages:
   '@sinclair/typebox@0.27.10':
     resolution: {integrity: sha512-MTBk/3jGLNB2tVxv6uLlFh1iu64iYOQ2PbdOSK3NW8JZsmlaOh2q6sdtKowBhfw8QFLmYNzTW4/oK4uATIi6ZA==}
 
-  '@the-ansible/life-system-shared@0.4.1':
-    resolution: {integrity: sha512-NZacZzWISTdHQsrZuV+UztrHt2rHKOpmI0v6cmabIS6R1U5HsHgcMbl9foCt58CSOyc3vEEpx8mVTg28dMfvBg==, tarball: https://npm.pkg.github.com/download/@the-ansible/life-system-shared/0.4.1/69ffe00e4c4efb846ed915710848eaa4601f9663}
+  '@the-ansible/life-system-shared@file:../../packages/life-system-shared':
+    resolution: {directory: ../../packages/life-system-shared, type: directory}
 
   '@types/estree@1.0.8':
     resolution: {integrity: sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==}
@@ -1104,7 +1104,7 @@ snapshots:
 
   '@sinclair/typebox@0.27.10': {}
 
-  '@the-ansible/life-system-shared@0.4.1':
+  '@the-ansible/life-system-shared@file:../../packages/life-system-shared':
     dependencies:
       uuidv7: 1.1.0
       zod: 3.25.76
