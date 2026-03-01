@@ -147,6 +147,13 @@ export async function compose(input: ComposerInput): Promise<string | null> {
   }
 }
 
+/** Strip CLAUDECODE env var so spawned Claude CLI doesn't think it's nested */
+function stripClaudeCodeEnv(): Record<string, string | undefined> {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+  return env;
+}
+
 function spawnClaude(prompt: string): Promise<string | null> {
   return new Promise((resolve) => {
     const proc = spawn('claude', [
@@ -159,11 +166,12 @@ function spawnClaude(prompt: string): Promise<string | null> {
     ], {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: '/agent',
-      env: { ...process.env },
+      env: stripClaudeCodeEnv(),
       timeout: COMPOSER_TIMEOUT_MS,
     });
 
     let stdout = '';
+    let stderr = '';
     let timedOut = false;
 
     proc.stdin.write(prompt);
@@ -173,20 +181,38 @@ function spawnClaude(prompt: string): Promise<string | null> {
       stdout += chunk.toString();
     });
 
-    proc.stderr.on('data', () => {
-      // Ignore
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
     });
 
     proc.on('close', (code, signal) => {
       if (signal === 'SIGTERM' || signal === 'SIGKILL') timedOut = true;
       if (timedOut || code !== 0) {
+        if (stderr) {
+          console.log(JSON.stringify({
+            level: 'warn',
+            msg: 'Composer Claude CLI stderr',
+            component: 'composer',
+            stderr: stderr.slice(0, 500),
+            code,
+            signal,
+            ts: new Date().toISOString(),
+          }));
+        }
         resolve(null);
         return;
       }
       resolve(stdout);
     });
 
-    proc.on('error', () => {
+    proc.on('error', (err) => {
+      console.log(JSON.stringify({
+        level: 'error',
+        msg: 'Composer Claude CLI spawn error',
+        component: 'composer',
+        error: String(err),
+        ts: new Date().toISOString(),
+      }));
       resolve(null);
     });
 
@@ -202,27 +228,38 @@ function spawnClaude(prompt: string): Promise<string | null> {
 /** Parse Claude CLI output to get the composed message */
 function parseComposerResponse(stdout: string): string | null {
   try {
-    const messages = JSON.parse(stdout) as Array<{
-      type: string;
-      result?: string;
-    }>;
-    for (const msg of messages) {
-      if (msg.type === 'result' && msg.result) {
-        // Strip any markdown code blocks or quotes the model might add
-        let text = msg.result.trim();
-        // Remove wrapping quotes if present
-        if ((text.startsWith('"') && text.endsWith('"')) ||
-            (text.startsWith("'") && text.endsWith("'"))) {
-          text = text.slice(1, -1);
+    const parsed = JSON.parse(stdout);
+
+    // Handle single object with result field
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (parsed.type === 'result' && parsed.result) {
+        return cleanText(parsed.result);
+      }
+    }
+
+    // Handle array format
+    if (Array.isArray(parsed)) {
+      for (const msg of parsed) {
+        if (msg.type === 'result' && msg.result) {
+          return cleanText(msg.result);
         }
-        return text;
       }
     }
   } catch {
-    // If not JSON array, treat as raw text
+    // If not JSON, treat as raw text
     const text = stdout.trim();
     return text || null;
   }
 
   return null;
+}
+
+function cleanText(text: string): string {
+  let cleaned = text.trim();
+  // Remove wrapping quotes if present
+  if ((cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+      (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+    cleaned = cleaned.slice(1, -1);
+  }
+  return cleaned;
 }
