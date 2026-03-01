@@ -77,7 +77,7 @@ export function createApp(deps: ServerDeps): Hono {
 
     const event = {
       id: uuidv7(),
-      sessionId: body.sessionId || 'stimulation-server-admin',
+      sessionId: body.sessionId || uuidv7(),
       channelType: body.channelType || 'message',
       direction: 'outbound' as const,
       contentType: 'markdown' as const,
@@ -123,7 +123,7 @@ export function createApp(deps: ServerDeps): Hono {
 
     const event = {
       id: uuidv7(),
-      sessionId: body.sessionId || 'loopback-test',
+      sessionId: body.sessionId || uuidv7(),
       channelType: body.channelType || 'realtime',
       direction: 'inbound' as const,
       contentType: 'markdown' as const,
