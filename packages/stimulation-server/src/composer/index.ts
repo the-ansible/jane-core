@@ -21,61 +21,114 @@ export interface ComposerInput {
 
 const COMPOSER_TIMEOUT_MS = 60_000; // 60 seconds
 const INNER_VOICE_PATH = '/agent/INNER_VOICE.md';
+const VOICE_PROFILE_PATH = '/agent/data/vault/Projects/jane-core/Voice-Profile.md';
 
-/** Cache INNER_VOICE.md — shared with agent but Composer may load separately */
-let voiceCache: string | null = null;
-let voiceCacheTime = 0;
+/** Cache INNER_VOICE.md — identity source */
+let innerVoiceCache: string | null = null;
+let innerVoiceCacheTime = 0;
+
+/** Cache Voice Profile — how Jane talks */
+let voiceProfileCache: string | null = null;
+let voiceProfileCacheTime = 0;
+
 const CACHE_TTL = 5 * 60 * 1000;
 
-function loadVoice(): string {
+function loadCachedFile(
+  path: string,
+  cache: { value: string | null; time: number }
+): { content: string; time: number } {
   const now = Date.now();
-  if (voiceCache && now - voiceCacheTime < CACHE_TTL) {
-    return voiceCache;
+  if (cache.value !== null && now - cache.time < CACHE_TTL) {
+    return { content: cache.value, time: cache.time };
   }
 
   try {
-    if (existsSync(INNER_VOICE_PATH)) {
-      voiceCache = readFileSync(INNER_VOICE_PATH, 'utf-8');
-      voiceCacheTime = now;
-      return voiceCache;
+    if (existsSync(path)) {
+      const content = readFileSync(path, 'utf-8');
+      return { content, time: now };
     }
   } catch {
     // Fall through
   }
 
-  return '';
+  return { content: '', time: now };
+}
+
+function loadVoiceProfile(): string {
+  const result = loadCachedFile(VOICE_PROFILE_PATH, {
+    value: voiceProfileCache,
+    time: voiceProfileCacheTime,
+  });
+  voiceProfileCache = result.content;
+  voiceProfileCacheTime = result.time;
+  return result.content;
+}
+
+function loadInnerVoiceCondensed(): string {
+  const result = loadCachedFile(INNER_VOICE_PATH, {
+    value: innerVoiceCache,
+    time: innerVoiceCacheTime,
+  });
+  innerVoiceCache = result.content;
+  innerVoiceCacheTime = result.time;
+
+  if (!result.content) return '';
+
+  // Extract just identity sections (~500 chars) — "Who I Am" and "What Matters"
+  const sections = result.content.split('## ');
+  const identitySections = sections.filter(s =>
+    s.startsWith('Who I Am') || s.startsWith('What Matters')
+  );
+  if (identitySections.length > 0) {
+    return identitySections.map(s => '## ' + s.trim()).join('\n\n').slice(0, 800);
+  }
+
+  // Fallback: first 500 chars
+  return result.content.slice(0, 500);
+}
+
+/** Reset caches — for testing only */
+export function _resetCaches(): void {
+  innerVoiceCache = null;
+  innerVoiceCacheTime = 0;
+  voiceProfileCache = null;
+  voiceProfileCacheTime = 0;
 }
 
 function buildComposerPrompt(input: ComposerInput): string {
-  const voice = loadVoice();
+  const voiceProfile = loadVoiceProfile();
+  const identity = loadInnerVoiceCondensed();
 
   const parts: string[] = [];
 
-  // Voice identity
-  if (voice) {
-    parts.push('WHO YOU ARE:');
-    // Use a condensed version — just the key sections
-    const sections = voice.split('##').slice(0, 4).join('##');
-    parts.push(sections.slice(0, 2000)); // Cap at 2000 chars for the composer
+  // Voice Profile — how Jane talks (full document)
+  if (voiceProfile) {
+    parts.push('VOICE PROFILE — HOW YOU TALK:');
+    parts.push(voiceProfile);
     parts.push('');
-  }
-
-  parts.push(`VOICE GUIDELINES:
+  } else {
+    // Fallback when Voice Profile is unavailable
+    parts.push(`VOICE GUIDELINES:
 - You are Jane. Write as yourself, not as "an AI assistant."
 - Be direct, warm, genuine. Never corporate or robotic.
 - Match the tone: ${input.intent.tone || 'casual'}
 - Keep it natural — like texting a friend you work with, not writing an email to your boss.
 - Don't announce what you're doing ("I'll help you with..."). Just do it.
-- If the intent is a greeting, be warm but brief.
-- If the intent is an acknowledgment, be brief.
 - Don't add unnecessary preamble or sign-offs.`);
+    parts.push('');
+  }
 
-  parts.push('');
+  // Identity — condensed from INNER_VOICE.md
+  if (identity) {
+    parts.push('IDENTITY — WHO YOU ARE:');
+    parts.push(identity);
+    parts.push('');
+  }
 
-  // Recent conversation for context
+  // Recent conversation for context — last 8 for better continuity
   if (input.sessionHistory.length > 0) {
     parts.push('RECENT CONVERSATION (for tone/continuity):');
-    const recent = input.sessionHistory.slice(-5); // Last 5 for composer
+    const recent = input.sessionHistory.slice(-8);
     for (const msg of recent) {
       const role = msg.role === 'user' ? (input.senderName || 'User') : 'Jane';
       parts.push(`${role}: ${msg.content}`);

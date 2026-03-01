@@ -125,11 +125,10 @@ describe('SafetyGate', () => {
 
     it('blocks when LLM loop detected (circuit breaker, not rate limit)', () => {
       const now = Date.now();
-      // 3 calls per event type threshold
-      gate.recordLlmCall('local', 'chat', now);
-      gate.recordLlmCall('local', 'chat', now);
-      gate.recordLlmCall('local', 'chat', now);
-      gate.recordLlmCall('local', 'chat', now); // 4th triggers loop detection
+      // 15 calls per event type threshold (within 60s window)
+      for (let i = 0; i < 16; i++) {
+        gate.recordLlmCall('local', 'chat', now);
+      }
       expect(gate.canCallLocalLlm('chat', now).allowed).toBe(false);
       expect(gate.canCallLocalLlm('email', now).allowed).toBe(true); // different type is fine
     });

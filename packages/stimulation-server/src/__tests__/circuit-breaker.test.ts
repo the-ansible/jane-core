@@ -102,49 +102,68 @@ describe('FloodDetector', () => {
 
 describe('LlmLoopDetector', () => {
   it('allows calls under threshold', () => {
-    const ld = new LlmLoopDetector(3);
-    expect(ld.recordCall('chat')).toBe(false); // 1
-    expect(ld.recordCall('chat')).toBe(false); // 2
-    expect(ld.recordCall('chat')).toBe(false); // 3
-    expect(ld.isBlocked('chat')).toBe(false);
+    const ld = new LlmLoopDetector(3, 60_000);
+    const now = Date.now();
+    expect(ld.recordCall('chat', now)).toBe(false); // 1
+    expect(ld.recordCall('chat', now)).toBe(false); // 2
+    expect(ld.recordCall('chat', now)).toBe(false); // 3
+    expect(ld.isBlocked('chat', now)).toBe(false);
   });
 
   it('blocks event type after exceeding threshold', () => {
-    const ld = new LlmLoopDetector(2);
-    ld.recordCall('chat'); // 1
-    ld.recordCall('chat'); // 2
-    expect(ld.recordCall('chat')).toBe(true); // 3 — over threshold
-    expect(ld.isBlocked('chat')).toBe(true);
+    const ld = new LlmLoopDetector(2, 60_000);
+    const now = Date.now();
+    ld.recordCall('chat', now); // 1
+    ld.recordCall('chat', now); // 2
+    expect(ld.recordCall('chat', now)).toBe(true); // 3 — over threshold
+    expect(ld.isBlocked('chat', now)).toBe(true);
   });
 
   it('tracks event types independently', () => {
-    const ld = new LlmLoopDetector(2);
-    ld.recordCall('chat');
-    ld.recordCall('chat');
-    ld.recordCall('chat'); // blocks chat
+    const ld = new LlmLoopDetector(2, 60_000);
+    const now = Date.now();
+    ld.recordCall('chat', now);
+    ld.recordCall('chat', now);
+    ld.recordCall('chat', now); // blocks chat
 
-    expect(ld.isBlocked('chat')).toBe(true);
-    expect(ld.isBlocked('email')).toBe(false);
-    expect(ld.recordCall('email')).toBe(false);
+    expect(ld.isBlocked('chat', now)).toBe(true);
+    expect(ld.isBlocked('email', now)).toBe(false);
+    expect(ld.recordCall('email', now)).toBe(false);
+  });
+
+  it('auto-unblocks after window expires', () => {
+    const ld = new LlmLoopDetector(2, 10_000); // 10s window
+    const t0 = 1000000;
+    ld.recordCall('chat', t0);
+    ld.recordCall('chat', t0);
+    ld.recordCall('chat', t0); // blocks
+    expect(ld.isBlocked('chat', t0)).toBe(true);
+
+    // After window expires, should auto-unblock
+    expect(ld.isBlocked('chat', t0 + 11_000)).toBe(false);
+    // New calls should work again
+    expect(ld.recordCall('chat', t0 + 11_000)).toBe(false);
   });
 
   it('resetType clears specific type', () => {
-    const ld = new LlmLoopDetector(1);
-    ld.recordCall('chat');
-    ld.recordCall('chat');
-    expect(ld.isBlocked('chat')).toBe(true);
+    const ld = new LlmLoopDetector(1, 60_000);
+    const now = Date.now();
+    ld.recordCall('chat', now);
+    ld.recordCall('chat', now);
+    expect(ld.isBlocked('chat', now)).toBe(true);
     ld.resetType('chat');
-    expect(ld.isBlocked('chat')).toBe(false);
+    expect(ld.isBlocked('chat', now)).toBe(false);
   });
 
   it('full reset clears everything', () => {
-    const ld = new LlmLoopDetector(1);
-    ld.recordCall('chat');
-    ld.recordCall('chat');
-    ld.recordCall('email');
-    ld.recordCall('email');
+    const ld = new LlmLoopDetector(1, 60_000);
+    const now = Date.now();
+    ld.recordCall('chat', now);
+    ld.recordCall('chat', now);
+    ld.recordCall('email', now);
+    ld.recordCall('email', now);
     ld.reset();
-    expect(ld.isBlocked('chat')).toBe(false);
-    expect(ld.isBlocked('email')).toBe(false);
+    expect(ld.isBlocked('chat', now)).toBe(false);
+    expect(ld.isBlocked('email', now)).toBe(false);
   });
 });

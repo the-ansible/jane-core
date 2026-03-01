@@ -157,50 +157,70 @@ export class FloodDetector {
   }
 }
 
-// --- LLM loop detector (per event-type tracking) ---
+// --- LLM loop detector (per event-type tracking with sliding window) ---
 
 export class LlmLoopDetector {
-  private callCounts = new Map<string, number>();
+  private callTimestamps = new Map<string, number[]>();
   private blockedTypes = new Set<string>();
   private readonly threshold: number;
+  private readonly windowMs: number;
 
-  constructor(threshold = 3) {
+  constructor(threshold = 10, windowMs = 60_000) {
     this.threshold = threshold;
+    this.windowMs = windowMs;
   }
 
   /** Record an LLM call for an event type. Returns true if loop detected. */
-  recordCall(eventType: string): boolean {
-    const count = (this.callCounts.get(eventType) || 0) + 1;
-    this.callCounts.set(eventType, count);
+  recordCall(eventType: string, now = Date.now()): boolean {
+    const cutoff = now - this.windowMs;
+    const timestamps = this.callTimestamps.get(eventType) || [];
+    // Keep only timestamps within the window
+    const recent = timestamps.filter(t => t > cutoff);
+    recent.push(now);
+    this.callTimestamps.set(eventType, recent);
 
-    if (count > this.threshold) {
+    if (recent.length > this.threshold) {
       this.blockedTypes.add(eventType);
       return true;
     }
+    // Auto-unblock if we've dropped below threshold (window expired)
+    this.blockedTypes.delete(eventType);
     return false;
   }
 
   /** Check if an event type is blocked */
-  isBlocked(eventType: string): boolean {
-    return this.blockedTypes.has(eventType);
+  isBlocked(eventType: string, now = Date.now()): boolean {
+    if (!this.blockedTypes.has(eventType)) return false;
+    // Re-check with current window — auto-unblock if calls aged out
+    const cutoff = now - this.windowMs;
+    const timestamps = this.callTimestamps.get(eventType) || [];
+    const recent = timestamps.filter(t => t > cutoff);
+    this.callTimestamps.set(eventType, recent);
+    if (recent.length <= this.threshold) {
+      this.blockedTypes.delete(eventType);
+      return false;
+    }
+    return true;
   }
 
   /** Reset counts for a specific event type */
   resetType(eventType: string): void {
-    this.callCounts.delete(eventType);
+    this.callTimestamps.delete(eventType);
     this.blockedTypes.delete(eventType);
   }
 
   /** Full reset */
   reset(): void {
-    this.callCounts.clear();
+    this.callTimestamps.clear();
     this.blockedTypes.clear();
   }
 
   status(): { blockedTypes: string[]; callCounts: Record<string, number> } {
     return {
       blockedTypes: Array.from(this.blockedTypes),
-      callCounts: Object.fromEntries(this.callCounts),
+      callCounts: Object.fromEntries(
+        Array.from(this.callTimestamps.entries()).map(([k, v]) => [k, v.length])
+      ),
     };
   }
 }
@@ -241,7 +261,7 @@ export function createDefaultBreakers() {
       resetTimeMs: FIVE_MINUTES,
     }),
     outboundFlood: new FloodDetector('outbound_flood', 10, ONE_MINUTE),
-    llmLoop: new LlmLoopDetector(3),
+    llmLoop: new LlmLoopDetector(15, ONE_MINUTE),
     memory: new MemoryMonitor(256),
   };
 }

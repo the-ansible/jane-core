@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 process.env.SESSIONS_DIR = mkdtempSync(join(tmpdir(), 'pipeline-test-'));
 
 import { processPipeline, type PipelineDeps } from '../pipeline.js';
-import { clearAllSessions, getSession } from '../sessions/store.js';
+import { clearAllSessions, getSession, appendMessage } from '../sessions/store.js';
 import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 import type { ClassificationResult } from '../classifier/types.js';
 
@@ -364,6 +364,76 @@ describe('Pipeline', () => {
       expect(mockInvokeAgent).toHaveBeenCalledWith(
         expect.objectContaining({ senderName: 'user-123' })
       );
+    });
+  });
+
+  describe('active-session override', () => {
+    it('overrides log_only to reply when session has recent Jane activity', async () => {
+      // Seed session with a recent Jane message
+      appendMessage('active-sess', {
+        role: 'user',
+        content: 'What time is it?',
+        timestamp: new Date(Date.now() - 5 * 60 * 1000).toISOString(), // 5 min ago
+      });
+      appendMessage('active-sess', {
+        role: 'assistant',
+        content: 'It is 10 PM Pacific.',
+        timestamp: new Date(Date.now() - 4 * 60 * 1000).toISOString(), // 4 min ago
+      });
+
+      mockInvokeAgent.mockResolvedValue({
+        type: 'acknowledgment',
+        content: 'Acknowledged',
+        tone: 'casual',
+      });
+      mockCompose.mockResolvedValue('Thanks!');
+
+      const mockNats = {
+        isConnected: () => true,
+        publish: vi.fn().mockResolvedValue(undefined),
+      } as any;
+
+      const result = await processPipeline(
+        makeEvent({ sessionId: 'active-sess', content: 'Good job!' }),
+        makeClassification({ routing: 'log_only' }),
+        makeDeps({ nats: mockNats })
+      );
+
+      // Should have been overridden from log to reply
+      expect(result.action).toBe('reply');
+      expect(result.responded).toBe(true);
+      expect(result.reason).toContain('active_session_override');
+      expect(mockInvokeAgent).toHaveBeenCalled();
+    });
+
+    it('does NOT override log_only when session has no recent activity', async () => {
+      // Seed session with an old Jane message (> 10 min ago)
+      appendMessage('stale-sess', {
+        role: 'assistant',
+        content: 'Old message',
+        timestamp: new Date(Date.now() - 15 * 60 * 1000).toISOString(), // 15 min ago
+      });
+
+      const result = await processPipeline(
+        makeEvent({ sessionId: 'stale-sess', content: 'Good job!' }),
+        makeClassification({ routing: 'log_only' }),
+        makeDeps()
+      );
+
+      expect(result.action).toBe('log');
+      expect(result.responded).toBe(false);
+      expect(mockInvokeAgent).not.toHaveBeenCalled();
+    });
+
+    it('does NOT override log_only when session is empty', async () => {
+      const result = await processPipeline(
+        makeEvent({ sessionId: 'empty-sess', content: 'ok' }),
+        makeClassification({ routing: 'log_only' }),
+        makeDeps()
+      );
+
+      expect(result.action).toBe('log');
+      expect(result.responded).toBe(false);
     });
   });
 

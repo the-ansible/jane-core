@@ -13,6 +13,7 @@ import { invokeAgent, type AgentIntent } from './agent/index.js';
 import { compose } from './composer/index.js';
 import { recordPipelineOutcome } from './pipeline-stats.js';
 import { enqueueForRetry } from './outbound-queue.js';
+import { pushEvent } from './events.js';
 import {
   getSession,
   appendMessage,
@@ -47,6 +48,20 @@ export async function processPipeline(
 ): Promise<PipelineResult> {
   // 1. Route based on classification
   const decision = route(classification);
+
+  // Active-session override: if routed to log_only but session has recent Jane activity,
+  // override to reply so conversational messages ("Good job!", "Thanks", etc.) get responses.
+  if (decision.action === 'log') {
+    const session = getSession(event.sessionId);
+    const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+    const hasRecentJaneActivity = session.messages.some(
+      m => m.role === 'assistant' && new Date(m.timestamp).getTime() > tenMinutesAgo
+    );
+    if (hasRecentJaneActivity) {
+      decision.action = 'reply';
+      decision.reason = `active_session_override (was: ${classification.routing}) — ${decision.reason}`;
+    }
+  }
 
   console.log(JSON.stringify({
     level: 'info',
@@ -221,6 +236,7 @@ async function handleAgentResponse(
   try {
     await deps.nats.publish(subject, responseEvent);
     deps.safety?.recordSend();
+    pushEvent(responseEvent as CommunicationEvent, subject);
 
     // Record outbound in session
     appendMessage(event.sessionId, {

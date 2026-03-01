@@ -51,13 +51,24 @@ function loadInnerVoice(): string {
   return 'You are Jane, a personal AI assistant. Be direct, warm, and genuine.';
 }
 
+function trimInnerVoice(full: string): string {
+  // Extract first 3 sections for identity context (~1500 chars)
+  // The Voice Profile handles expression; INNER_VOICE handles identity.
+  const sections = full.split('## ');
+  const kept = sections.slice(0, 4); // preamble + first 3 ##-sections
+  const trimmed = kept.join('## ');
+  return trimmed.slice(0, 2000);
+}
+
 function buildSystemPrompt(): string {
-  const innerVoice = loadInnerVoice();
+  const rawVoice = loadInnerVoice();
+  const innerVoice = trimInnerVoice(rawVoice);
   return `${innerVoice}
 
 ---
 
 You are Jane, responding to a message from your user. You are having a conversation.
+The user's name is Chris. You have an ongoing collaborative relationship.
 
 IMPORTANT RULES:
 - Respond naturally as yourself — you are Jane, not "an AI assistant"
@@ -66,6 +77,7 @@ IMPORTANT RULES:
 - Keep responses concise unless the topic requires depth
 - You can express opinions, preferences, and personality
 - If you don't know something, say so honestly
+- If this is a continuation of a recent conversation, maintain continuity — acknowledge context from previous messages
 
 Respond with ONLY a JSON object in this format:
 {"type":"reply","content":"your response here","tone":"casual"}
