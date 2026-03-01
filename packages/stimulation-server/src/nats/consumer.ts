@@ -8,16 +8,23 @@ import { communicationEventSchema } from '@the-ansible/life-system-shared';
 import { increment } from '../metrics.js';
 import { pushEvent } from '../events.js';
 import type { SafetyGate } from '../safety/index.js';
+import type { NatsClient } from './client.js';
 import { classify, type ClassificationResult } from '../classifier/index.js';
+import { processPipeline, type PipelineDeps } from '../pipeline.js';
 
 const STREAM = 'COMMUNICATION';
 const DURABLE_NAME = 'stimulation-server';
 const FILTER_SUBJECT = 'communication.inbound.>';
 
 let safetyGate: SafetyGate | null = null;
+let natsClient: NatsClient | null = null;
 
 export function setSafetyGate(gate: SafetyGate): void {
   safetyGate = gate;
+}
+
+export function setNatsClient(client: NatsClient): void {
+  natsClient = client;
 }
 
 export async function processMessage(msg: JsMsg): Promise<ClassificationResult | null> {
@@ -94,6 +101,41 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
   }));
 
   msg.ack();
+
+  // Run through the full pipeline if classification succeeded
+  if (classification) {
+    const pipelineDeps: PipelineDeps = {
+      nats: natsClient,
+      safety: safetyGate,
+    };
+
+    try {
+      const pipelineResult = await processPipeline(result.data, classification, pipelineDeps);
+      increment('pipelineProcessed');
+
+      console.log(JSON.stringify({
+        level: 'info',
+        msg: 'Pipeline completed',
+        component: 'consumer',
+        eventId: result.data.id,
+        action: pipelineResult.action,
+        responded: pipelineResult.responded,
+        responseEventId: pipelineResult.responseEventId,
+        ts: new Date().toISOString(),
+      }));
+    } catch (err) {
+      console.log(JSON.stringify({
+        level: 'error',
+        msg: 'Pipeline processing failed',
+        component: 'consumer',
+        eventId: result.data.id,
+        error: String(err),
+        ts: new Date().toISOString(),
+      }));
+      increment('errors');
+    }
+  }
+
   return classification;
 }
 

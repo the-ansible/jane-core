@@ -1,7 +1,7 @@
 import { serve } from '@hono/node-server';
 import { createApp, type ServerDeps } from './server.js';
 import { createNatsClient } from './nats/client.js';
-import { startConsumer, setSafetyGate } from './nats/consumer.js';
+import { startConsumer, setSafetyGate, setNatsClient } from './nats/consumer.js';
 import { SafetyGate } from './safety/index.js';
 
 const PORT = parseInt(process.env.PORT || '3102', 10);
@@ -26,6 +26,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
   try {
     deps.nats = await createNatsClient(NATS_URL);
     safety.setNats(deps.nats);
+    setNatsClient(deps.nats);
     // Start consumer in background (infinite loop)
     startConsumer(deps.nats.js).catch((err) => {
       console.log(JSON.stringify({
