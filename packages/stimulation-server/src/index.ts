@@ -3,6 +3,7 @@ import { createApp, type ServerDeps } from './server.js';
 import { createNatsClient } from './nats/client.js';
 import { startConsumer, setSafetyGate, setNatsClient } from './nats/consumer.js';
 import { SafetyGate } from './safety/index.js';
+import { startRetryLoop, stopRetryLoop } from './outbound-queue.js';
 
 const PORT = parseInt(process.env.PORT || '3102', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
@@ -27,6 +28,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     deps.nats = await createNatsClient(NATS_URL);
     safety.setNats(deps.nats);
     setNatsClient(deps.nats);
+    startRetryLoop(deps.nats);
     // Start consumer in background (infinite loop)
     startConsumer(deps.nats.js).catch((err) => {
       console.log(JSON.stringify({
@@ -57,6 +59,7 @@ async function shutdown(signal: string) {
     ts: new Date().toISOString(),
   }));
   try {
+    stopRetryLoop();
     if (deps.nats) {
       await deps.nats.close();
     }

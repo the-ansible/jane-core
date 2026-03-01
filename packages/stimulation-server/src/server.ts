@@ -7,6 +7,7 @@ import { listSessions, getMessageCount, getSession, getContextMessages } from '.
 import { getPipelineStats } from './pipeline-stats.js';
 import type { NatsClient } from './nats/client.js';
 import type { SafetyGate } from './safety/index.js';
+import { getQueueStatus } from './outbound-queue.js';
 
 export interface ServerDeps {
   nats: NatsClient | null;
@@ -34,6 +35,7 @@ export function createApp(deps: ServerDeps): Hono {
       safety: deps.safety?.status() ?? null,
       classification: getClassifierMetrics(),
       pipeline: getPipelineStats(),
+      outboundQueue: getQueueStatus(),
       sessions: {
         active: sessionIds.length,
         totalMessages: sessionIds.reduce((sum, id) => sum + getMessageCount(id), 0),

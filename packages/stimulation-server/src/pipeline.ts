@@ -12,6 +12,7 @@ import { route, type RouteDecision } from './router/index.js';
 import { invokeAgent, type AgentIntent } from './agent/index.js';
 import { compose } from './composer/index.js';
 import { recordPipelineOutcome } from './pipeline-stats.js';
+import { enqueueForRetry } from './outbound-queue.js';
 import {
   getSession,
   appendMessage,
@@ -268,15 +269,20 @@ async function handleAgentResponse(
   } catch (err) {
     console.log(JSON.stringify({
       level: 'error',
-      msg: 'Failed to publish response',
+      msg: 'Failed to publish response, queuing for retry',
       component: 'pipeline',
+      eventId: event.id,
+      responseId: responseEvent.id,
       error: String(err),
       ts: new Date().toISOString(),
     }));
 
+    // Queue for retry instead of losing the composed message
+    enqueueForRetry(subject, responseEvent, event.sessionId, responseEvent.id);
+
     recordPipelineOutcome({
       action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
-      error: `Publish failed: ${err}`,
+      error: `Publish failed (queued for retry): ${err}`,
     });
 
     return {
@@ -284,7 +290,7 @@ async function handleAgentResponse(
       reason: decision.reason,
       responded: false,
       agentIntent: intent,
-      error: `Publish failed: ${err}`,
+      error: `Publish failed (queued for retry): ${err}`,
     };
   }
 }
