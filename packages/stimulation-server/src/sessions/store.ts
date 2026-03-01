@@ -227,10 +227,20 @@ export function listSessions(): string[] {
   return Array.from(inMemory).sort();
 }
 
-/** Get message count for a session */
+/** Get message count for a session (loads from disk if needed) */
 export function getMessageCount(sessionId: string): number {
-  const session = sessions.get(sessionId);
-  return session?.messages.length ?? 0;
+  // Check in-memory first
+  const inMemory = sessions.get(sessionId);
+  if (inMemory) return inMemory.messages.length;
+
+  // Try disk without creating a new session
+  const fromDisk = loadFromDisk(sessionId);
+  if (fromDisk) {
+    sessions.set(sessionId, fromDisk);
+    return fromDisk.messages.length;
+  }
+
+  return 0;
 }
 
 /** Clear all in-memory sessions (for testing) */
