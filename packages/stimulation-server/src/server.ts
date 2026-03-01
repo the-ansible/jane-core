@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
+import { serveStatic } from '@hono/node-server/serve-static';
 import { uuidv7 } from '@the-ansible/life-system-shared';
 import { getMetrics } from './metrics.js';
 import { getRecentEvents, onEvent, pushEvent } from './events.js';
@@ -9,7 +10,6 @@ import { getPipelineStats } from './pipeline-stats.js';
 import type { NatsClient } from './nats/client.js';
 import type { SafetyGate } from './safety/index.js';
 import { getQueueStatus } from './outbound-queue.js';
-import { getDashboardHtml } from './dashboard.js';
 import { compose } from './composer/index.js';
 
 export interface ServerDeps {
@@ -385,11 +385,23 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     });
   });
 
-  // --- Dashboard ---
+  // --- Dashboard (React SPA served from dashboard/dist/) ---
 
+  // Redirect /dashboard to /dashboard/ so relative asset paths resolve correctly
   app.get('/dashboard', (c) => {
-    return c.html(getDashboardHtml());
+    const url = new URL(c.req.url);
+    return c.redirect(url.pathname + '/');
   });
+
+  app.get('/dashboard/assets/*', serveStatic({
+    root: './dashboard/dist',
+    rewriteRequestPath: (path) => path.replace(/^.*\/dashboard/, ''),
+  }));
+
+  app.get('/dashboard/', serveStatic({
+    root: './dashboard/dist',
+    rewriteRequestPath: () => '/index.html',
+  }));
 }
 
 export function createApp(deps: ServerDeps): Hono {

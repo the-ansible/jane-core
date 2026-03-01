@@ -1,7 +1,6 @@
-import type { z } from 'zod';
-import type { communicationEventSchema } from '@the-ansible/life-system-shared';
+import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 
-export type CommunicationEvent = z.infer<typeof communicationEventSchema>;
+export type { CommunicationEvent };
 
 export interface StoredEvent {
   event: CommunicationEvent;

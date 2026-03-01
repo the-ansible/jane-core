@@ -109,7 +109,7 @@ export async function classify(
           tier: 'claude_escalation',
           latencyMs: claudeResult.latencyMs,
         };
-        log('Classified by Claude escalation', result);
+        log('Classified by Claude escalation', result as unknown as Record<string, unknown>);
         safety?.recordLlmCall('claude', ctx.channelType);
         recordClassification(
           'claude_escalation', result.urgency, result.category, result.routing,

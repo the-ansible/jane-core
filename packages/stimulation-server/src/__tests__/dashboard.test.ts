@@ -34,41 +34,11 @@ describe('Dashboard route', () => {
     resetPipelineStats();
   });
 
-  it('GET /dashboard returns 200 with HTML content type', async () => {
+  it('GET /dashboard redirects to /dashboard/ (trailing slash for correct relative paths)', async () => {
     const app = createApp(makeDeps());
-    const res = await app.request('/dashboard');
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('text/html');
-  });
-
-  it('dashboard HTML contains expected panel elements', async () => {
-    const app = createApp(makeDeps());
-    const res = await app.request('/dashboard');
-    const html = await res.text();
-    expect(html).toContain('Stimulation Server');
-    expect(html).toContain('Pipeline Counters');
-    expect(html).toContain('Pipeline Performance');
-    expect(html).toContain('Classification');
-    expect(html).toContain('Safety Gate');
-    expect(html).toContain('Live Events');
-    expect(html).toContain('Active Sessions');
-    expect(html).toContain('Outbound Queue');
-  });
-
-  it('dashboard HTML uses dynamic base path for all API calls', async () => {
-    const app = createApp(makeDeps());
-    const res = await app.request('/dashboard');
-    const html = await res.text();
-    // Should use api() helper for all fetch/SSE calls
-    expect(html).toContain("api('/api/events/stream')");
-    expect(html).toContain("api('/metrics')");
-    expect(html).toContain("api('/api/events/recent");
-    expect(html).toContain("api('/health')");
-    expect(html).toContain("api('/api/sessions')");
-    // Should NOT contain localhost or hardcoded hosts
-    expect(html).not.toContain('localhost:3102');
-    expect(html).not.toContain('http://');
-    expect(html).not.toContain('https://');
+    const res = await app.request('/dashboard', { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/dashboard/');
   });
 
   it('GET / redirects to /dashboard', async () => {
@@ -78,11 +48,11 @@ describe('Dashboard route', () => {
     expect(res.headers.get('location')).toBe('/dashboard');
   });
 
-  it('GET /apps/stim/dashboard returns 200 with HTML (gateway prefix)', async () => {
+  it('GET /apps/stim/dashboard redirects to /apps/stim/dashboard/ (gateway prefix)', async () => {
     const app = createApp(makeDeps());
-    const res = await app.request('/apps/stim/dashboard');
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('text/html');
+    const res = await app.request('/apps/stim/dashboard', { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/apps/stim/dashboard/');
   });
 
   it('GET /apps/stim/metrics returns 200 with JSON (gateway prefix)', async () => {
