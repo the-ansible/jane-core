@@ -2,10 +2,19 @@ import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 
 export type { CommunicationEvent };
 
+export interface EventClassification {
+  urgency: string;
+  category: string;
+  routing: string;
+  confidence: string;
+  tier: string;
+}
+
 export interface StoredEvent {
   event: CommunicationEvent;
   subject: string;
   receivedAt: string;
+  classification?: EventClassification;
 }
 
 const MAX_EVENTS = 50;
@@ -19,11 +28,12 @@ export function onEvent(callback: EventListener): () => void {
   return () => { listeners.delete(callback); };
 }
 
-export function pushEvent(event: CommunicationEvent, subject: string): void {
+export function pushEvent(event: CommunicationEvent, subject: string, classification?: EventClassification): void {
   const stored: StoredEvent = {
     event,
     subject,
     receivedAt: new Date().toISOString(),
+    ...(classification ? { classification } : {}),
   };
   buffer.push(stored);
   if (buffer.length > MAX_EVENTS) {

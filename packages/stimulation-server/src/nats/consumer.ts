@@ -132,7 +132,13 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
     }));
   }
 
-  pushEvent(result.data, msg.subject);
+  pushEvent(result.data, msg.subject, classification ? {
+    urgency: classification.urgency,
+    category: classification.category,
+    routing: classification.routing,
+    confidence: classification.confidence,
+    tier: classification.tier,
+  } : undefined);
   console.log(JSON.stringify({
     level: 'info',
     msg: 'Event received',

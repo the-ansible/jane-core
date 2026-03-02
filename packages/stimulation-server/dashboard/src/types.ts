@@ -38,6 +38,13 @@ export interface Metrics {
   outboundQueue: {
     size: number;
     oldest?: string;
+    messages?: Array<{
+      subject: string;
+      eventId: string;
+      sessionId: string;
+      queuedAt: string;
+      attempts: number;
+    }>;
   } | null;
   sessions: {
     active: number;
@@ -54,6 +61,13 @@ export interface StoredEvent {
     sender?: { displayName?: string };
   };
   receivedAt: string;
+  classification?: {
+    urgency: string;
+    category: string;
+    routing: string;
+    confidence: string;
+    tier: string;
+  };
 }
 
 export interface SessionInfo {

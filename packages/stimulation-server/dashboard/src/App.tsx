@@ -10,7 +10,7 @@ import { EventsFeed } from '@/components/EventsFeed';
 import { SessionsPanel } from '@/components/SessionsPanel';
 
 export default function App() {
-  const { metrics, events, sessions, natsConnected, sseConnected } = useDashboardData();
+  const { metrics, metricsHistory, events, sessions, natsConnected, sseConnected } = useDashboardData();
 
   return (
     <div className="min-h-screen">
@@ -20,7 +20,7 @@ export default function App() {
         <div className="mb-2 text-[13px] font-semibold uppercase tracking-wide text-muted-foreground">
           Pipeline Counters
         </div>
-        <CounterCards metrics={metrics} />
+        <CounterCards metrics={metrics} history={metricsHistory} />
 
         <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
           <PipelinePanel metrics={metrics} />
