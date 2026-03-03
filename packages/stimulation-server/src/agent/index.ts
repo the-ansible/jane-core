@@ -4,12 +4,16 @@
  * produces structured intent for the Composer.
  *
  * Uses Claude CLI with OAuth session (Max 5x) via --print mode.
+ * Spawns agent-job-wrapper.mjs for job persistence and restart recovery.
  */
 
 import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import type { ClassificationResult } from '../classifier/types.js';
-import type { SessionMessage } from '../sessions/store.js';
+import type { AssembledContext } from '../context/types.js';
+import { createJob, markJobFailed } from './job-registry.js';
 
 export interface AgentIntent {
   type: 'reply' | 'update' | 'question' | 'greeting' | 'acknowledgment';
@@ -21,11 +25,27 @@ export interface AgentContext {
   content: string;                        // The inbound message content
   senderName?: string;                    // Who sent it
   classification: ClassificationResult;
-  sessionHistory: SessionMessage[];
+  assembledContext: AssembledContext;
+  // Job recovery context — stored in agent_jobs.context_json for requeue
+  recoveryContext?: { event: any; classification: any };
+  // Set when this job is a recovery of a previously interrupted job
+  recoveryInfo?: { recoveryCount: number; originalStartedAt: string };
 }
 
-const AGENT_TIMEOUT_MS = 90_000; // 90 seconds for thinking
+export interface AgentResult {
+  intent: AgentIntent | null;
+  jobId: string | null;
+}
+
+const AGENT_TIMEOUT_MS = 900_000; // 15 minutes — agent can be slow under contention
 const INNER_VOICE_PATH = '/agent/INNER_VOICE.md';
+
+// Resolve wrapper path relative to this file (works in both dev/prod)
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// dev: src/agent/ → ../../agent-job-wrapper.mjs
+// prod: dist/agent/ → ../../agent-job-wrapper.mjs
+const WRAPPER_PATH = resolve(__dirname, '../../agent-job-wrapper.mjs');
+const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
 
 /** Cache INNER_VOICE.md in memory, reload every 5 minutes */
 let innerVoiceCache: string | null = null;
@@ -90,14 +110,40 @@ Do NOT include any text outside the JSON object.`;
 
 function buildConversationPrompt(context: AgentContext): string {
   const parts: string[] = [];
+  const { assembledContext } = context;
 
-  // Add session history
-  if (context.sessionHistory.length > 0) {
-    parts.push('CONVERSATION HISTORY:');
-    for (const msg of context.sessionHistory) {
+  parts.push('CONVERSATION CONTEXT:');
+  parts.push('');
+
+  // Add summaries section (older conversation compressed)
+  if (assembledContext.summaries.length > 0) {
+    parts.push('[Earlier conversation summaries]');
+    for (const s of assembledContext.summaries) {
+      parts.push(`--- Summary (${s.timeRange}, ${s.messageCount} messages) ---`);
+      if (s.topics.length > 0) {
+        parts.push(`Topics: ${s.topics.join(', ')}`);
+      }
+      parts.push(s.text);
+      parts.push('');
+    }
+  }
+
+  // Add raw messages section (recent conversation verbatim)
+  if (assembledContext.recentMessages.length > 0) {
+    if (assembledContext.summaries.length > 0) {
+      parts.push('[Recent messages — verbatim]');
+    }
+    for (const msg of assembledContext.recentMessages) {
       const role = msg.role === 'user' ? (context.senderName || 'User') : 'Jane';
       parts.push(`${role}: ${msg.content}`);
     }
+    parts.push('');
+  }
+
+  // Recovery notice — prepend if this job is recovering from an interruption
+  if (context.recoveryInfo) {
+    const { recoveryCount, originalStartedAt } = context.recoveryInfo;
+    parts.push(`⚠️ RECOVERY CONTEXT: This is recovery attempt #${recoveryCount} of an interrupted job (originally started: ${originalStartedAt}). The previous run was cut off mid-execution. Check for partial state or side effects before proceeding. If this has been recovered ${recoveryCount >= 3 ? 'multiple times' : 'more than once'}, surface that to the user rather than silently retrying.`);
     parts.push('');
   }
 
@@ -115,22 +161,43 @@ function buildConversationPrompt(context: AgentContext): string {
 
 /**
  * Invoke the agent to process an inbound message.
- * Returns structured intent for the Composer.
+ * Returns structured intent for the Composer, plus the job ID for completion tracking.
  */
-export async function invokeAgent(context: AgentContext): Promise<AgentIntent | null> {
+export async function invokeAgent(context: AgentContext): Promise<AgentResult> {
   const systemPrompt = buildSystemPrompt();
   const conversationPrompt = buildConversationPrompt(context);
-
-  // Combine system prompt and conversation into a single prompt for --print mode
   const fullPrompt = `SYSTEM:\n${systemPrompt}\n\n---\n\n${conversationPrompt}`;
 
   const start = Date.now();
 
+  // Create job row for persistence
+  let jobId: string | null = null;
+  const outputFile = `/tmp/agent-jobs/${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
+
   try {
-    const result = await spawnClaude(fullPrompt);
+    jobId = await createJob({
+      sessionId: context.recoveryContext?.event?.sessionId ?? 'unknown',
+      command: context.content,
+      contextJson: context.recoveryContext ?? {},
+      outputFile,
+    });
+  } catch (err) {
+    // Non-fatal — continue without persistence
+    console.log(JSON.stringify({
+      level: 'warn',
+      msg: 'Failed to create agent job row — proceeding without persistence',
+      component: 'agent',
+      error: String(err),
+      ts: new Date().toISOString(),
+    }));
+  }
+
+  try {
+    const result = await spawnWrapper(fullPrompt, outputFile, jobId);
     const latencyMs = Date.now() - start;
 
     if (!result) {
+      if (jobId) await markJobFailed(jobId, 'Agent returned no result').catch(() => {});
       console.log(JSON.stringify({
         level: 'error',
         msg: 'Agent returned no result',
@@ -138,23 +205,37 @@ export async function invokeAgent(context: AgentContext): Promise<AgentIntent | 
         latencyMs,
         ts: new Date().toISOString(),
       }));
-      return null;
+      return { intent: null, jobId };
     }
 
     const intent = parseAgentResponse(result);
 
-    console.log(JSON.stringify({
-      level: 'info',
-      msg: 'Agent produced intent',
-      component: 'agent',
-      intentType: intent?.type,
-      tone: intent?.tone,
-      latencyMs,
-      ts: new Date().toISOString(),
-    }));
+    if (intent) {
+      console.log(JSON.stringify({
+        level: 'info',
+        msg: 'Agent produced intent',
+        component: 'agent',
+        intentType: intent.type,
+        tone: intent.tone,
+        contentLength: intent.content.length,
+        latencyMs,
+        ts: new Date().toISOString(),
+      }));
+    } else {
+      if (jobId) await markJobFailed(jobId, 'Agent returned empty result').catch(() => {});
+      console.log(JSON.stringify({
+        level: 'error',
+        msg: 'Agent returned empty result',
+        component: 'agent',
+        rawPreview: result.slice(0, 500),
+        latencyMs,
+        ts: new Date().toISOString(),
+      }));
+    }
 
-    return intent;
+    return { intent, jobId };
   } catch (err) {
+    if (jobId) await markJobFailed(jobId, String(err)).catch(() => {});
     console.log(JSON.stringify({
       level: 'error',
       msg: 'Agent invocation failed',
@@ -163,7 +244,7 @@ export async function invokeAgent(context: AgentContext): Promise<AgentIntent | 
       latencyMs: Date.now() - start,
       ts: new Date().toISOString(),
     }));
-    return null;
+    return { intent: null, jobId };
   }
 }
 
@@ -174,34 +255,64 @@ function stripClaudeCodeEnv(): Record<string, string | undefined> {
   return env;
 }
 
-function spawnClaude(prompt: string): Promise<string | null> {
+/**
+ * Spawn the agent-job-wrapper which runs Claude CLI and handles persistence.
+ * Falls back to direct Claude spawn if wrapper path doesn't exist.
+ */
+function spawnWrapper(prompt: string, outputFile: string, jobId: string | null): Promise<string | null> {
   return new Promise((resolve) => {
-    const proc = spawn('claude', [
-      '--print',
-      '--dangerously-skip-permissions',
-      '--output-format', 'json',
-      '--max-turns', '1',
-      '--model', 'sonnet',
-      '-p', '-',
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/agent',
-      env: stripClaudeCodeEnv(),
-      timeout: AGENT_TIMEOUT_MS,
-    });
+    const env: Record<string, string | undefined> = {
+      ...stripClaudeCodeEnv(),
+      OUTPUT_FILE: outputFile,
+      NATS_URL,
+    };
+    if (jobId) env.JOB_ID = jobId;
+
+    let proc: ReturnType<typeof spawn>;
+
+    // Check if wrapper exists; fall back to direct claude if not
+    if (existsSync(WRAPPER_PATH)) {
+      proc = spawn('node', [WRAPPER_PATH], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: '/agent',
+        env,
+        timeout: AGENT_TIMEOUT_MS,
+      });
+    } else {
+      // Fallback: spawn claude directly (no wrapper persistence)
+      console.log(JSON.stringify({
+        level: 'warn',
+        msg: 'Wrapper not found, falling back to direct claude spawn',
+        component: 'agent',
+        wrapperPath: WRAPPER_PATH,
+        ts: new Date().toISOString(),
+      }));
+      proc = spawn('claude', [
+        '--print',
+        '--dangerously-skip-permissions',
+        '--output-format', 'json',
+        '--model', 'sonnet',
+        '-p', '-',
+      ], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: '/agent',
+        env: stripClaudeCodeEnv(),
+        timeout: AGENT_TIMEOUT_MS,
+      });
+    }
 
     let stdout = '';
     let stderr = '';
     let timedOut = false;
 
-    proc.stdin.write(prompt);
-    proc.stdin.end();
+    proc.stdin!.write(prompt);
+    proc.stdin!.end();
 
-    proc.stdout.on('data', (chunk: Buffer) => {
+    proc.stdout!.on('data', (chunk: Buffer) => {
       stdout += chunk.toString();
     });
 
-    proc.stderr.on('data', (chunk: Buffer) => {
+    proc.stderr!.on('data', (chunk: Buffer) => {
       stderr += chunk.toString();
     });
 
@@ -246,7 +357,7 @@ function spawnClaude(prompt: string): Promise<string | null> {
 }
 
 /** Parse Claude CLI JSON output to extract the agent's response */
-function parseAgentResponse(stdout: string): AgentIntent | null {
+export function parseAgentResponse(stdout: string): AgentIntent | null {
   // First, parse the Claude CLI JSON output format
   let resultText: string | null = null;
 
@@ -262,10 +373,31 @@ function parseAgentResponse(stdout: string): AgentIntent | null {
 
     // Handle array format
     if (!resultText && Array.isArray(parsed)) {
+      // First try to get the result entry
       for (const msg of parsed) {
         if (msg.type === 'result' && msg.result) {
           resultText = msg.result;
           break;
+        }
+      }
+
+      // If result is empty, extract text from assistant message content blocks
+      if (!resultText) {
+        for (const msg of parsed) {
+          if (msg.type === 'assistant' && msg.message?.content) {
+            const textBlocks = Array.isArray(msg.message.content)
+              ? msg.message.content
+                  .filter((b: { type: string; text?: string }) => b.type === 'text' && b.text)
+                  .map((b: { text: string }) => b.text)
+                  .join('\n')
+              : typeof msg.message.content === 'string'
+                ? msg.message.content
+                : null;
+            if (textBlocks) {
+              resultText = textBlocks;
+              break;
+            }
+          }
         }
       }
     }

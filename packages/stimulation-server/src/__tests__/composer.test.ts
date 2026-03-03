@@ -28,6 +28,7 @@ import { spawn } from 'node:child_process';
 import { compose, _resetCaches } from '../composer/index.js';
 import type { AgentIntent } from '../agent/index.js';
 import type { SessionMessage } from '../sessions/store.js';
+import type { AssembledContext } from '../context/types.js';
 
 const mockSpawn = vi.mocked(spawn);
 
@@ -50,6 +51,20 @@ function makeHistory(count: number): SessionMessage[] {
     });
   }
   return messages;
+}
+
+function makeAssembledContext(messages: SessionMessage[]): AssembledContext {
+  return {
+    summaries: [],
+    recentMessages: messages,
+    meta: {
+      assemblyLogId: 'test-log-id', planName: 'baseline_v1', summaryCount: 0,
+      rawMessageCount: messages.length, totalMessageCoverage: messages.length,
+      estimatedTokens: 0, rawTokens: 0, summaryTokens: 0, summaryBudget: 12000,
+      budgetUtilization: 0, rawOverBudget: false, assemblyMs: 1,
+      summarizationMs: null, newSummariesCreated: 0,
+    },
+  };
 }
 
 function captureStdinFromSpawn(): string {
@@ -127,7 +142,7 @@ describe('Composer', () => {
 
       const promise = compose({
         intent: makeIntent(),
-        sessionHistory: [],
+        assembledContext: makeAssembledContext([]),
         senderName: 'Chris',
       });
 
@@ -155,7 +170,7 @@ describe('Composer', () => {
 
       const promise = compose({
         intent: makeIntent(),
-        sessionHistory: [],
+        assembledContext: makeAssembledContext([]),
       });
 
       vi.advanceTimersByTime(100);
@@ -180,7 +195,7 @@ describe('Composer', () => {
 
       const promise = compose({
         intent: makeIntent(),
-        sessionHistory: [],
+        assembledContext: makeAssembledContext([]),
       });
 
       vi.advanceTimersByTime(100);
@@ -202,7 +217,7 @@ describe('Composer', () => {
 
       const promise = compose({
         intent: makeIntent(),
-        sessionHistory: history,
+        assembledContext: makeAssembledContext(history),
         senderName: 'Chris',
       });
 
@@ -223,10 +238,10 @@ describe('Composer', () => {
 
       const promise = compose({
         intent: makeIntent(),
-        sessionHistory: [
+        assembledContext: makeAssembledContext([
           { role: 'user', content: 'Hello', timestamp: new Date().toISOString() },
           { role: 'assistant', content: 'Hi there', timestamp: new Date().toISOString() },
-        ],
+        ]),
         senderName: 'Chris',
       });
 
@@ -259,7 +274,7 @@ describe('Composer', () => {
 
       const promise = compose({
         intent: makeIntent({ content: 'Fallback content' }),
-        sessionHistory: [],
+        assembledContext: makeAssembledContext([]),
       });
 
       vi.advanceTimersByTime(100);

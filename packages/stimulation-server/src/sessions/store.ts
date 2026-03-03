@@ -27,6 +27,7 @@ function getSessionsDir(): string {
 }
 const COMPACTION_THRESHOLD = 40;
 const KEEP_RECENT = 10; // Keep last N raw messages after compaction
+const IN_MEMORY_CAP = 100; // Max messages to keep in memory (disk keeps everything)
 
 // In-memory session cache
 const sessions = new Map<string, SessionState>();
@@ -136,12 +137,18 @@ export function appendMessage(sessionId: string, message: SessionMessage): void 
   session.messages.push(message);
   session.lastActivityAt = message.timestamp;
 
-  // Write-through to disk
+  // Write-through to disk (disk file keeps everything)
   ensureDir();
   appendFileSync(
     sessionFilePath(sessionId),
     JSON.stringify({ type: 'message', message }) + '\n'
   );
+
+  // In-memory cap: trim oldest messages to stay under limit.
+  // Disk file retains all messages for re-summarization.
+  if (session.messages.length > IN_MEMORY_CAP) {
+    session.messages = session.messages.slice(-IN_MEMORY_CAP);
+  }
 }
 
 /** Get recent messages for context (returns last N messages) */
@@ -241,6 +248,33 @@ export function getMessageCount(sessionId: string): number {
   }
 
   return 0;
+}
+
+/**
+ * Get messages from a specific index to the end of the session.
+ * Used by the context assembler to get raw messages from the summary boundary.
+ */
+export function getMessagesSince(sessionId: string, startIdx: number): SessionMessage[] {
+  const session = getSession(sessionId);
+  if (startIdx < 0) return session.messages;
+  return session.messages.slice(startIdx);
+}
+
+/**
+ * Count total messages stored on disk for a session.
+ * May differ from session.messages.length for active sessions that have been trimmed.
+ */
+export function getDiskMessageCount(sessionId: string): number {
+  const filePath = sessionFilePath(sessionId);
+  if (!existsSync(filePath)) return 0;
+  try {
+    const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+    return lines.filter(line => {
+      try { return JSON.parse(line).type === 'message'; } catch { return false; }
+    }).length;
+  } catch {
+    return 0;
+  }
 }
 
 /** Clear all in-memory sessions (for testing) */

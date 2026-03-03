@@ -8,15 +8,35 @@ This monorepo contains the communication pipeline, event processing, and safety 
 
 ### [`stimulation-server`](./packages/stimulation-server/)
 
-Always-on NATS JetStream consumer that receives inbound communication events, validates them, and (soon) classifies and responds. Named after the biological stimulus-response model — external stimuli arrive, get classified by urgency and type, and route to the appropriate response pathway.
+Always-on NATS JetStream consumer that receives inbound communication events, classifies them, and routes them through the full pipeline: classify → agent → compose → respond. Named after the biological stimulus-response model — external stimuli arrive, get classified by urgency and type, and route to the appropriate response pathway. Round-trip verified ~11-13s end-to-end (2026-02-28).
 
 **Features:**
 - Durable pull consumer on NATS JetStream COMMUNICATION stream
 - Event validation against shared Zod schema (`communicationEventSchema`)
+- Tiered classifier: rules → Ollama 3x consensus → Claude escalation
+- Claude agent invocation with session context + active plan awareness
+- Voice composition layer (Jane's tone applied before outbound publish)
 - Safety layer: rate limits, circuit breakers, flood detection, LLM loop detection, memory pressure monitoring
 - Manual pause/resume controls for human override
-- Admin/debug HTTP endpoints for interactive testing
-- 64 tests across 6 suites
+- Outbound retry queue for failed NATS publishes
+- Pipeline run tracking with per-stage telemetry
+- Live observability dashboard — React/Vite SPA, SSE real-time, served at `http://localhost:3102/`
+- Admin/debug HTTP endpoints (`/health`, `/metrics`, `/api/sessions`, `/api/pipeline`, etc.)
+- 176 tests across 21 suites
+
+### Dashboard
+
+Built-in observability UI served directly by the stimulation server at `http://localhost:3102/`. React + Vite SPA, SSE-connected for real-time updates.
+
+**Panels:**
+- **Counter Cards** — Received / Validated / Classified / Processed / Errors / Deduped, each with live per/min rate and sparkline history
+- **Pipeline Runs** — Per-message stage progress bar (Route → Safety → Context → Agent → Composer → Publish), click to expand per-stage timing and errors, live duration for active runs
+- **Classification** — Tier distribution bar (rules/consensus/escalation/fallback), urgency/category/routing/confidence breakdowns, Ollama consensus agreement stats
+- **Safety Gate** — Rate limit progress bars, circuit breaker state indicators, LLM loop detection, memory pressure
+- **Outbound Queue** — Queue depth and retry state
+- **Events Feed** — Live SSE event stream
+- **Sessions** — All active sessions with context visualization (raw/summarized/excluded/disk status per message), expandable to full message history
+- **Test Sender** — Inject test inbound events directly from the dashboard
 
 ### [`event-drainer`](./packages/event-drainer/)
 

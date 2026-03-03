@@ -8,9 +8,10 @@ import { OutboundQueuePanel } from '@/components/OutboundQueuePanel';
 import { TestSender } from '@/components/TestSender';
 import { EventsFeed } from '@/components/EventsFeed';
 import { SessionsPanel } from '@/components/SessionsPanel';
+import { PipelineRunsPanel } from '@/components/PipelineRunsPanel';
 
 export default function App() {
-  const { metrics, metricsHistory, events, sessions, natsConnected, sseConnected } = useDashboardData();
+  const { metrics, metricsHistory, events, sessions, natsConnected, sseConnected, pipelineRuns, recoveryReport } = useDashboardData();
 
   return (
     <div className="min-h-screen">
@@ -21,6 +22,10 @@ export default function App() {
           Pipeline Counters
         </div>
         <CounterCards metrics={metrics} history={metricsHistory} />
+
+        <div className="mt-4">
+          <PipelineRunsPanel pipelineRuns={pipelineRuns} recoveryReport={recoveryReport} />
+        </div>
 
         <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
           <PipelinePanel metrics={metrics} />

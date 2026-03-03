@@ -14,10 +14,12 @@
     "@hono/node-server": "^1.19.9",
     "@the-ansible/life-system-shared": "file:../../../../packages/life-system-shared",
     "hono": "^4.0.0",
-    "nats": "^2.29.0"
+    "nats": "^2.29.0",
+    "pg": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.16.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^1.2.0"

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { apiUrl } from '@/lib/utils';
-import type { Metrics, StoredEvent, SessionInfo } from '@/types';
+import type { Metrics, StoredEvent, SessionInfo, PipelineRun, RecoveryReport } from '@/types';
 
 const MAX_EVENTS = 50;
 const MAX_HISTORY = 60; // 60 snapshots * 5s = 5 minutes
@@ -14,6 +14,8 @@ export function useDashboardData() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [natsConnected, setNatsConnected] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
+  const [pipelineRuns, setPipelineRuns] = useState<PipelineRun[]>([]);
+  const [recoveryReport, setRecoveryReport] = useState<RecoveryReport | null>(null);
 
   const sseRef = useRef(false);
 
@@ -31,6 +33,15 @@ export function useDashboardData() {
       const next = [...prev, snap];
       return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
     });
+    // Sync active pipeline runs from metrics snapshot
+    if (data.pipelineRuns?.active) {
+      setPipelineRuns((prev) => {
+        const activeIds = new Set(data.pipelineRuns!.active.map(r => r.runId));
+        // Keep completed runs that haven't expired yet, replace active ones
+        const completed = prev.filter(r => r.status !== 'running' && !activeIds.has(r.runId));
+        return [...completed, ...data.pipelineRuns!.active];
+      });
+    }
   }, []);
 
   const fetchSessions = useCallback(() => {
@@ -78,6 +89,30 @@ export function useDashboardData() {
         try {
           const data = JSON.parse((e as MessageEvent).data) as Metrics;
           handleMetrics(data);
+        } catch {}
+      });
+
+      es.addEventListener('recovery-status', (e) => {
+        try {
+          const report = JSON.parse((e as MessageEvent).data) as RecoveryReport;
+          setRecoveryReport(report);
+        } catch {}
+      });
+
+      es.addEventListener('pipeline-run', (e) => {
+        try {
+          const run = JSON.parse((e as MessageEvent).data) as PipelineRun;
+          setPipelineRuns((prev) => {
+            const idx = prev.findIndex(r => r.runId === run.runId);
+            const next = idx >= 0
+              ? [...prev.slice(0, idx), run, ...prev.slice(idx + 1)]
+              : [...prev, run];
+            // Auto-remove completed runs after 60s
+            const cutoff = Date.now() - 60_000;
+            return next.filter(r =>
+              r.status === 'running' || !r.completedAt || new Date(r.completedAt).getTime() > cutoff
+            );
+          });
         } catch {}
       });
 
@@ -130,6 +165,31 @@ export function useDashboardData() {
       .then(handleMetrics)
       .catch(() => {});
 
+    fetch(apiUrl('/api/recovery'))
+      .then((r) => r.json())
+      .then((data) => { if (data.recovery) setRecoveryReport(data.recovery); })
+      .catch(() => {});
+
+    // Load full pipeline run history (active + recent) on startup
+    fetch(apiUrl('/api/pipeline/runs'))
+      .then((r) => r.json())
+      .then((data) => {
+        const recent: PipelineRun[] = data.recent || [];
+        const active: PipelineRun[] = data.active || [];
+        if (recent.length === 0 && active.length === 0) return;
+        setPipelineRuns((prev) => {
+          const existingIds = new Set(prev.map(r => r.runId));
+          // Deduplicate: active wins over recent for same runId
+          const byId = new Map<string, PipelineRun>();
+          for (const run of [...recent, ...active]) byId.set(run.runId, run);
+          // Don't overwrite runs already tracked via SSE (they're more current)
+          const newOnes = Array.from(byId.values()).filter(r => !existingIds.has(r.runId));
+          if (newOnes.length === 0) return prev;
+          return [...prev, ...newOnes];
+        });
+      })
+      .catch(() => {});
+
     return () => {
       es?.close();
       clearInterval(metricsTimer);
@@ -148,5 +208,5 @@ export function useDashboardData() {
     return () => clearInterval(timer);
   }, [fetchSessions, fetchHealth]);
 
-  return { metrics, metricsHistory, events, sessions, natsConnected, sseConnected };
+  return { metrics, metricsHistory, events, sessions, natsConnected, sseConnected, pipelineRuns, recoveryReport };
 }

@@ -20,11 +20,67 @@ vi.mock('../composer/index.js', () => ({
   compose: vi.fn(),
 }));
 
+// Mock context assembler
+vi.mock('../context/assembler.js', () => ({
+  assembleContext: vi.fn().mockResolvedValue({
+    summaries: [],
+    recentMessages: [],
+    meta: {
+      assemblyLogId: 'test-assembly-log-id',
+      planName: 'baseline_v1',
+      summaryCount: 0,
+      rawMessageCount: 0,
+      totalMessageCoverage: 0,
+      estimatedTokens: 0,
+      rawTokens: 0,
+      summaryTokens: 0,
+      summaryBudget: 12000,
+      budgetUtilization: 0,
+      rawOverBudget: false,
+      assemblyMs: 5,
+      summarizationMs: null,
+      newSummariesCreated: 0,
+    },
+  }),
+}));
+
+// Mock context DB
+vi.mock('../context/db.js', () => ({
+  updateAssemblyOutcome: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Mock pipeline runs
+vi.mock('../pipeline-runs.js', () => ({
+  startRun: vi.fn().mockReturnValue({ runId: 'test-run-id' }),
+  beginStage: vi.fn(),
+  completeStage: vi.fn(),
+  failStage: vi.fn(),
+  completeRun: vi.fn(),
+  setRunOutputs: vi.fn(),
+}));
+
+// Mock job registry (no DB in tests)
+vi.mock('../agent/job-registry.js', () => ({
+  markJobCompleted: vi.fn().mockResolvedValue(undefined),
+  markJobFailed: vi.fn().mockResolvedValue(undefined),
+  getJobById: vi.fn().mockResolvedValue(null),
+}));
+
 import { invokeAgent } from '../agent/index.js';
 import { compose } from '../composer/index.js';
+import { assembleContext } from '../context/assembler.js';
+import { updateAssemblyOutcome } from '../context/db.js';
+import { startRun, beginStage, completeStage, failStage, completeRun } from '../pipeline-runs.js';
 
 const mockInvokeAgent = vi.mocked(invokeAgent);
 const mockCompose = vi.mocked(compose);
+const mockAssembleContext = vi.mocked(assembleContext);
+const mockUpdateOutcome = vi.mocked(updateAssemblyOutcome);
+const mockStartRun = vi.mocked(startRun);
+const mockBeginStage = vi.mocked(beginStage);
+const mockCompleteStage = vi.mocked(completeStage);
+const mockFailStage = vi.mocked(failStage);
+const mockCompleteRun = vi.mocked(completeRun);
 
 function makeEvent(overrides: Partial<CommunicationEvent> = {}): CommunicationEvent {
   return {
@@ -101,9 +157,8 @@ describe('Pipeline', () => {
   describe('reply routing', () => {
     it('invokes agent and composer for reply routing', async () => {
       mockInvokeAgent.mockResolvedValue({
-        type: 'reply',
-        content: 'I am doing great!',
-        tone: 'casual',
+        intent: { type: 'reply', content: 'I am doing great!', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue('Doing great! What about you?');
 
@@ -130,9 +185,8 @@ describe('Pipeline', () => {
 
     it('publishes to correct NATS subject', async () => {
       mockInvokeAgent.mockResolvedValue({
-        type: 'reply',
-        content: 'Response',
-        tone: 'casual',
+        intent: { type: 'reply', content: 'Response', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue('Composed response');
 
@@ -160,9 +214,8 @@ describe('Pipeline', () => {
 
     it('records both inbound and outbound in session', async () => {
       mockInvokeAgent.mockResolvedValue({
-        type: 'reply',
-        content: 'Intent',
-        tone: 'casual',
+        intent: { type: 'reply', content: 'Intent', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue('Composed');
 
@@ -187,7 +240,7 @@ describe('Pipeline', () => {
 
   describe('error handling', () => {
     it('handles agent returning null', async () => {
-      mockInvokeAgent.mockResolvedValue(null);
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
 
       const result = await processPipeline(
         makeEvent(),
@@ -203,9 +256,8 @@ describe('Pipeline', () => {
 
     it('handles composer returning null', async () => {
       mockInvokeAgent.mockResolvedValue({
-        type: 'reply',
-        content: 'Intent here',
-        tone: 'casual',
+        intent: { type: 'reply', content: 'Intent here', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue(null);
 
@@ -221,9 +273,8 @@ describe('Pipeline', () => {
 
     it('handles NATS not connected', async () => {
       mockInvokeAgent.mockResolvedValue({
-        type: 'reply',
-        content: 'Intent',
-        tone: 'casual',
+        intent: { type: 'reply', content: 'Intent', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue('Composed');
 
@@ -239,9 +290,8 @@ describe('Pipeline', () => {
 
     it('handles NATS publish failure', async () => {
       mockInvokeAgent.mockResolvedValue({
-        type: 'reply',
-        content: 'Intent',
-        tone: 'casual',
+        intent: { type: 'reply', content: 'Intent', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue('Composed');
 
@@ -282,7 +332,7 @@ describe('Pipeline', () => {
     });
 
     it('proceeds when safety gate allows', async () => {
-      mockInvokeAgent.mockResolvedValue(null);
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
 
       const mockSafety = {
         canCallClaude: vi.fn().mockReturnValue({ allowed: true, reasons: [] }),
@@ -300,9 +350,8 @@ describe('Pipeline', () => {
 
     it('records LLM calls for both agent and composer', async () => {
       mockInvokeAgent.mockResolvedValue({
-        type: 'reply',
-        content: 'Intent',
-        tone: 'casual',
+        intent: { type: 'reply', content: 'Intent', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue('Composed');
 
@@ -345,7 +394,7 @@ describe('Pipeline', () => {
     });
 
     it('falls back to sender id when no displayName', async () => {
-      mockInvokeAgent.mockResolvedValue(null);
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
 
       const mockSafety = {
         canCallClaude: vi.fn().mockReturnValue({ allowed: true, reasons: [] }),
@@ -382,9 +431,8 @@ describe('Pipeline', () => {
       });
 
       mockInvokeAgent.mockResolvedValue({
-        type: 'acknowledgment',
-        content: 'Acknowledged',
-        tone: 'casual',
+        intent: { type: 'acknowledgment', content: 'Acknowledged', tone: 'casual' },
+        jobId: null,
       });
       mockCompose.mockResolvedValue('Thanks!');
 
@@ -437,9 +485,129 @@ describe('Pipeline', () => {
     });
   });
 
+  describe('pipeline run tracking', () => {
+    it('starts a run and completes on log-only', async () => {
+      await processPipeline(
+        makeEvent({ sessionId: 'tracking-log-sess' }),
+        makeClassification({ routing: 'log_only' }),
+        makeDeps()
+      );
+
+      expect(mockStartRun).toHaveBeenCalledWith(expect.objectContaining({
+        runId: '019502e4-0000-7000-8000-000000000001',
+        sessionId: 'tracking-log-sess',
+      }));
+      expect(mockCompleteRun).toHaveBeenCalledWith('test-run-id', 'success', expect.objectContaining({ routeAction: 'log' }));
+    });
+
+    it('tracks all stages on successful reply', async () => {
+      mockInvokeAgent.mockResolvedValue({ intent: { type: 'reply', content: 'Hi', tone: 'casual' }, jobId: null });
+      mockCompose.mockResolvedValue('Hey!');
+
+      const mockNats = {
+        isConnected: () => true,
+        publish: vi.fn().mockResolvedValue(undefined),
+      } as any;
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps({ nats: mockNats })
+      );
+
+      expect(mockBeginStage).toHaveBeenCalledWith('test-run-id', 'routing');
+      expect(mockCompleteStage).toHaveBeenCalledWith('test-run-id', 'routing', 'reply');
+      expect(mockBeginStage).toHaveBeenCalledWith('test-run-id', 'safety_check');
+      expect(mockBeginStage).toHaveBeenCalledWith('test-run-id', 'context_assembly');
+      expect(mockBeginStage).toHaveBeenCalledWith('test-run-id', 'agent');
+      expect(mockBeginStage).toHaveBeenCalledWith('test-run-id', 'composer');
+      expect(mockBeginStage).toHaveBeenCalledWith('test-run-id', 'publish');
+      expect(mockCompleteRun).toHaveBeenCalledWith('test-run-id', 'success', expect.objectContaining({ routeAction: 'reply' }));
+    });
+
+    it('fails stage on agent null', async () => {
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps()
+      );
+
+      expect(mockFailStage).toHaveBeenCalledWith('test-run-id', 'agent', 'Agent returned no intent');
+      expect(mockCompleteRun).toHaveBeenCalledWith('test-run-id', 'failure', expect.objectContaining({ error: 'Agent returned no intent' }));
+    });
+
+    it('fails stage on safety block', async () => {
+      const mockSafety = {
+        canCallClaude: vi.fn().mockReturnValue({ allowed: false, reasons: ['Rate limit'] }),
+      } as any;
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps({ safety: mockSafety })
+      );
+
+      expect(mockFailStage).toHaveBeenCalledWith('test-run-id', 'safety_check', expect.stringContaining('Blocked by safety'));
+      expect(mockCompleteRun).toHaveBeenCalledWith('test-run-id', 'failure', expect.objectContaining({ error: expect.stringContaining('Blocked by safety') }));
+    });
+  });
+
+  describe('recovery context injection', () => {
+    it('injects recoveryInfo into agent context when redeliveryCount > 1', async () => {
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
+
+      await processPipeline(
+        makeEvent({ timestamp: '2026-02-28T12:00:00.000Z' }),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps(),
+        { redeliveryCount: 2 }
+      );
+
+      expect(mockInvokeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recoveryInfo: {
+            recoveryCount: 1,
+            originalStartedAt: '2026-02-28T12:00:00.000Z',
+          },
+        })
+      );
+    });
+
+    it('does not inject recoveryInfo when redeliveryCount is 1', async () => {
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps(),
+        { redeliveryCount: 1 }
+      );
+
+      expect(mockInvokeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ recoveryInfo: undefined })
+      );
+    });
+
+    it('does not inject recoveryInfo when opts is absent', async () => {
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps()
+      );
+
+      expect(mockInvokeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ recoveryInfo: undefined })
+      );
+    });
+  });
+
   describe('think and escalate routing', () => {
     it('handles think routing same as reply', async () => {
-      mockInvokeAgent.mockResolvedValue(null);
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
 
       const result = await processPipeline(
         makeEvent(),
@@ -452,7 +620,7 @@ describe('Pipeline', () => {
     });
 
     it('handles escalate routing same as reply', async () => {
-      mockInvokeAgent.mockResolvedValue(null);
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
 
       const result = await processPipeline(
         makeEvent(),

@@ -11,11 +11,11 @@
 import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import type { AgentIntent } from '../agent/index.js';
-import type { SessionMessage } from '../sessions/store.js';
+import type { AssembledContext } from '../context/types.js';
 
 export interface ComposerInput {
   intent: AgentIntent;
-  sessionHistory: SessionMessage[];
+  assembledContext: AssembledContext;
   senderName?: string;
 }
 
@@ -125,10 +125,20 @@ function buildComposerPrompt(input: ComposerInput): string {
     parts.push('');
   }
 
-  // Recent conversation for context — last 8 for better continuity
-  if (input.sessionHistory.length > 0) {
+  // Summaries for broader context (composer gets fewer per plan overrides)
+  if (input.assembledContext.summaries.length > 0) {
+    parts.push('CONVERSATION CONTEXT (summaries):');
+    for (const s of input.assembledContext.summaries) {
+      parts.push(`--- ${s.timeRange} (${s.messageCount} messages) ---`);
+      parts.push(s.text);
+    }
+    parts.push('');
+  }
+
+  // Recent conversation for tone/continuity — last 8 from raw messages
+  if (input.assembledContext.recentMessages.length > 0) {
     parts.push('RECENT CONVERSATION (for tone/continuity):');
-    const recent = input.sessionHistory.slice(-8);
+    const recent = input.assembledContext.recentMessages.slice(-8);
     for (const msg of recent) {
       const role = msg.role === 'user' ? (input.senderName || 'User') : 'Jane';
       parts.push(`${role}: ${msg.content}`);

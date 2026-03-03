@@ -1,5 +1,7 @@
+import { useState } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
+import { apiUrl } from '@/lib/utils';
 import type { Metrics } from '@/types';
 
 interface SafetyPanelProps {
@@ -7,6 +9,33 @@ interface SafetyPanelProps {
 }
 
 export function SafetyPanel({ metrics }: SafetyPanelProps) {
+  const [includeRunning, setIncludeRunning] = useState(false);
+  const [panicPending, setPanicPending] = useState(false);
+  const [panicResult, setPanicResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  async function triggerPanic() {
+    if (panicPending) return;
+    setPanicPending(true);
+    setPanicResult(null);
+    try {
+      const res = await fetch(apiUrl('/api/panic'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ includeRunning }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        const parts = [`${data.clearedQueued} queued cleared`];
+        if (includeRunning) parts.push(`${data.clearedRunning} running killed`);
+        setPanicResult({ ok: true, text: parts.join(', ') });
+      } else {
+        setPanicResult({ ok: false, text: data.error || 'Failed' });
+      }
+    } catch {
+      setPanicResult({ ok: false, text: 'Network error' });
+    }
+    setPanicPending(false);
+  }
   const safety = metrics?.safety;
   const rl = safety?.rateLimits || {};
   const breakers = safety?.circuitBreakers || {};
@@ -83,6 +112,34 @@ export function SafetyPanel({ metrics }: SafetyPanelProps) {
             </span>
           ) : (
             <span className="font-mono text-xs text-muted-foreground">--</span>
+          )}
+        </div>
+
+        {/* Panic button */}
+        <div className="mt-4 border-t border-border pt-3">
+          <div className="mb-2 text-[11px] text-muted-foreground">Stuck Job Controls</div>
+          <button
+            onClick={triggerPanic}
+            disabled={panicPending}
+            className="rounded bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground hover:opacity-90 disabled:opacity-50"
+          >
+            {panicPending ? 'Clearing…' : 'Clear Stuck Jobs'}
+          </button>
+          <label className="ml-3 flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground inline-flex">
+            <input
+              type="checkbox"
+              checked={includeRunning}
+              onChange={(e) => setIncludeRunning(e.target.checked)}
+              className="h-3 w-3"
+            />
+            Also kill running jobs
+          </label>
+          {panicResult && (
+            <div
+              className={`mt-1.5 text-[11px] font-mono ${panicResult.ok ? 'text-primary' : 'text-destructive'}`}
+            >
+              {panicResult.text}
+            </div>
           )}
         </div>
       </CardContent>

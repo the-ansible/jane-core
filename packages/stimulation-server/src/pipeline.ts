@@ -3,25 +3,29 @@
  * This is the main processing pipeline for inbound communication events.
  */
 
+import { readFileSync } from 'node:fs';
 import { uuidv7 } from '@the-ansible/life-system-shared';
 import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 import type { ClassificationResult } from './classifier/types.js';
 import type { NatsClient } from './nats/client.js';
 import type { SafetyGate } from './safety/index.js';
 import { route, type RouteDecision } from './router/index.js';
-import { invokeAgent, type AgentIntent } from './agent/index.js';
+import { invokeAgent, parseAgentResponse, type AgentIntent } from './agent/index.js';
+import { markJobCompleted, markJobFailed, getJobById, type AgentJob } from './agent/job-registry.js';
 import { compose } from './composer/index.js';
 import { recordPipelineOutcome } from './pipeline-stats.js';
 import { enqueueForRetry } from './outbound-queue.js';
 import { pushEvent } from './events.js';
 import {
+  startRun, beginStage, completeStage, failStage, completeRun, setRunOutputs, getRunByJobId,
+} from './pipeline-runs.js';
+import {
   getSession,
   appendMessage,
-  getContextMessages,
-  needsCompaction,
-  compactSession,
   type SessionMessage,
 } from './sessions/store.js';
+import { assembleContext } from './context/assembler.js';
+import { updateAssemblyOutcome } from './context/db.js';
 
 export interface PipelineDeps {
   nats: NatsClient | null;
@@ -44,9 +48,23 @@ export interface PipelineResult {
 export async function processPipeline(
   event: CommunicationEvent,
   classification: ClassificationResult,
-  deps: PipelineDeps
+  deps: PipelineDeps,
+  opts?: { recoveredJobId?: string; redeliveryCount?: number }
 ): Promise<PipelineResult> {
+  // Start pipeline run tracking
+  const senderName = event.sender?.displayName || event.sender?.id || 'User';
+  const run = startRun({
+    runId: event.id,
+    sessionId: event.sessionId,
+    channelType: event.channelType,
+    senderName,
+    contentPreview: event.content.slice(0, 120),
+    classification: classification.routing,
+    recoveredJobId: opts?.recoveredJobId,
+  });
+
   // 1. Route based on classification
+  beginStage(run.runId, 'routing');
   const decision = route(classification);
 
   // Active-session override: if routed to log_only but session has recent Jane activity,
@@ -73,8 +91,9 @@ export async function processPipeline(
     ts: new Date().toISOString(),
   }));
 
+  completeStage(run.runId, 'routing', decision.action);
+
   // 2. Record inbound message in session
-  const senderName = event.sender?.displayName || event.sender?.id || 'User';
   appendMessage(event.sessionId, {
     role: 'user',
     content: event.content,
@@ -89,19 +108,21 @@ export async function processPipeline(
     case 'log': {
       const result = { action: 'log', reason: decision.reason, responded: false };
       recordPipelineOutcome({ action: 'log', responded: false, totalMs: Date.now() - pipelineStart });
+      completeRun(run.runId, 'success', { routeAction: 'log' });
       return result;
     }
 
     case 'reply':
     case 'think':
     case 'escalate': {
-      const result = await handleAgentResponse(event, classification, decision, senderName, deps, pipelineStart);
+      const result = await handleAgentResponse(event, classification, decision, senderName, deps, pipelineStart, run.runId, opts);
       return result;
     }
 
     default: {
       const result = { action: decision.action, reason: decision.reason, responded: false };
       recordPipelineOutcome({ action: decision.action, responded: false, totalMs: Date.now() - pipelineStart });
+      completeRun(run.runId, 'success', { routeAction: decision.action });
       return result;
     }
   }
@@ -113,12 +134,18 @@ async function handleAgentResponse(
   decision: RouteDecision,
   senderName: string,
   deps: PipelineDeps,
-  pipelineStart: number
+  pipelineStart: number,
+  runId: string,
+  opts?: { recoveredJobId?: string; redeliveryCount?: number }
 ): Promise<PipelineResult> {
   // Safety check before Claude calls
+  beginStage(runId, 'safety_check');
   if (deps.safety) {
     const claudeCheck = deps.safety.canCallClaude(event.channelType);
     if (!claudeCheck.allowed) {
+      const errorMsg = 'Blocked by safety: ' + claudeCheck.reasons.join(', ');
+      failStage(runId, 'safety_check', errorMsg);
+      completeRun(runId, 'failure', { routeAction: decision.action, error: errorMsg });
       console.log(JSON.stringify({
         level: 'warn',
         msg: 'Pipeline blocked by safety gate',
@@ -132,76 +159,122 @@ async function handleAgentResponse(
       });
       return {
         action: decision.action,
-        reason: 'Blocked by safety: ' + claudeCheck.reasons.join(', '),
+        reason: errorMsg,
         responded: false,
       };
     }
   }
+  completeStage(runId, 'safety_check');
 
-  // Get session context
-  const sessionHistory = getContextMessages(event.sessionId);
+  // Get assembled context for agent
+  beginStage(runId, 'context_assembly');
+  const agentContext = await assembleContext(event.sessionId, 'agent', event.id);
+  completeStage(runId, 'context_assembly');
 
   // 4. Invoke Agent
+  beginStage(runId, 'agent');
   deps.safety?.recordLlmCall('claude', event.channelType);
+
+  // Build recovery info if this is a recovered/retried job
+  let recoveryInfo: { recoveryCount: number; originalStartedAt: string } | undefined;
+  if (opts?.recoveredJobId) {
+    const recoveredJob = await getJobById(opts.recoveredJobId).catch(() => null);
+    if (recoveredJob) {
+      recoveryInfo = {
+        recoveryCount: recoveredJob.retry_count + 1,
+        originalStartedAt: new Date(recoveredJob.created_at).toISOString(),
+      };
+    }
+  } else if (opts?.redeliveryCount && opts.redeliveryCount > 1) {
+    // NATS redelivered this message — server likely restarted mid-pipeline
+    recoveryInfo = {
+      recoveryCount: opts.redeliveryCount - 1,
+      originalStartedAt: event.timestamp,
+    };
+  }
+
   const agentStart = Date.now();
-  const intent = await invokeAgent({
+  const { intent, jobId } = await invokeAgent({
     content: event.content,
     senderName,
     classification,
-    sessionHistory,
+    assembledContext: agentContext,
+    recoveryContext: { event, classification },
+    recoveryInfo,
   });
   const agentMs = Date.now() - agentStart;
 
   if (!intent) {
+    const agentError = 'Agent returned no intent';
+    failStage(runId, 'agent', agentError);
+    completeRun(runId, 'failure', { routeAction: decision.action, error: agentError });
+    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, false).catch(() => {});
     recordPipelineOutcome({
       action: decision.action, responded: false, agentMs, totalMs: Date.now() - pipelineStart,
-      error: 'Agent returned no intent',
+      error: agentError,
     });
     return {
       action: decision.action,
       reason: decision.reason,
       responded: false,
       agentIntent: null,
-      error: 'Agent returned no intent',
+      error: agentError,
     };
   }
+  completeStage(runId, 'agent', `${intent.type} (${agentMs}ms)`);
+  setRunOutputs(runId, { agentOutput: intent.content });
+
+  // Get assembled context for composer (separate budget/overrides)
+  const composerContext = await assembleContext(event.sessionId, 'composer', event.id);
 
   // 5. Compose in Jane's voice
+  beginStage(runId, 'composer');
   deps.safety?.recordLlmCall('claude', event.channelType);
   const composerStart = Date.now();
   const composedMessage = await compose({
     intent,
-    sessionHistory,
+    assembledContext: composerContext,
     senderName,
   });
   const composerMs = Date.now() - composerStart;
 
   if (!composedMessage) {
+    const composerError = 'Composer returned no message';
+    failStage(runId, 'composer', composerError);
+    completeRun(runId, 'failure', { routeAction: decision.action, error: composerError });
+    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, false).catch(() => {});
+    await updateAssemblyOutcome(composerContext.meta.assemblyLogId, false).catch(() => {});
     recordPipelineOutcome({
       action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
-      error: 'Composer returned no message',
+      error: composerError,
     });
     return {
       action: decision.action,
       reason: decision.reason,
       responded: false,
       agentIntent: intent,
-      error: 'Composer returned no message',
+      error: composerError,
     };
   }
+  completeStage(runId, 'composer', `${composerMs}ms`);
+  setRunOutputs(runId, { composerOutput: composedMessage });
 
   // 6. Publish outbound response
+  beginStage(runId, 'publish');
   if (!deps.nats?.isConnected()) {
+    const natsError = 'NATS not connected';
+    failStage(runId, 'publish', natsError);
+    completeRun(runId, 'failure', { routeAction: decision.action, error: natsError });
     recordPipelineOutcome({
       action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
-      error: 'NATS not connected',
+      error: natsError,
     });
     return {
       action: decision.action,
       reason: decision.reason,
       responded: false,
       agentIntent: intent,
-      error: 'NATS not connected',
+      error: natsError,
     };
   }
 
@@ -257,19 +330,15 @@ async function handleAgentResponse(
       ts: new Date().toISOString(),
     }));
 
-    // Check if session needs compaction (async, don't block)
-    if (needsCompaction(event.sessionId)) {
-      compactSession(event.sessionId, summarizeMessages).catch((err) => {
-        console.log(JSON.stringify({
-          level: 'error',
-          msg: 'Session compaction failed',
-          component: 'pipeline',
-          sessionId: event.sessionId,
-          error: String(err),
-          ts: new Date().toISOString(),
-        }));
-      });
-    }
+    // Mark job completed now that outbound publish is confirmed
+    if (jobId) markJobCompleted(jobId).catch(() => {});
+
+    // Record assembly outcome (async, don't block)
+    updateAssemblyOutcome(agentContext.meta.assemblyLogId, true).catch(() => {});
+    updateAssemblyOutcome(composerContext.meta.assemblyLogId, true).catch(() => {});
+
+    completeStage(runId, 'publish', responseEvent.id);
+    completeRun(runId, 'success', { routeAction: decision.action });
 
     recordPipelineOutcome({
       action: decision.action, responded: true, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
@@ -296,6 +365,12 @@ async function handleAgentResponse(
     // Queue for retry instead of losing the composed message
     enqueueForRetry(subject, responseEvent, event.sessionId, responseEvent.id);
 
+    // Mark job failed — the outbound retry queue handles the message
+    if (jobId) markJobFailed(jobId, `publish failed: ${err}`).catch(() => {});
+
+    failStage(runId, 'publish', String(err));
+    completeRun(runId, 'failure', { routeAction: decision.action, error: `Publish failed: ${err}` });
+
     recordPipelineOutcome({
       action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
       error: `Publish failed (queued for retry): ${err}`,
@@ -312,43 +387,171 @@ async function handleAgentResponse(
 }
 
 /**
- * Simple summarizer for session compaction.
- * Uses Ollama for free, fast summarization.
+ * Resume a pipeline run that was attached to an alive job wrapper after restart.
+ * Called when we receive the `stimulation.agent_jobs.completed` NATS event.
  */
-async function summarizeMessages(messages: SessionMessage[]): Promise<string> {
-  const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
+export async function resumeAliveJob(opts: {
+  jobId: string;
+  outputFile: string;
+  success: boolean;
+  deps: PipelineDeps;
+}): Promise<void> {
+  const run = getRunByJobId(opts.jobId);
+  if (!run) {
+    // Job completed before or after we tracked it — nothing to do
+    return;
+  }
 
-  const conversationText = messages
-    .map(m => `${m.role}: ${m.content}`)
-    .join('\n');
+  const job = await getJobById(opts.jobId);
+  if (!job) {
+    failStage(run.runId, 'agent', 'Job not found in DB');
+    completeRun(run.runId, 'failure', { error: 'Job not found in DB' });
+    return;
+  }
+
+  const ctx = job.context_json as { event?: any; classification?: any };
+  const event = ctx?.event;
+  const pipelineStart = new Date(run.startedAt).getTime();
+
+  if (!opts.success) {
+    failStage(run.runId, 'agent', 'Wrapper exited with failure');
+    completeRun(run.runId, 'failure', { error: 'Agent wrapper failed' });
+    await markJobFailed(opts.jobId, 'wrapper exited with failure').catch(() => {});
+    return;
+  }
+
+  // Read Claude's output from the file the wrapper wrote
+  let rawOutput: string;
+  try {
+    rawOutput = readFileSync(opts.outputFile, 'utf-8');
+  } catch (err) {
+    failStage(run.runId, 'agent', `Cannot read output file: ${err}`);
+    completeRun(run.runId, 'failure', { error: 'Output file missing' });
+    await markJobFailed(opts.jobId, `output file missing: ${err}`).catch(() => {});
+    return;
+  }
+
+  const intent = parseAgentResponse(rawOutput);
+  const agentMs = Date.now() - pipelineStart;
+
+  if (!intent) {
+    failStage(run.runId, 'agent', 'No intent parsed from output');
+    completeRun(run.runId, 'failure', { error: 'No agent intent' });
+    await markJobFailed(opts.jobId, 'no intent parsed').catch(() => {});
+    return;
+  }
+
+  completeStage(run.runId, 'agent', `${intent.type} (resumed, ${agentMs}ms)`);
+  setRunOutputs(run.runId, { agentOutput: intent.content });
+
+  if (!event || !ctx?.classification) {
+    completeRun(run.runId, 'failure', { error: 'Missing event/classification context' });
+    await markJobFailed(opts.jobId, 'missing context').catch(() => {});
+    return;
+  }
+
+  // Assemble context for composer
+  const composerContext = await assembleContext(event.sessionId, 'composer', event.id).catch(() => null);
+  if (!composerContext) {
+    completeRun(run.runId, 'failure', { error: 'Context assembly failed' });
+    await markJobFailed(opts.jobId, 'context assembly failed').catch(() => {});
+    return;
+  }
+
+  // Compose in Jane's voice
+  beginStage(run.runId, 'composer');
+  const composerStart = Date.now();
+  const composedMessage = await compose({
+    intent,
+    assembledContext: composerContext,
+    senderName: event.sender?.displayName || 'User',
+  }).catch(() => null);
+  const composerMs = Date.now() - composerStart;
+
+  if (!composedMessage) {
+    failStage(run.runId, 'composer', 'Composer returned nothing');
+    completeRun(run.runId, 'failure', { error: 'Composer returned nothing' });
+    await markJobFailed(opts.jobId, 'composer returned nothing').catch(() => {});
+    return;
+  }
+
+  completeStage(run.runId, 'composer', `${composerMs}ms`);
+  setRunOutputs(run.runId, { composerOutput: composedMessage });
+
+  // Publish outbound
+  beginStage(run.runId, 'publish');
+  const subject = `communication.outbound.${event.channelType}`;
+
+  if (!opts.deps.nats?.isConnected()) {
+    failStage(run.runId, 'publish', 'NATS not connected');
+    completeRun(run.runId, 'failure', { error: 'NATS not connected' });
+    const queueId = uuidv7();
+    enqueueForRetry(subject, {
+      id: queueId,
+      parentId: event.id,
+      sessionId: event.sessionId,
+      channelType: event.channelType,
+      direction: 'outbound',
+      contentType: 'markdown',
+      content: composedMessage,
+      sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
+      metadata: { resumedFromAttached: true },
+      timestamp: new Date().toISOString(),
+    } as any, event.sessionId, queueId);
+    await markJobFailed(opts.jobId, 'NATS not connected (queued for retry)').catch(() => {});
+    return;
+  }
+
+  const responseEvent = {
+    id: uuidv7(),
+    parentId: event.id,
+    sessionId: event.sessionId,
+    channelType: event.channelType,
+    direction: 'outbound' as const,
+    contentType: 'markdown' as const,
+    content: composedMessage,
+    sender: { id: 'jane', displayName: 'Jane', type: 'agent' as const },
+    recipients: event.sender
+      ? [{ id: event.sender.id, displayName: event.sender.displayName, type: event.sender.type }]
+      : [],
+    metadata: { intentType: intent.type, tone: intent.tone, resumedFromAttached: true },
+    timestamp: new Date().toISOString(),
+  };
 
   try {
-    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: process.env.OLLAMA_SUMMARIZER_MODEL || 'gemma3:4b',
-        prompt: `Summarize this conversation concisely, preserving key facts, decisions, and context:\n\n${conversationText}\n\nSummary:`,
-        stream: false,
-      }),
+    await opts.deps.nats.publish(subject, responseEvent);
+    opts.deps.safety?.recordSend();
+    pushEvent(responseEvent as CommunicationEvent, subject);
+    appendMessage(event.sessionId, {
+      role: 'assistant',
+      content: composedMessage,
+      timestamp: responseEvent.timestamp,
+      eventId: responseEvent.id,
     });
 
-    if (!response.ok) {
-      throw new Error(`Ollama returned ${response.status}`);
-    }
+    await markJobCompleted(opts.jobId).catch(() => {});
+    completeStage(run.runId, 'publish', responseEvent.id);
+    completeRun(run.runId, 'success', { routeAction: 'reply' });
+    recordPipelineOutcome({
+      action: 'reply',
+      responded: true,
+      agentMs,
+      composerMs,
+      totalMs: Date.now() - pipelineStart,
+    });
 
-    const data = await response.json() as { response: string };
-    return data.response;
-  } catch (err) {
     console.log(JSON.stringify({
-      level: 'warn',
-      msg: 'Ollama summarization failed, using naive truncation',
+      level: 'info',
+      msg: 'Resumed alive job — response sent',
       component: 'pipeline',
-      error: String(err),
+      jobId: opts.jobId,
+      responseId: responseEvent.id,
       ts: new Date().toISOString(),
     }));
-
-    // Fallback: just keep the last few messages as a crude summary
-    return messages.slice(-5).map(m => `${m.role}: ${m.content}`).join('\n');
+  } catch (err) {
+    failStage(run.runId, 'publish', String(err));
+    completeRun(run.runId, 'failure', { error: `Publish failed: ${err}` });
+    enqueueForRetry(subject, responseEvent as any, event.sessionId, responseEvent.id);
+    await markJobFailed(opts.jobId, `publish failed: ${err}`).catch(() => {});
   }
 }

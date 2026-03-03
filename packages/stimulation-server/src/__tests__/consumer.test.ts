@@ -32,6 +32,7 @@ function makeMockMsg(data: unknown): any {
     data: encoded,
     subject: 'communication.inbound.message',
     ack: vi.fn(),
+    working: vi.fn(),
   };
 }
 

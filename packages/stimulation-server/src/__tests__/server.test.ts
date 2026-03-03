@@ -10,12 +10,47 @@ vi.mock('../composer/index.js', () => ({
   compose: vi.fn(),
 }));
 
+// Mock context modules (used by compose-and-send endpoint)
+vi.mock('../context/assembler.js', () => ({
+  assembleContext: vi.fn().mockResolvedValue({
+    summaries: [],
+    recentMessages: [],
+    meta: {
+      assemblyLogId: 'test-log', planName: 'baseline_v1', summaryCount: 0,
+      rawMessageCount: 0, totalMessageCoverage: 0, estimatedTokens: 0,
+      rawTokens: 0, summaryTokens: 0, summaryBudget: 12000,
+      budgetUtilization: 0, rawOverBudget: false, assemblyMs: 1,
+      summarizationMs: null, newSummariesCreated: 0,
+    },
+  }),
+}));
+
+vi.mock('../context/db.js', () => ({
+  db: { query: vi.fn().mockResolvedValue({ rows: [] }), exec: vi.fn() },
+  initializeContextDb: vi.fn(),
+  updateAssemblyOutcome: vi.fn(),
+}));
+
+vi.mock('../context/plans.js', () => ({
+  getActivePlan: vi.fn().mockResolvedValue({ name: 'baseline_v1', config: {} }),
+  listPlans: vi.fn().mockResolvedValue([]),
+  createPlan: vi.fn(),
+  setActivePlan: vi.fn(),
+}));
+
+vi.mock('../agent/job-registry.js', () => ({
+  panicClearJobs: vi.fn(),
+}));
+
 import { compose } from '../composer/index.js';
 import { createApp, type ServerDeps } from '../server.js';
 import { resetMetrics, increment } from '../metrics.js';
 import { pushEvent, clearEvents } from '../events.js';
 import { appendMessage, clearAllSessions } from '../sessions/store.js';
 import { recordPipelineOutcome, resetPipelineStats } from '../pipeline-stats.js';
+import { panicClearJobs } from '../agent/job-registry.js';
+
+const mockPanicClearJobs = vi.mocked(panicClearJobs);
 import type { NatsClient } from '../nats/client.js';
 
 const mockCompose = vi.mocked(compose);
@@ -425,5 +460,79 @@ describe('Pipeline stats endpoint', () => {
     expect(body.pipeline).toBeDefined();
     expect(body.pipeline.total).toBe(1);
     expect(body.pipeline.latency.agent.avg).toBe(5000);
+  });
+});
+
+describe('POST /api/panic', () => {
+  beforeEach(() => {
+    mockPanicClearJobs.mockReset();
+  });
+
+  it('clears queued jobs without running by default', async () => {
+    mockPanicClearJobs.mockResolvedValue({ clearedQueued: 3, clearedRunning: 0, killedPids: [] });
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/panic', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.cleared).toBe(true);
+    expect(body.clearedQueued).toBe(3);
+    expect(body.clearedRunning).toBe(0);
+    expect(body.killedPids).toEqual([]);
+    expect(mockPanicClearJobs).toHaveBeenCalledWith(false);
+  });
+
+  it('kills running jobs when includeRunning is true', async () => {
+    mockPanicClearJobs.mockResolvedValue({ clearedQueued: 1, clearedRunning: 2, killedPids: [1234, 5678] });
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/panic', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ includeRunning: true }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.clearedRunning).toBe(2);
+    expect(body.killedPids).toEqual([1234, 5678]);
+    expect(mockPanicClearJobs).toHaveBeenCalledWith(true);
+  });
+
+  it('works with no request body', async () => {
+    mockPanicClearJobs.mockResolvedValue({ clearedQueued: 0, clearedRunning: 0, killedPids: [] });
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/panic', { method: 'POST' });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.cleared).toBe(true);
+    expect(mockPanicClearJobs).toHaveBeenCalledWith(false);
+  });
+
+  it('returns 500 when job registry throws', async () => {
+    mockPanicClearJobs.mockRejectedValue(new Error('DB connection failed'));
+
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+    const res = await app.request('/api/panic', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(500);
+    expect(body.error).toBe('Failed to clear jobs');
+    expect(body.detail).toContain('DB connection failed');
   });
 });

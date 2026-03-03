@@ -5,12 +5,19 @@ import { uuidv7 } from '@the-ansible/life-system-shared';
 import { getMetrics } from './metrics.js';
 import { getRecentEvents, onEvent, pushEvent } from './events.js';
 import { getClassifierMetrics } from './classifier/index.js';
-import { listSessions, getMessageCount, getSession, getContextMessages, appendMessage } from './sessions/store.js';
+import { listSessions, getMessageCount, getSession, getContextMessages, appendMessage, getDiskMessageCount } from './sessions/store.js';
+import { assembleContext } from './context/assembler.js';
+import { getActivePlan, listPlans, createPlan, setActivePlan } from './context/plans.js';
+import { db as contextDb } from './context/db.js';
+import type { ContextPlanConfig } from './context/types.js';
 import { getPipelineStats } from './pipeline-stats.js';
 import type { NatsClient } from './nats/client.js';
 import type { SafetyGate } from './safety/index.js';
 import { getQueueStatus } from './outbound-queue.js';
 import { compose } from './composer/index.js';
+import { getActiveRuns, getRecentRuns, getRun, onRunUpdate, cleanupOrphanedRuns } from './pipeline-runs.js';
+import { getLastRecovery, onRecovery } from './agent/recovery.js';
+import { panicClearJobs } from './agent/job-registry.js';
 
 export interface ServerDeps {
   nats: NatsClient | null;
@@ -30,6 +37,10 @@ function buildMetricsSnapshot(deps: ServerDeps) {
     sessions: {
       active: sessionIds.length,
       totalMessages: sessionIds.reduce((sum, id) => sum + getMessageCount(id), 0),
+    },
+    pipelineRuns: {
+      active: getActiveRuns(),
+      activeCount: getActiveRuns().length,
     },
   };
 }
@@ -143,7 +154,25 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     }
 
     const sessionId = body.sessionId || 'scheduled-jobs';
-    const sessionHistory = getContextMessages(sessionId);
+
+    // Assemble context for composer
+    let composerContext;
+    try {
+      composerContext = await assembleContext(sessionId, 'composer');
+    } catch {
+      // Fallback if context DB is unavailable — use empty context
+      composerContext = {
+        summaries: [],
+        recentMessages: getContextMessages(sessionId),
+        meta: {
+          assemblyLogId: '', planName: 'fallback', summaryCount: 0,
+          rawMessageCount: 0, totalMessageCoverage: 0, estimatedTokens: 0,
+          rawTokens: 0, summaryTokens: 0, summaryBudget: 0,
+          budgetUtilization: 0, rawOverBudget: false, assemblyMs: 0,
+          summarizationMs: null, newSummariesCreated: 0,
+        },
+      };
+    }
 
     // Run through the composer for voice consistency
     deps.safety?.recordLlmCall('claude', body.channelType || 'realtime');
@@ -153,7 +182,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         content: body.message,
         tone: body.tone || 'casual',
       },
-      sessionHistory,
+      assembledContext: composerContext,
     });
 
     const finalMessage = composed || body.message;
@@ -268,6 +297,61 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     });
   });
 
+  // --- Nudge endpoint ---
+  // Simple webhook to publish an inbound message — use to wake Jane after a restart.
+  // POST /api/nudge  (no body required; optional { message, sessionId })
+
+  app.post('/api/nudge', async (c) => {
+    if (!deps.nats?.isConnected()) {
+      return c.json({ error: 'NATS not connected' }, 503);
+    }
+
+    let message = 'nudge';
+    let sessionId: string | undefined;
+
+    try {
+      const body = await c.req.json<{ message?: string; sessionId?: string }>();
+      if (body.message) message = body.message;
+      if (body.sessionId) sessionId = body.sessionId;
+    } catch {
+      // Body is optional — no-op if absent or not JSON
+    }
+
+    const event = {
+      id: uuidv7(),
+      sessionId: sessionId || uuidv7(),
+      channelType: 'realtime' as const,
+      direction: 'inbound' as const,
+      contentType: 'markdown' as const,
+      content: message,
+      sender: {
+        id: 'nudge',
+        displayName: 'Nudge',
+        type: 'person' as const,
+      },
+      recipients: [{
+        id: 'jane',
+        displayName: 'Jane',
+        type: 'agent' as const,
+      }],
+      metadata: { source: 'nudge' },
+      timestamp: new Date().toISOString(),
+    };
+
+    const subject = `communication.inbound.${event.channelType}`;
+    await deps.nats.publish(subject, event);
+
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'Nudge published',
+      eventId: event.id,
+      subject,
+      ts: new Date().toISOString(),
+    }));
+
+    return c.json({ nudged: true, eventId: event.id, subject });
+  });
+
   // --- Session inspection endpoints ---
 
   app.get('/api/sessions', (c) => {
@@ -289,10 +373,12 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     const limit = parseInt(c.req.query('limit') || '50', 10);
     const session = getSession(sessionId);
     const messages = getContextMessages(sessionId, limit);
+    const diskMessageCount = getDiskMessageCount(sessionId);
 
     return c.json({
       sessionId: session.sessionId,
       messageCount: session.messages.length,
+      diskMessageCount,
       createdAt: session.createdAt,
       lastActivityAt: session.lastActivityAt,
       metadata: session.metadata,
@@ -300,10 +386,126 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     });
   });
 
+  // --- Context management endpoints ---
+
+  app.get('/api/context/plan', async (c) => {
+    try {
+      const { name, config } = await getActivePlan();
+      return c.json({ name, config });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.put('/api/context/plan', async (c) => {
+    try {
+      const body = await c.req.json<{ name: string }>();
+      if (!body.name) return c.json({ error: 'name is required' }, 400);
+      await setActivePlan(body.name);
+      return c.json({ activated: body.name });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.get('/api/context/plans', async (c) => {
+    try {
+      const plans = await listPlans();
+      return c.json({ plans });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/api/context/plans', async (c) => {
+    try {
+      const body = await c.req.json<{ name: string; config: ContextPlanConfig; description?: string }>();
+      if (!body.name || !body.config) return c.json({ error: 'name and config are required' }, 400);
+      await createPlan(body.name, body.config, body.description);
+      return c.json({ created: body.name });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.get('/api/context/sessions/:id/summaries', async (c) => {
+    try {
+      const sessionId = c.req.param('id');
+      const { rows } = await contextDb.query(
+        `SELECT id, summary, topics, entities, msg_start_idx, msg_end_idx, msg_count,
+                ts_start, ts_end, model, plan_name, created_at
+         FROM context.summaries WHERE session_id = $1 ORDER BY msg_end_idx`,
+        [sessionId]
+      );
+      return c.json({ sessionId, summaries: rows, count: rows.length });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/context/sessions/:id/assembly', async (c) => {
+    try {
+      const sessionId = c.req.param('id');
+      const { rows } = await contextDb.query(
+        `SELECT * FROM context.assembly_log
+         WHERE session_id = $1
+         ORDER BY assembled_at DESC
+         LIMIT 1`,
+        [sessionId]
+      );
+      return c.json({ assembly: rows[0] || null });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/context/metrics', async (c) => {
+    try {
+      const limit = parseInt(c.req.query('limit') || '20', 10);
+      const { rows } = await contextDb.query(
+        `SELECT * FROM context.assembly_log ORDER BY assembled_at DESC LIMIT $1`,
+        [limit]
+      );
+      // Compute averages
+      const avgAssemblyMs = rows.length > 0
+        ? Math.round(rows.reduce((s, r: any) => s + r.assembly_ms, 0) / rows.length)
+        : 0;
+      const avgBudgetUtil = rows.length > 0
+        ? Math.round(rows.reduce((s, r: any) => s + r.budget_utilization, 0) / rows.length * 100) / 100
+        : 0;
+      return c.json({
+        recentAssemblies: rows,
+        count: rows.length,
+        averages: { assemblyMs: avgAssemblyMs, budgetUtilization: avgBudgetUtil },
+      });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
   // --- Pipeline stats endpoint ---
 
   app.get('/api/pipeline', (c) => {
     return c.json(getPipelineStats());
+  });
+
+  // --- Pipeline runs endpoints ---
+
+  app.get('/api/pipeline/runs', (c) => {
+    const active = getActiveRuns();
+    const recent = getRecentRuns();
+    return c.json({
+      active,
+      recent,
+      activeCount: active.length,
+      recentCount: recent.length,
+    });
+  });
+
+  app.get('/api/pipeline/runs/:id', (c) => {
+    const run = getRun(c.req.param('id'));
+    if (!run) return c.json({ error: 'Run not found' }, 404);
+    return c.json(run);
   });
 
   // --- Safety control endpoints ---
@@ -331,6 +533,49 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     return c.json(deps.safety.status());
   });
 
+  app.get('/api/recovery', (c) => {
+    return c.json({ recovery: getLastRecovery() });
+  });
+
+  // --- Panic endpoint ---
+  // Clears stuck jobs (queued + recovered + agent_done) and optionally kills running wrapper PIDs.
+  // POST /api/panic  body: { includeRunning?: boolean }
+
+  app.post('/api/panic', async (c) => {
+    let includeRunning = false;
+    try {
+      const body = await c.req.json<{ includeRunning?: boolean }>();
+      includeRunning = body.includeRunning === true;
+    } catch {
+      // Body optional — default to safe mode (running jobs untouched)
+    }
+
+    let result;
+    try {
+      result = await panicClearJobs(includeRunning);
+    } catch (err) {
+      return c.json({ error: 'Failed to clear jobs', detail: String(err) }, 500);
+    }
+
+    console.log(JSON.stringify({
+      level: 'warn',
+      msg: 'Panic button triggered',
+      component: 'server',
+      clearedQueued: result.clearedQueued,
+      clearedRunning: result.clearedRunning,
+      killedPids: result.killedPids,
+      includeRunning,
+      ts: new Date().toISOString(),
+    }));
+
+    return c.json({
+      cleared: true,
+      clearedQueued: result.clearedQueued,
+      clearedRunning: result.clearedRunning,
+      killedPids: result.killedPids,
+    });
+  });
+
   // --- SSE endpoint for real-time events ---
 
   app.get('/api/events/stream', (c) => {
@@ -346,8 +591,27 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         }).catch(() => {});
       });
 
-      // Periodic metrics push
+      // Push pipeline run updates
+      const unsubscribeRuns = onRunUpdate((run) => {
+        stream.writeSSE({
+          event: 'pipeline-run',
+          data: JSON.stringify(run),
+          id: String(++eventId),
+        }).catch(() => {});
+      });
+
+      // Push recovery status updates
+      const unsubscribeRecovery = onRecovery((report) => {
+        stream.writeSSE({
+          event: 'recovery-status',
+          data: JSON.stringify(report),
+          id: String(++eventId),
+        }).catch(() => {});
+      });
+
+      // Periodic metrics push + orphan cleanup
       const metricsInterval = setInterval(() => {
+        cleanupOrphanedRuns();
         stream.writeSSE({
           event: 'metrics',
           data: JSON.stringify(buildMetricsSnapshot(deps)),
@@ -371,9 +635,21 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         id: String(++eventId),
       });
 
+      // Send initial recovery status if available
+      const initialRecovery = getLastRecovery();
+      if (initialRecovery) {
+        await stream.writeSSE({
+          event: 'recovery-status',
+          data: JSON.stringify(initialRecovery),
+          id: String(++eventId),
+        });
+      }
+
       // Wait until client disconnects
       stream.onAbort(() => {
         unsubscribe();
+        unsubscribeRuns();
+        unsubscribeRecovery();
         clearInterval(metricsInterval);
         clearInterval(heartbeatInterval);
       });

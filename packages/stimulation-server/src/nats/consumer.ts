@@ -11,6 +11,7 @@ import type { SafetyGate } from '../safety/index.js';
 import type { NatsClient } from './client.js';
 import { classify, type ClassificationResult, type ClassificationContext } from '../classifier/index.js';
 import { processPipeline, type PipelineDeps } from '../pipeline.js';
+import { completeRun } from '../pipeline-runs.js';
 import { getMessageCount } from '../sessions/store.js';
 
 const STREAM = 'COMMUNICATION';
@@ -41,6 +42,22 @@ function isDuplicate(eventId: string): boolean {
 /** Clear dedup cache (for testing) */
 export function clearDedupCache(): void {
   processedEvents.clear();
+}
+
+// Per-session lock: only one pipeline runs per session at a time.
+// Different sessions process in parallel. This prevents the resubmission loop
+// (which was always same-session) without sacrificing cross-session throughput.
+const sessionLocks = new Map<string, Promise<void>>();
+
+function withSessionLock(sessionId: string, fn: () => Promise<void>): Promise<void> {
+  const prev = sessionLocks.get(sessionId) ?? Promise.resolve();
+  const next = prev.then(fn, fn); // run fn after previous completes (even if it failed)
+  sessionLocks.set(sessionId, next);
+  // Clean up the lock entry once the chain settles to prevent unbounded growth
+  next.then(() => {
+    if (sessionLocks.get(sessionId) === next) sessionLocks.delete(sessionId);
+  });
+  return next;
 }
 
 let safetyGate: SafetyGate | null = null;
@@ -160,17 +177,20 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
     ts: new Date().toISOString(),
   }));
 
-  msg.ack();
-
   // Run through the full pipeline if classification succeeded
   if (classification) {
+    // Signal NATS we're working on it (prevents redelivery during long pipeline runs)
+    msg.working();
+
     const pipelineDeps: PipelineDeps = {
       nats: natsClient,
       safety: safetyGate,
     };
 
     try {
-      const pipelineResult = await processPipeline(result.data, classification, pipelineDeps);
+      const pipelineResult = await processPipeline(result.data, classification, pipelineDeps, {
+        redeliveryCount: msg.info?.deliveryCount ?? 1,
+      });
       increment('pipelineProcessed');
 
       console.log(JSON.stringify({
@@ -184,6 +204,7 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
         ts: new Date().toISOString(),
       }));
     } catch (err) {
+      completeRun(result.data.id, 'failure', { error: `Pipeline crash: ${err}` });
       console.log(JSON.stringify({
         level: 'error',
         msg: 'Pipeline processing failed',
@@ -196,19 +217,48 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
     }
   }
 
+  // ACK only AFTER full pipeline completion — this is the critical fix.
+  // Previously we acked before the pipeline ran, so if the server crashed mid-pipeline,
+  // the message was lost and we relied on job recovery (which caused resubmission loops).
+  msg.ack();
+
   return classification;
 }
 
 export async function startConsumer(js: JetStreamClient): Promise<void> {
   const jsm = await js.jetstreamManager();
 
-  // Ensure the consumer exists (idempotent upsert)
-  await jsm.consumers.add(STREAM, {
+  // Ensure the consumer exists with our desired config.
+  // If the consumer already exists with different settings, delete and recreate.
+  // ack_wait: 120s — pipeline takes 11-13s normally, but agent calls can take longer.
+  // msg.working() extends this deadline during active processing.
+  // max_deliver: 3 — prevents infinite redelivery loops.
+  const consumerConfig = {
     durable_name: DURABLE_NAME,
     filter_subject: FILTER_SUBJECT,
     ack_policy: AckPolicy.Explicit,
-    deliver_policy: DeliverPolicy.All,
-  });
+    deliver_policy: DeliverPolicy.New,
+    ack_wait: 120_000_000_000, // 120 seconds in nanoseconds
+    max_deliver: 3,
+  };
+
+  try {
+    await jsm.consumers.add(STREAM, consumerConfig);
+  } catch (err: any) {
+    // Consumer exists with different config — delete and recreate
+    if (err?.message?.includes('already exists') || err?.code === '10148') {
+      console.log(JSON.stringify({
+        level: 'info',
+        msg: 'Consumer config changed — recreating',
+        component: 'consumer',
+        ts: new Date().toISOString(),
+      }));
+      await jsm.consumers.delete(STREAM, DURABLE_NAME);
+      await jsm.consumers.add(STREAM, consumerConfig);
+    } else {
+      throw err;
+    }
+  }
 
   console.log(JSON.stringify({
     level: 'info',
@@ -223,18 +273,47 @@ export async function startConsumer(js: JetStreamClient): Promise<void> {
       const messages = await consumer.consume();
 
       for await (const msg of messages) {
+        // Parse just enough to extract sessionId for locking
+        let sessionId: string | null = null;
         try {
-          processMessage(msg);
-        } catch (err) {
-          console.log(JSON.stringify({
-            level: 'error',
-            msg: 'Error processing message',
-            error: String(err),
-            ts: new Date().toISOString(),
-          }));
-          increment('errors');
-          safetyGate?.recordError();
-          msg.ack(); // ack to avoid redelivery loops
+          const parsed = JSON.parse(new TextDecoder().decode(msg.data));
+          sessionId = parsed?.sessionId ?? null;
+        } catch {
+          // If we can't parse, processMessage will handle the error
+        }
+
+        if (sessionId) {
+          // Per-session lock: parallel across sessions, sequential within a session
+          withSessionLock(sessionId, async () => {
+            try {
+              await processMessage(msg);
+            } catch (err) {
+              console.log(JSON.stringify({
+                level: 'error',
+                msg: 'Error processing message',
+                error: String(err),
+                ts: new Date().toISOString(),
+              }));
+              increment('errors');
+              safetyGate?.recordError();
+              msg.ack();
+            }
+          });
+        } else {
+          // No sessionId — process immediately (will likely fail validation)
+          try {
+            await processMessage(msg);
+          } catch (err) {
+            console.log(JSON.stringify({
+              level: 'error',
+              msg: 'Error processing message',
+              error: String(err),
+              ts: new Date().toISOString(),
+            }));
+            increment('errors');
+            safetyGate?.recordError();
+            msg.ack();
+          }
         }
       }
     } catch (err) {
