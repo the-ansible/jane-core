@@ -5,6 +5,7 @@ import {
   JsMsg,
 } from 'nats';
 import { communicationEventSchema } from '@the-ansible/life-system-shared';
+import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 import { increment } from '../metrics.js';
 import { pushEvent } from '../events.js';
 import type { SafetyGate } from '../safety/index.js';
@@ -71,7 +72,18 @@ export function setNatsClient(client: NatsClient): void {
   natsClient = client;
 }
 
-export async function processMessage(msg: JsMsg): Promise<ClassificationResult | null> {
+interface PreProcessResult {
+  event: CommunicationEvent;
+  classification: ClassificationResult | null;
+}
+
+/**
+ * Pre-process a message: parse, validate, dedup, classify, push to dashboard.
+ * Runs OUTSIDE the session lock so the dashboard shows new messages immediately,
+ * even while a pipeline is running for the same session.
+ * Returns null if the message was already acked (invalid/dedup).
+ */
+async function preProcess(msg: JsMsg): Promise<PreProcessResult | null> {
   increment('received');
 
   let data: unknown;
@@ -149,6 +161,8 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
     }));
   }
 
+  // Push to dashboard immediately — outside the session lock so messages
+  // appear in the UI as soon as they arrive, even while a pipeline is running.
   pushEvent(result.data, msg.subject, classification ? {
     urgency: classification.urgency,
     category: classification.category,
@@ -178,6 +192,7 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
       // Fire-and-forget — never block the pipeline on this
     }
   }
+
   console.log(JSON.stringify({
     level: 'info',
     msg: 'Event received',
@@ -199,50 +214,72 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
     ts: new Date().toISOString(),
   }));
 
-  // Run through the full pipeline if classification succeeded
-  if (classification) {
-    // Signal NATS we're working on it (prevents redelivery during long pipeline runs)
-    msg.working();
+  return { event: result.data, classification };
+}
 
-    const pipelineDeps: PipelineDeps = {
-      nats: natsClient,
-      safety: safetyGate,
-    };
+/**
+ * Execute the pipeline for a classified event. Runs INSIDE the session lock
+ * to prevent concurrent pipeline runs for the same session.
+ */
+async function executePipeline(
+  event: CommunicationEvent,
+  classification: ClassificationResult,
+  msg: JsMsg,
+  deps: PipelineDeps,
+): Promise<void> {
+  // Signal NATS we're working on it (prevents redelivery during long pipeline runs)
+  msg.working();
 
-    try {
-      const pipelineResult = await processPipeline(result.data, classification, pipelineDeps, {
-        redeliveryCount: msg.info?.deliveryCount ?? 1,
-      });
-      increment('pipelineProcessed');
+  try {
+    const pipelineResult = await processPipeline(event, classification, deps, {
+      redeliveryCount: msg.info?.deliveryCount ?? 1,
+    });
+    increment('pipelineProcessed');
 
-      console.log(JSON.stringify({
-        level: 'info',
-        msg: 'Pipeline completed',
-        component: 'consumer',
-        eventId: result.data.id,
-        action: pipelineResult.action,
-        responded: pipelineResult.responded,
-        responseEventId: pipelineResult.responseEventId,
-        ts: new Date().toISOString(),
-      }));
-    } catch (err) {
-      completeRun(result.data.id, 'failure', { error: `Pipeline crash: ${err}` });
-      console.log(JSON.stringify({
-        level: 'error',
-        msg: 'Pipeline processing failed',
-        component: 'consumer',
-        eventId: result.data.id,
-        error: String(err),
-        ts: new Date().toISOString(),
-      }));
-      increment('errors');
-    }
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'Pipeline completed',
+      component: 'consumer',
+      eventId: event.id,
+      action: pipelineResult.action,
+      responded: pipelineResult.responded,
+      responseEventId: pipelineResult.responseEventId,
+      ts: new Date().toISOString(),
+    }));
+  } catch (err) {
+    completeRun(event.id, 'failure', { error: `Pipeline crash: ${err}` });
+    console.log(JSON.stringify({
+      level: 'error',
+      msg: 'Pipeline processing failed',
+      component: 'consumer',
+      eventId: event.id,
+      error: String(err),
+      ts: new Date().toISOString(),
+    }));
+    increment('errors');
   }
 
   // ACK only AFTER full pipeline completion — this is the critical fix.
   // Previously we acked before the pipeline ran, so if the server crashed mid-pipeline,
   // the message was lost and we relied on job recovery (which caused resubmission loops).
   msg.ack();
+}
+
+/**
+ * processMessage: pre-process + pipeline in one call.
+ * Used by tests and kept for backward compatibility.
+ */
+export async function processMessage(msg: JsMsg): Promise<ClassificationResult | null> {
+  const preResult = await preProcess(msg);
+  if (!preResult) return null;
+
+  const { event, classification } = preResult;
+
+  if (classification) {
+    await executePipeline(event, classification, msg, { nats: natsClient, safety: safetyGate });
+  } else {
+    msg.ack();
+  }
 
   return classification;
 }
@@ -288,6 +325,11 @@ export async function startConsumer(js: JetStreamClient): Promise<void> {
     ts: new Date().toISOString(),
   }));
 
+  const pipelineDeps: PipelineDeps = {
+    nats: natsClient,
+    safety: safetyGate,
+  };
+
   // Consume loop with auto-restart on error
   while (true) {
     try {
@@ -295,36 +337,26 @@ export async function startConsumer(js: JetStreamClient): Promise<void> {
       const messages = await consumer.consume();
 
       for await (const msg of messages) {
-        // Parse just enough to extract sessionId for locking
-        let sessionId: string | null = null;
-        try {
-          const parsed = JSON.parse(new TextDecoder().decode(msg.data));
-          sessionId = parsed?.sessionId ?? null;
-        } catch {
-          // If we can't parse, processMessage will handle the error
-        }
-
-        if (sessionId) {
-          // Per-session lock: parallel across sessions, sequential within a session
-          withSessionLock(sessionId, async () => {
-            try {
-              await processMessage(msg);
-            } catch (err) {
-              console.log(JSON.stringify({
-                level: 'error',
-                msg: 'Error processing message',
-                error: String(err),
-                ts: new Date().toISOString(),
-              }));
-              increment('errors');
-              safetyGate?.recordError();
-              msg.ack();
-            }
-          });
-        } else {
-          // No sessionId — process immediately (will likely fail validation)
+        // Fire off async processing without blocking the consume loop.
+        // preProcess (classify + pushEvent) runs concurrently across all messages.
+        // Only the pipeline execution is serialized per session via the lock.
+        (async () => {
           try {
-            await processMessage(msg);
+            const preResult = await preProcess(msg);
+            if (!preResult) return; // already acked
+
+            const { event, classification } = preResult;
+
+            if (!classification) {
+              // Classification failed — ack and move on
+              msg.ack();
+              return;
+            }
+
+            // Per-session lock: parallel across sessions, sequential within a session
+            withSessionLock(event.sessionId, () =>
+              executePipeline(event, classification, msg, pipelineDeps)
+            );
           } catch (err) {
             console.log(JSON.stringify({
               level: 'error',
@@ -336,7 +368,7 @@ export async function startConsumer(js: JetStreamClient): Promise<void> {
             safetyGate?.recordError();
             msg.ack();
           }
-        }
+        })();
       }
     } catch (err) {
       console.log(JSON.stringify({
