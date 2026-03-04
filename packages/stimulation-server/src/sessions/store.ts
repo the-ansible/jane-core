@@ -167,16 +167,23 @@ export function needsCompaction(sessionId: string): boolean {
 /**
  * Compact a session by summarizing older messages.
  * Takes a summarizer function so the store doesn't depend on any specific LLM.
+ * Optional beforeCompact hook is called with the messages about to be removed —
+ * use this to ingest them into Graphiti before they're discarded.
  */
 export async function compactSession(
   sessionId: string,
-  summarize: (messages: SessionMessage[]) => Promise<string>
+  summarize: (messages: SessionMessage[]) => Promise<string>,
+  beforeCompact?: (toCompact: SessionMessage[]) => Promise<void>
 ): Promise<void> {
   const session = sessions.get(sessionId);
   if (!session || session.messages.length <= COMPACTION_THRESHOLD) return;
 
   const toCompact = session.messages.slice(0, -KEEP_RECENT);
   const toKeep = session.messages.slice(-KEEP_RECENT);
+
+  if (beforeCompact) {
+    await beforeCompact(toCompact);
+  }
 
   const summary = await summarize(toCompact);
 

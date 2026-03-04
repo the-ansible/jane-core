@@ -15,6 +15,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { ClassificationResult } from '../classifier/types.js';
 import type { AssembledContext } from '../context/types.js';
+import type { MemoryFact } from '../graphiti/client.js';
 import { createJob, markJobFailed } from './job-registry.js';
 
 export interface AgentIntent {
@@ -28,6 +29,8 @@ export interface AgentContext {
   senderName?: string;                    // Who sent it
   classification: ClassificationResult;
   assembledContext: AssembledContext;
+  // Long-term memory facts retrieved from Graphiti for this message
+  graphitiMemory?: MemoryFact[];
   // Job recovery context — stored in agent_jobs.context_json for requeue
   recoveryContext?: { event: any; classification: any };
   // Set when this job is a recovery of a previously interrupted job
@@ -121,6 +124,16 @@ Do NOT include any text outside the JSON object.`;
 function buildConversationPrompt(context: AgentContext): string {
   const parts: string[] = [];
   const { assembledContext } = context;
+
+  // Inject long-term memory facts from Graphiti (past conversations, distilled facts)
+  const facts = context.graphitiMemory?.filter((f) => f.fact?.trim());
+  if (facts && facts.length > 0) {
+    parts.push('LONG-TERM MEMORY (relevant facts from past conversations):');
+    for (const f of facts) {
+      parts.push(`• ${f.fact}`);
+    }
+    parts.push('');
+  }
 
   parts.push('CONVERSATION CONTEXT:');
   parts.push('');

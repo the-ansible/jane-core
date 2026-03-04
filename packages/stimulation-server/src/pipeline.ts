@@ -22,10 +22,13 @@ import {
 import {
   getSession,
   appendMessage,
+  needsCompaction,
   type SessionMessage,
 } from './sessions/store.js';
 import { assembleContext } from './context/assembler.js';
 import { updateAssemblyOutcome } from './context/db.js';
+import { compactAndIngest } from './graphiti/compactor.js';
+import { searchMemory } from './graphiti/client.js';
 
 export interface PipelineDeps {
   nats: NatsClient | null;
@@ -111,6 +114,20 @@ export async function processPipeline(
     eventId: event.id,
   });
 
+  // Compact + ingest to Graphiti when session exceeds threshold (fire-and-forget)
+  if (needsCompaction(event.sessionId)) {
+    compactAndIngest(event.sessionId, deps.nats).catch((err) => {
+      console.log(JSON.stringify({
+        level: 'warn',
+        msg: 'Session compaction failed',
+        sessionId: event.sessionId,
+        error: String(err),
+        component: 'pipeline',
+        ts: new Date().toISOString(),
+      }));
+    });
+  }
+
   // 3. Dispatch based on route decision
   const pipelineStart = Date.now();
 
@@ -176,10 +193,23 @@ async function handleAgentResponse(
   }
   completeStage(runId, 'safety_check');
 
-  // Get assembled context for agent
+  // Get assembled context and long-term memory in parallel
   beginStage(runId, 'context_assembly');
-  const agentContext = await assembleContext(event.sessionId, 'agent', event.id);
+  const [agentContext, graphitiMemory] = await Promise.all([
+    assembleContext(event.sessionId, 'agent', event.id),
+    searchMemory(event.content, 5).catch(() => []),
+  ]);
   completeStage(runId, 'context_assembly');
+
+  if (graphitiMemory.length > 0) {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'Graphiti memory retrieved',
+      component: 'pipeline',
+      factCount: graphitiMemory.length,
+      ts: new Date().toISOString(),
+    }));
+  }
 
   // 4. Invoke Agent
   beginStage(runId, 'agent');
@@ -209,6 +239,7 @@ async function handleAgentResponse(
     senderName,
     classification,
     assembledContext: agentContext,
+    graphitiMemory,
     recoveryContext: { event, classification },
     recoveryInfo,
   });

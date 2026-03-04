@@ -49,6 +49,8 @@ import { recordManualMemory } from '../memory/recorder.js';
 import { getRelevantMemories, formatMemoriesForContext } from '../memory/retriever.js';
 import { runConsolidation, isConsolidating, getLastConsolidationResult } from '../memory/consolidator.js';
 import type { MemoryType, MemorySource } from '../memory/types.js';
+import { runBackfill } from '../memory/backfill.js';
+import { getIngestionHistory, countIngestedSessions } from '../memory/ingestion-log.js';
 
 const sc = StringCodec();
 
@@ -523,6 +525,42 @@ export function createApp(deps: ServerDeps): Hono {
       const deleted = await deleteMemory(c.req.param('id'));
       if (!deleted) return c.json({ error: 'Not found' }, 404);
       return c.json({ id: c.req.param('id'), deleted: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Graphiti Memory Ingestion API
+  //
+  // POST /api/memory/backfill        — ingest existing sessions into Graphiti
+  // GET  /api/memory/ingestion       — ingestion stats + history
+  // GET  /api/memory/ingestion/:sid  — ingestion history for a session
+  // -------------------------------------------------------------------------
+
+  app.post('/api/memory/backfill', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { sessionId?: string };
+    // Run in the background — Graphiti takes ~84s per episode so this can take 30+ minutes.
+    // Return 202 immediately and check /api/memory/ingestion for progress.
+    runBackfill(body.sessionId).catch((err) => {
+      console.error(JSON.stringify({ level: 'error', msg: 'Backfill failed', error: String(err), component: 'brain-api', ts: new Date().toISOString() }));
+    });
+    return c.json({ status: 'started', message: 'Backfill running in background. Check /api/memory/ingestion for progress.' }, 202);
+  });
+
+  app.get('/api/memory/ingestion', async (c) => {
+    try {
+      const totalSessions = await countIngestedSessions();
+      return c.json({ totalIngestedSessions: totalSessions });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/memory/ingestion/:sessionId', async (c) => {
+    try {
+      const history = await getIngestionHistory(c.req.param('sessionId'));
+      return c.json({ sessionId: c.req.param('sessionId'), history });
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }

@@ -66,14 +66,22 @@ vi.mock('../agent/job-registry.js', () => ({
   getJobById: vi.fn().mockResolvedValue(null),
 }));
 
+// Mock graphiti client — deterministic memory facts in tests
+vi.mock('../graphiti/client.js', () => ({
+  searchMemory: vi.fn().mockResolvedValue([]),
+  ingestEpisode: vi.fn().mockResolvedValue({ episodeId: null, error: null }),
+}));
+
 import { invokeAgent } from '../agent/index.js';
 import { compose } from '../composer/index.js';
 import { assembleContext } from '../context/assembler.js';
 import { updateAssemblyOutcome } from '../context/db.js';
 import { startRun, beginStage, completeStage, failStage, completeRun } from '../pipeline-runs.js';
+import { searchMemory } from '../graphiti/client.js';
 
 const mockInvokeAgent = vi.mocked(invokeAgent);
 const mockCompose = vi.mocked(compose);
+const mockSearchMemory = vi.mocked(searchMemory);
 const mockAssembleContext = vi.mocked(assembleContext);
 const mockUpdateOutcome = vi.mocked(updateAssemblyOutcome);
 const mockStartRun = vi.mocked(startRun);
@@ -601,6 +609,57 @@ describe('Pipeline', () => {
 
       expect(mockInvokeAgent).toHaveBeenCalledWith(
         expect.objectContaining({ recoveryInfo: undefined })
+      );
+    });
+  });
+
+  describe('graphiti memory retrieval', () => {
+    it('passes graphitiMemory to invokeAgent when facts are found', async () => {
+      const facts = [
+        { uuid: 'f1', fact: 'Chris prefers concise answers', score: 0.9 },
+        { uuid: 'f2', fact: 'Jane is building the brain server', score: 0.8 },
+      ];
+      mockSearchMemory.mockResolvedValueOnce(facts);
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps()
+      );
+
+      expect(mockInvokeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ graphitiMemory: facts })
+      );
+    });
+
+    it('passes empty graphitiMemory when search returns nothing', async () => {
+      mockSearchMemory.mockResolvedValueOnce([]);
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps()
+      );
+
+      expect(mockInvokeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ graphitiMemory: [] })
+      );
+    });
+
+    it('passes empty graphitiMemory when search fails', async () => {
+      mockSearchMemory.mockRejectedValueOnce(new Error('graphiti unavailable'));
+      mockInvokeAgent.mockResolvedValue({ intent: null, jobId: null });
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps()
+      );
+
+      expect(mockInvokeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ graphitiMemory: [] })
       );
     });
   });

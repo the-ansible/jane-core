@@ -22,6 +22,7 @@ import { startGoalEngine } from './goals/engine.js';
 import { startHierarchicalControl } from './layers/controller.js';
 import { initMemoryRegistry } from './memory/registry.js';
 import { startConsolidator } from './memory/consolidator.js';
+import { initIngestionLog } from './memory/ingestion-log.js';
 
 const PORT = parseInt(process.env.PORT || '3103', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
@@ -42,6 +43,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     await initGoalRegistry();
     await seedInitialGoals();
     await initMemoryRegistry();
+    await initIngestionLog();
     startConsolidator();
   } catch (err) {
     log('error', 'Failed to initialize DB schemas', { error: String(err) });
