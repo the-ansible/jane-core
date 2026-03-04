@@ -12,8 +12,7 @@ export interface SessionMessage {
   content: string;
   timestamp: string;
   eventId?: string;
-  source?: string;       // Who sent this: "chris", "jane", "librarian-audit", etc.
-  source_type?: string;  // Category: "human", "agent", "system"
+  sender?: { id: string; displayName?: string; type: string }; // Who sent this (maps to CommunicationEvent.sender)
 }
 
 export interface SessionState {

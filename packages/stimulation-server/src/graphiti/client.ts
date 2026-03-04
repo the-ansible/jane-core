@@ -24,29 +24,29 @@ export interface MemoryFact {
 /**
  * Resolve the display name for a message speaker.
  *
- * Priority: explicit source field → role-based default.
- * The source field is set at ingest time from the CommunicationEvent's
- * source/sender fields, so it's structurally correct rather than a heuristic.
+ * Priority: explicit sender field → legacy content heuristics.
+ * The sender field is set at ingest time directly from CommunicationEvent.sender,
+ * so it's structurally correct (no guessing from content).
  *
  * Content-based heuristics are kept as a fallback for legacy JSONL files
- * that predate the source field.
+ * that predate the sender field.
  */
-function resolveSpeaker(message: SessionMessage): string {
+export function resolveSpeaker(message: SessionMessage): string {
   if (message.role === 'assistant') return 'Jane';
 
-  // Prefer explicit source over heuristics
-  if (message.source) {
-    // Normalize known automated sources to "Jane (<name>)"
-    if (message.source_type === 'system' || message.source_type === 'agent') {
-      return `Jane (${message.source})`;
+  // Prefer explicit sender over heuristics
+  if (message.sender) {
+    const { id, displayName, type } = message.sender;
+    // Automated sources (agent/system) are Jane's subsystems
+    if (type === 'system' || type === 'agent') {
+      return `Jane (${displayName || id})`;
     }
-    if (message.source === 'chris') return 'Chris';
-    if (message.source === 'jane') return 'Jane';
-    // Unknown source — label it clearly
-    return message.source;
+    if (id === 'chris') return 'Chris';
+    if (id === 'jane') return 'Jane';
+    return displayName || id;
   }
 
-  // Legacy fallback: content heuristics for old JSONL without source field
+  // Legacy fallback: content heuristics for old JSONL without sender field
   const automatedPatterns = [
     /^\s*(weekly|daily|monthly|hourly)\s+\w[\w\s]+\s+(audit|check|review|cleanup|scan)/i,
     /^\s*health\s+check/i,

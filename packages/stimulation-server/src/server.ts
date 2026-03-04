@@ -100,6 +100,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       direction: 'outbound' as const,
       contentType: 'markdown' as const,
       content: body.message,
+      sender: { id: 'jane', displayName: 'Jane', type: 'agent' as const },
       metadata: {},
       timestamp: new Date().toISOString(),
       ...(body.parentId ? { parentId: body.parentId } : {}),
@@ -202,6 +203,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       content: finalMessage,
       timestamp: event.timestamp,
       eventId: event.id,
+      sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
     });
 
     console.log(JSON.stringify({

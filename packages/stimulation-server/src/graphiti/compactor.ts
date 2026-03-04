@@ -10,7 +10,7 @@
 
 import type { NatsClient } from '../nats/client.js';
 import { getSession, compactSession } from '../sessions/store.js';
-import { ingestEpisode } from './client.js';
+import { ingestEpisode, resolveSpeaker } from './client.js';
 import type { SessionMessage } from '../sessions/store.js';
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
@@ -23,7 +23,7 @@ const CHUNK_SIZE = 15;
 async function summarizeForCompaction(messages: SessionMessage[]): Promise<string> {
   const formatted = messages
     .filter((m) => m.role !== 'system')
-    .map((m) => `${m.role === 'user' ? 'Chris' : 'Jane'}: ${m.content}`)
+    .map((m) => `${resolveSpeaker(m)}: ${m.content}`)
     .join('\n');
 
   try {
