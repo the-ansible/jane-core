@@ -2,7 +2,7 @@
  * Shared types for the Brain Server job system.
  */
 
-export type JobType = 'task' | 'research' | 'maintenance';
+export type JobType = 'task' | 'research' | 'maintenance' | 'reflection';
 export type JobStatus =
   | 'queued'
   | 'running'

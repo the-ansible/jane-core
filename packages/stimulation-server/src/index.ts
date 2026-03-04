@@ -7,6 +7,7 @@ import { startRetryLoop, stopRetryLoop } from './outbound-queue.js';
 import { initializeContextDb } from './context/db.js';
 import { initJobRegistry } from './agent/job-registry.js';
 import { recoverInFlightJobs } from './agent/recovery.js';
+import { setAgentNatsConnection } from './agent/index.js';
 import { resumeAliveJob } from './pipeline.js';
 import { initPipelineRunsStore } from './pipeline-runs.js';
 
@@ -56,6 +57,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     deps.nats = await createNatsClient(NATS_URL);
     safety.setNats(deps.nats);
     setNatsClient(deps.nats);
+    setAgentNatsConnection(deps.nats.nc);
     startRetryLoop(deps.nats);
     // Recover stale agent jobs now that NATS is available for re-dispatch
     recoverInFlightJobs(deps).catch((err) => {

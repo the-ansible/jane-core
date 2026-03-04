@@ -15,6 +15,13 @@
  * POST /api/goals                 — create a goal
  * PATCH /api/goals/:id            — update a goal
  * DELETE /api/goals/:id           — abandon a goal (sets status=abandoned)
+ *
+ * GET  /api/layers                — status of all 4 hierarchical layers
+ * GET  /api/layers/:name          — status of a specific layer
+ * GET  /api/layers/events         — recent cross-layer events
+ * GET  /api/layers/directives     — strategic directives
+ * POST /api/layers/evaluate       — trigger strategic evaluation
+ * POST /api/layers/directive      — issue a strategic directive
  */
 
 import { Hono } from 'hono';
@@ -28,6 +35,13 @@ import {
 } from '../goals/registry.js';
 import { isCycleActive } from '../goals/engine.js';
 import type { GoalLevel, GoalStatus } from '../goals/types.js';
+import {
+  getLayerStatuses, getLayerStatus, isInitialized,
+  triggerStrategicEvaluation, issueDirective,
+} from '../layers/controller.js';
+import { listLayerEvents, listDirectives } from '../layers/registry.js';
+import { getLastMonitorResults } from '../layers/autonomic.js';
+import type { LayerName } from '../layers/types.js';
 
 const sc = StringCodec();
 
@@ -261,6 +275,97 @@ export function createApp(deps: ServerDeps): Hono {
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Hierarchical Layers API
+  // -------------------------------------------------------------------------
+
+  // Must be before /:name to avoid route conflicts
+  app.get('/api/layers/events', async (c) => {
+    try {
+      const layer = c.req.query('layer') as LayerName | undefined;
+      const eventType = c.req.query('type') as string | undefined;
+      const severity = c.req.query('severity');
+      const limit = parseInt(c.req.query('limit') ?? '50', 10);
+      const opts: Parameters<typeof listLayerEvents>[0] = {
+        layer,
+        severity: severity ?? undefined,
+        limit: Math.min(limit, 500),
+      };
+      if (eventType) opts.eventType = eventType as NonNullable<typeof opts.eventType>;
+      const events = await listLayerEvents(opts);
+      return c.json({ events });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/layers/directives', async (c) => {
+    try {
+      const targetLayer = c.req.query('target') as LayerName | undefined;
+      const status = c.req.query('status') as Parameters<typeof listDirectives>[1];
+      const directives = await listDirectives(targetLayer, status);
+      return c.json({ directives });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/api/layers/evaluate', async (c) => {
+    if (!deps.nats) return c.json({ error: 'NATS not connected' }, 503);
+    if (!isInitialized()) return c.json({ error: 'Hierarchical control not initialized' }, 503);
+    try {
+      const jobId = await triggerStrategicEvaluation(deps.nats);
+      return c.json({ jobId, status: 'triggered' }, 202);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/api/layers/directive', async (c) => {
+    if (!deps.nats) return c.json({ error: 'NATS not connected' }, 503);
+    if (!isInitialized()) return c.json({ error: 'Hierarchical control not initialized' }, 503);
+    try {
+      const body = await c.req.json() as {
+        targetLayer?: string;
+        directive?: string;
+        params?: Record<string, unknown>;
+      };
+      if (!body.targetLayer || !body.directive) {
+        return c.json({ error: 'targetLayer and directive are required' }, 400);
+      }
+      const validLayers = ['autonomic', 'reflexive', 'cognitive'] as const;
+      type TargetLayer = typeof validLayers[number];
+      if (!validLayers.includes(body.targetLayer as TargetLayer)) {
+        return c.json({ error: `targetLayer must be one of: ${validLayers.join(', ')}` }, 400);
+      }
+      const directiveId = await issueDirective(deps.nats, {
+        targetLayer: body.targetLayer as TargetLayer,
+        directive: body.directive,
+        directiveParams: body.params,
+      });
+      return c.json({ directiveId, status: 'issued' }, 201);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/layers', (c) => {
+    if (!isInitialized()) {
+      return c.json({ initialized: false, layers: [] });
+    }
+    const statuses = getLayerStatuses();
+    const monitors = getLastMonitorResults();
+    return c.json({ initialized: true, layers: statuses, monitors });
+  });
+
+  app.get('/api/layers/:name', (c) => {
+    const name = c.req.param('name') as LayerName;
+    const status = getLayerStatus(name);
+    if (!status) return c.json({ error: 'Unknown layer' }, 404);
+    const extra = name === 'autonomic' ? { monitors: getLastMonitorResults() } : {};
+    return c.json({ ...status, ...extra });
   });
 
   return app;

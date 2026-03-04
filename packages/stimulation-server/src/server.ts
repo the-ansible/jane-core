@@ -6,7 +6,6 @@ import { getMetrics } from './metrics.js';
 import { getRecentEvents, onEvent, pushEvent } from './events.js';
 import { getClassifierMetrics } from './classifier/index.js';
 import { listSessions, getMessageCount, getSession, getContextMessages, appendMessage, getDiskMessageCount } from './sessions/store.js';
-import { assembleContext } from './context/assembler.js';
 import { getActivePlan, listPlans, createPlan, setActivePlan } from './context/plans.js';
 import { db as contextDb } from './context/db.js';
 import type { ContextPlanConfig } from './context/types.js';
@@ -155,25 +154,6 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
 
     const sessionId = body.sessionId || 'scheduled-jobs';
 
-    // Assemble context for composer
-    let composerContext;
-    try {
-      composerContext = await assembleContext(sessionId, 'composer');
-    } catch {
-      // Fallback if context DB is unavailable — use empty context
-      composerContext = {
-        summaries: [],
-        recentMessages: getContextMessages(sessionId),
-        meta: {
-          assemblyLogId: '', planName: 'fallback', summaryCount: 0,
-          rawMessageCount: 0, totalMessageCoverage: 0, estimatedTokens: 0,
-          rawTokens: 0, summaryTokens: 0, summaryBudget: 0,
-          budgetUtilization: 0, rawOverBudget: false, assemblyMs: 0,
-          summarizationMs: null, newSummariesCreated: 0,
-        },
-      };
-    }
-
     // Run through the composer for voice consistency
     deps.safety?.recordLlmCall('claude', body.channelType || 'realtime');
     const composed = await compose({
@@ -182,7 +162,6 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         content: body.message,
         tone: body.tone || 'casual',
       },
-      assembledContext: composerContext,
     });
 
     const finalMessage = composed || body.message;

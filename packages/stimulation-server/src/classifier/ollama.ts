@@ -140,6 +140,7 @@ export interface ConsensusResult {
   confidence: Confidence;
   agreement: { votes: number; agreeing: number };
   latencyMs: number;
+  model: string;
 }
 
 /**
@@ -177,5 +178,6 @@ export async function classifyByConsensus(
     confidence: result.confidence,
     agreement: { votes: validVotes, agreeing: result.agreeing },
     latencyMs,
+    model: OLLAMA_MODEL,
   };
 }

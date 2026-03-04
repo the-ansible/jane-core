@@ -19,6 +19,7 @@ import { createApp, type ServerDeps } from './api/routes.js';
 import { initGoalRegistry } from './goals/registry.js';
 import { seedInitialGoals } from './goals/seeder.js';
 import { startGoalEngine } from './goals/engine.js';
+import { startHierarchicalControl } from './layers/controller.js';
 
 const PORT = parseInt(process.env.PORT || '3103', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
@@ -50,6 +51,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     startConsumer(deps.nats);
     startHeartbeatMonitor(deps.nats);
     startGoalEngine(deps.nats);
+    await startHierarchicalControl(deps.nats);
     log('info', 'Brain server fully initialized', { port: PORT, natsUrl: NATS_URL });
   } catch (err) {
     log('error', 'Failed to connect to NATS — job submission via NATS unavailable', { error: String(err) });

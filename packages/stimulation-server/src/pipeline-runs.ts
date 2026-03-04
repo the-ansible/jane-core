@@ -19,6 +19,25 @@ export interface StageRecord {
   detail?: string;
 }
 
+export interface ClassificationProvenance {
+  /** The label (routing decision) */
+  routing: string;
+  /** Which tier produced this result */
+  tier: string;
+  /** Confidence level */
+  confidence: string;
+  /** Urgency level */
+  urgency: string;
+  /** Category */
+  category: string;
+  /** Consensus agreement from local_consensus tier */
+  agreement?: { votes: number; agreeing: number };
+  /** Total classifier latency in ms */
+  latencyMs: number;
+  /** Specific model used (e.g. 'gemma3:12b', 'haiku'). Absent for rules tier. */
+  model?: string;
+}
+
 export interface PipelineRun {
   runId: string;
   sessionId: string;
@@ -33,7 +52,9 @@ export interface PipelineRun {
   totalMs?: number;
   error?: string;
   routeAction?: string;
+  /** @deprecated Use classificationProvenance.routing instead */
   classification?: string;
+  classificationProvenance?: ClassificationProvenance;
   agentOutput?: string;
   composerOutput?: string;
   recoveredJobId?: string;
@@ -73,6 +94,7 @@ export function startRun(opts: {
   senderName: string;
   contentPreview: string;
   classification?: string;
+  classificationProvenance?: ClassificationProvenance;
   recoveredJobId?: string;
   attachedJobId?: string;
   /** Override the start timestamp (e.g. for attached jobs that started before this server instance) */
@@ -107,6 +129,7 @@ export function startRun(opts: {
     stages: [],
     startedAt: opts.startedAt || new Date().toISOString(),
     classification: opts.classification,
+    ...(opts.classificationProvenance ? { classificationProvenance: opts.classificationProvenance } : {}),
     ...(opts.recoveredJobId ? { recoveredJobId: opts.recoveredJobId } : {}),
     ...(opts.attachedJobId ? { attachedJobId: opts.attachedJobId } : {}),
   };

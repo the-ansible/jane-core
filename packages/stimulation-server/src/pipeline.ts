@@ -60,6 +60,16 @@ export async function processPipeline(
     senderName,
     contentPreview: event.content.slice(0, 120),
     classification: classification.routing,
+    classificationProvenance: {
+      routing: classification.routing,
+      tier: classification.tier,
+      confidence: classification.confidence,
+      urgency: classification.urgency,
+      category: classification.category,
+      ...(classification.agreement ? { agreement: classification.agreement } : {}),
+      latencyMs: classification.latencyMs,
+      ...(classification.model ? { model: classification.model } : {}),
+    },
     recoveredJobId: opts?.recoveredJobId,
   });
 
@@ -224,16 +234,12 @@ async function handleAgentResponse(
   completeStage(runId, 'agent', `${intent.type} (${agentMs}ms)`);
   setRunOutputs(runId, { agentOutput: intent.content });
 
-  // Get assembled context for composer (separate budget/overrides)
-  const composerContext = await assembleContext(event.sessionId, 'composer', event.id);
-
   // 5. Compose in Jane's voice
   beginStage(runId, 'composer');
   deps.safety?.recordLlmCall('claude', event.channelType);
   const composerStart = Date.now();
   const composedMessage = await compose({
     intent,
-    assembledContext: composerContext,
     senderName,
   });
   const composerMs = Date.now() - composerStart;
@@ -243,7 +249,6 @@ async function handleAgentResponse(
     failStage(runId, 'composer', composerError);
     completeRun(runId, 'failure', { routeAction: decision.action, error: composerError });
     await updateAssemblyOutcome(agentContext.meta.assemblyLogId, false).catch(() => {});
-    await updateAssemblyOutcome(composerContext.meta.assemblyLogId, false).catch(() => {});
     recordPipelineOutcome({
       action: decision.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
       error: composerError,
@@ -335,7 +340,6 @@ async function handleAgentResponse(
 
     // Record assembly outcome (async, don't block)
     updateAssemblyOutcome(agentContext.meta.assemblyLogId, true).catch(() => {});
-    updateAssemblyOutcome(composerContext.meta.assemblyLogId, true).catch(() => {});
 
     completeStage(runId, 'publish', responseEvent.id);
     completeRun(runId, 'success', { routeAction: decision.action });
@@ -450,20 +454,11 @@ export async function resumeAliveJob(opts: {
     return;
   }
 
-  // Assemble context for composer
-  const composerContext = await assembleContext(event.sessionId, 'composer', event.id).catch(() => null);
-  if (!composerContext) {
-    completeRun(run.runId, 'failure', { error: 'Context assembly failed' });
-    await markJobFailed(opts.jobId, 'context assembly failed').catch(() => {});
-    return;
-  }
-
   // Compose in Jane's voice
   beginStage(run.runId, 'composer');
   const composerStart = Date.now();
   const composedMessage = await compose({
     intent,
-    assembledContext: composerContext,
     senderName: event.sender?.displayName || 'User',
   }).catch(() => null);
   const composerMs = Date.now() - composerStart;

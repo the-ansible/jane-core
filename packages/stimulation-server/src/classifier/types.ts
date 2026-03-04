@@ -19,6 +19,8 @@ export interface ClassificationResult extends Classification {
   tier: Tier;
   agreement?: { votes: number; agreeing: number };
   latencyMs: number;
+  /** The specific model used (e.g. 'gemma3:12b', 'haiku'). Absent for rules tier. */
+  model?: string;
 }
 
 /** Valid values for schema validation of LLM responses */

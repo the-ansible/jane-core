@@ -10,20 +10,6 @@ vi.mock('../composer/index.js', () => ({
   compose: vi.fn(),
 }));
 
-// Mock context modules (used by compose-and-send endpoint)
-vi.mock('../context/assembler.js', () => ({
-  assembleContext: vi.fn().mockResolvedValue({
-    summaries: [],
-    recentMessages: [],
-    meta: {
-      assemblyLogId: 'test-log', planName: 'baseline_v1', summaryCount: 0,
-      rawMessageCount: 0, totalMessageCoverage: 0, estimatedTokens: 0,
-      rawTokens: 0, summaryTokens: 0, summaryBudget: 12000,
-      budgetUtilization: 0, rawOverBudget: false, assemblyMs: 1,
-      summarizationMs: null, newSummariesCreated: 0,
-    },
-  }),
-}));
 
 vi.mock('../context/db.js', () => ({
   db: { query: vi.fn().mockResolvedValue({ rows: [] }), exec: vi.fn() },

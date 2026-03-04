@@ -74,6 +74,7 @@ export async function classify(
           tier: 'local_consensus',
           agreement: consensusResult.agreement,
           latencyMs: consensusResult.latencyMs,
+          model: consensusResult.model,
         };
         log('Classified by local consensus', {
           agreement: consensusResult.agreement,
@@ -108,6 +109,7 @@ export async function classify(
           confidence: 'high', // Claude is authoritative
           tier: 'claude_escalation',
           latencyMs: claudeResult.latencyMs,
+          model: claudeResult.model,
         };
         log('Classified by Claude escalation', result as unknown as Record<string, unknown>);
         safety?.recordLlmCall('claude', ctx.channelType);

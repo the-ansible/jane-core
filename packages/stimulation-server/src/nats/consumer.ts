@@ -156,6 +156,28 @@ export async function processMessage(msg: JsMsg): Promise<ClassificationResult |
     confidence: classification.confidence,
     tier: classification.tier,
   } : undefined);
+
+  // Publish classification result to ephemeral NATS subject so external listeners
+  // (e.g. n8n) can react to how a message was classified, keyed by the original event ID.
+  if (classification && natsClient) {
+    try {
+      const classificationPayload = JSON.stringify({
+        id: result.data.id,
+        classification: classification.routing,
+        urgency: classification.urgency,
+        category: classification.category,
+        confidence: classification.confidence,
+        tier: classification.tier,
+        timestamp: new Date().toISOString(),
+      });
+      natsClient.nc.publish(
+        `communication.classification.${result.data.id}`,
+        new TextEncoder().encode(classificationPayload)
+      );
+    } catch {
+      // Fire-and-forget — never block the pipeline on this
+    }
+  }
   console.log(JSON.stringify({
     level: 'info',
     msg: 'Event received',

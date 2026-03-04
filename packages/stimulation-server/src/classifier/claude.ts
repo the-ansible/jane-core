@@ -18,10 +18,12 @@ import { parseClassificationResponse } from './ollama.js';
 import { buildClassificationPrompt } from './prompt.js';
 
 const CLAUDE_TIMEOUT_MS = 60_000; // 1 minute max for classification
+const CLAUDE_MODEL = 'haiku';
 
 interface ClaudeResult {
   classification: Classification;
   latencyMs: number;
+  model: string;
 }
 
 /**
@@ -42,7 +44,7 @@ export async function classifyByClaude(
     '--max-turns',
     '1',
     '--model',
-    'haiku',
+    CLAUDE_MODEL,
     '-p',
     '-',
   ];
@@ -61,7 +63,7 @@ export async function classifyByClaude(
     const classification = parseClassificationResponse(resultText);
     if (!classification) return null;
 
-    return { classification, latencyMs };
+    return { classification, latencyMs, model: CLAUDE_MODEL };
   } catch (err) {
     console.log(JSON.stringify({
       level: 'error',

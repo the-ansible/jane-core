@@ -6,20 +6,21 @@
  * Separated from the Agent so that multiple agent types can all feed
  * into one consistent voice. The Agent produces WHAT to say.
  * The Composer produces HOW to say it.
+ *
+ * Uses Mercury (mercury-2) via OpenAI-compatible API for faster, cheaper composition.
  */
 
-import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import type { AgentIntent } from '../agent/index.js';
-import type { AssembledContext } from '../context/types.js';
 
 export interface ComposerInput {
   intent: AgentIntent;
-  assembledContext: AssembledContext;
   senderName?: string;
 }
 
-const COMPOSER_TIMEOUT_MS = 60_000; // 60 seconds
+const COMPOSER_TIMEOUT_MS = 30_000; // 30 seconds — Mercury is fast
+const MERCURY_BASE_URL = 'https://api.inceptionlabs.ai/v1';
+const MERCURY_MODEL = 'mercury-2';
 const INNER_VOICE_PATH = '/agent/INNER_VOICE.md';
 const VOICE_PROFILE_PATH = '/agent/data/vault/Projects/jane-core/Voice-Profile.md';
 
@@ -125,27 +126,6 @@ function buildComposerPrompt(input: ComposerInput): string {
     parts.push('');
   }
 
-  // Summaries for broader context (composer gets fewer per plan overrides)
-  if (input.assembledContext.summaries.length > 0) {
-    parts.push('CONVERSATION CONTEXT (summaries):');
-    for (const s of input.assembledContext.summaries) {
-      parts.push(`--- ${s.timeRange} (${s.messageCount} messages) ---`);
-      parts.push(s.text);
-    }
-    parts.push('');
-  }
-
-  // Recent conversation for tone/continuity — last 8 from raw messages
-  if (input.assembledContext.recentMessages.length > 0) {
-    parts.push('RECENT CONVERSATION (for tone/continuity):');
-    const recent = input.assembledContext.recentMessages.slice(-8);
-    for (const msg of recent) {
-      const role = msg.role === 'user' ? (input.senderName || 'User') : 'Jane';
-      parts.push(`${role}: ${msg.content}`);
-    }
-    parts.push('');
-  }
-
   // The intent to compose
   parts.push(`INTENT (what to communicate):
 Type: ${input.intent.type}
@@ -159,7 +139,31 @@ Content: ${input.intent.content}`);
 }
 
 /**
- * Compose a message in Jane's voice.
+ * Read MERCURY_API_KEY from process env or fall back to PID 1 environ.
+ * Docker Desktop injects vars into PID 1 but they don't always propagate
+ * down the process tree to child processes.
+ */
+function getMercuryApiKey(): string | undefined {
+  if (process.env.MERCURY_API_KEY) return process.env.MERCURY_API_KEY;
+
+  try {
+    const environ = readFileSync('/proc/1/environ');
+    const vars = environ.toString().split('\0');
+    for (const v of vars) {
+      if (v.startsWith('MERCURY_API_KEY=')) {
+        const val = v.slice('MERCURY_API_KEY='.length);
+        if (val) return val;
+      }
+    }
+  } catch {
+    // /proc/1/environ not available — not on Linux or no permission
+  }
+
+  return undefined;
+}
+
+/**
+ * Compose a message in Jane's voice via Mercury API.
  * Takes structured intent and produces the final outbound message.
  */
 export async function compose(input: ComposerInput): Promise<string | null> {
@@ -167,7 +171,7 @@ export async function compose(input: ComposerInput): Promise<string | null> {
   const start = Date.now();
 
   try {
-    const result = await spawnClaude(prompt);
+    const result = await callMercury(prompt);
     const latencyMs = Date.now() - start;
 
     if (!result) {
@@ -183,18 +187,17 @@ export async function compose(input: ComposerInput): Promise<string | null> {
       return input.intent.content;
     }
 
-    const composed = parseComposerResponse(result);
-
     console.log(JSON.stringify({
       level: 'info',
       msg: 'Composer produced message',
       component: 'composer',
+      model: MERCURY_MODEL,
       latencyMs,
-      messageLength: composed?.length ?? 0,
+      messageLength: result.length,
       ts: new Date().toISOString(),
     }));
 
-    return composed || input.intent.content;
+    return result;
   } catch (err) {
     console.log(JSON.stringify({
       level: 'error',
@@ -210,111 +213,71 @@ export async function compose(input: ComposerInput): Promise<string | null> {
   }
 }
 
-/** Strip CLAUDECODE env var so spawned Claude CLI doesn't think it's nested */
-function stripClaudeCodeEnv(): Record<string, string | undefined> {
-  const env = { ...process.env };
-  delete env.CLAUDECODE;
-  return env;
-}
-
-function spawnClaude(prompt: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    const proc = spawn('claude', [
-      '--print',
-      '--dangerously-skip-permissions',
-      '--output-format', 'json',
-      '--max-turns', '1',
-      '--model', 'sonnet',
-      '-p', '-',
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/agent',
-      env: stripClaudeCodeEnv(),
-      timeout: COMPOSER_TIMEOUT_MS,
-    });
-
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-
-    proc.stdin.write(prompt);
-    proc.stdin.end();
-
-    proc.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-
-    proc.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    proc.on('close', (code, signal) => {
-      if (signal === 'SIGTERM' || signal === 'SIGKILL') timedOut = true;
-      if (timedOut || code !== 0) {
-        if (stderr) {
-          console.log(JSON.stringify({
-            level: 'warn',
-            msg: 'Composer Claude CLI stderr',
-            component: 'composer',
-            stderr: stderr.slice(0, 500),
-            code,
-            signal,
-            ts: new Date().toISOString(),
-          }));
-        }
-        resolve(null);
-        return;
-      }
-      resolve(stdout);
-    });
-
-    proc.on('error', (err) => {
-      console.log(JSON.stringify({
-        level: 'error',
-        msg: 'Composer Claude CLI spawn error',
-        component: 'composer',
-        error: String(err),
-        ts: new Date().toISOString(),
-      }));
-      resolve(null);
-    });
-
-    setTimeout(() => {
-      if (proc.exitCode === null) {
-        timedOut = true;
-        proc.kill('SIGTERM');
-      }
-    }, COMPOSER_TIMEOUT_MS + 2000);
-  });
-}
-
-/** Parse Claude CLI output to get the composed message */
-function parseComposerResponse(stdout: string): string | null {
-  try {
-    const parsed = JSON.parse(stdout);
-
-    // Handle single object with result field
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      if (parsed.type === 'result' && parsed.result) {
-        return cleanText(parsed.result);
-      }
-    }
-
-    // Handle array format
-    if (Array.isArray(parsed)) {
-      for (const msg of parsed) {
-        if (msg.type === 'result' && msg.result) {
-          return cleanText(msg.result);
-        }
-      }
-    }
-  } catch {
-    // If not JSON, treat as raw text
-    const text = stdout.trim();
-    return text || null;
+async function callMercury(prompt: string): Promise<string | null> {
+  const apiKey = getMercuryApiKey();
+  if (!apiKey) {
+    console.log(JSON.stringify({
+      level: 'error',
+      msg: 'MERCURY_API_KEY not set — cannot compose with Mercury',
+      component: 'composer',
+      ts: new Date().toISOString(),
+    }));
+    return null;
   }
 
-  return null;
+  const response = await fetch(`${MERCURY_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: MERCURY_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 4096,
+      reasoning_effort: 'instant',
+    }),
+    signal: AbortSignal.timeout(COMPOSER_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    console.log(JSON.stringify({
+      level: 'error',
+      msg: 'Mercury API error',
+      component: 'composer',
+      status: response.status,
+      body: text.slice(0, 300),
+      ts: new Date().toISOString(),
+    }));
+    return null;
+  }
+
+  const data = await response.json() as { choices?: Array<{ message?: { content?: string }; finish_reason?: string }> };
+  const choice = data?.choices?.[0];
+  const content = choice?.message?.content;
+  const finishReason = choice?.finish_reason ?? 'unknown';
+
+  console.log(JSON.stringify({
+    level: 'info',
+    msg: 'Mercury response received',
+    component: 'composer',
+    finish_reason: finishReason,
+    promptChars: prompt.length,
+    responseChars: content?.length ?? 0,
+    ts: new Date().toISOString(),
+  }));
+
+  if (finishReason === 'length') {
+    console.log(JSON.stringify({
+      level: 'warn',
+      msg: 'Mercury hit token limit — response may be truncated',
+      component: 'composer',
+      ts: new Date().toISOString(),
+    }));
+  }
+
+  return content ? cleanText(content) : null;
 }
 
 function cleanText(text: string): string {

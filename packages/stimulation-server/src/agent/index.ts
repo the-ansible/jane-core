@@ -11,6 +11,8 @@ import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import type { NatsConnection } from 'nats';
+import { StringCodec } from 'nats';
 import type { ClassificationResult } from '../classifier/types.js';
 import type { AssembledContext } from '../context/types.js';
 import { createJob, markJobFailed } from './job-registry.js';
@@ -38,7 +40,15 @@ export interface AgentResult {
 }
 
 const AGENT_TIMEOUT_MS = 900_000; // 15 minutes — agent can be slow under contention
+const BRAIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — brain server request timeout
 const INNER_VOICE_PATH = '/agent/INNER_VOICE.md';
+
+const brainSc = StringCodec();
+let agentNats: NatsConnection | null = null;
+
+export function setAgentNatsConnection(nc: NatsConnection): void {
+  agentNats = nc;
+}
 
 // Resolve wrapper path relative to this file (works in both dev/prod)
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -160,6 +170,43 @@ function buildConversationPrompt(context: AgentContext): string {
 }
 
 /**
+ * Dispatch the prompt to the brain server via NATS request/reply.
+ * Returns raw Claude CLI stdout, or null on failure/timeout.
+ */
+async function dispatchViaBrain(fullPrompt: string): Promise<string | null> {
+  if (!agentNats) return null;
+
+  try {
+    const payload = brainSc.encode(JSON.stringify({ type: 'task', prompt: fullPrompt }));
+    const reply = await agentNats.request('agent.jobs.request', payload, { timeout: BRAIN_TIMEOUT_MS });
+    const jobResult = JSON.parse(brainSc.decode(reply.data)) as { status: string; result?: string; error?: string };
+
+    if (jobResult.status === 'done' && jobResult.result) {
+      return jobResult.result;
+    }
+
+    console.log(JSON.stringify({
+      level: 'warn',
+      msg: 'Brain dispatch returned failure',
+      component: 'agent',
+      status: jobResult.status,
+      error: jobResult.error,
+      ts: new Date().toISOString(),
+    }));
+    return null;
+  } catch (err) {
+    console.log(JSON.stringify({
+      level: 'error',
+      msg: 'Brain dispatch failed',
+      component: 'agent',
+      error: String(err),
+      ts: new Date().toISOString(),
+    }));
+    return null;
+  }
+}
+
+/**
  * Invoke the agent to process an inbound message.
  * Returns structured intent for the Composer, plus the job ID for completion tracking.
  */
@@ -169,6 +216,43 @@ export async function invokeAgent(context: AgentContext): Promise<AgentResult> {
   const fullPrompt = `SYSTEM:\n${systemPrompt}\n\n---\n\n${conversationPrompt}`;
 
   const start = Date.now();
+
+  // Try brain server first — if connected, dispatch via NATS and return early
+  if (agentNats) {
+    const brainResult = await dispatchViaBrain(fullPrompt);
+    if (brainResult !== null) {
+      const latencyMs = Date.now() - start;
+      const intent = parseAgentResponse(brainResult);
+      if (intent) {
+        console.log(JSON.stringify({
+          level: 'info',
+          msg: 'Agent (brain) produced intent',
+          component: 'agent',
+          intentType: intent.type,
+          tone: intent.tone,
+          contentLength: intent.content.length,
+          latencyMs,
+          ts: new Date().toISOString(),
+        }));
+      } else {
+        console.log(JSON.stringify({
+          level: 'error',
+          msg: 'Agent (brain) returned empty result',
+          component: 'agent',
+          latencyMs,
+          ts: new Date().toISOString(),
+        }));
+      }
+      return { intent, jobId: null };
+    }
+    // Brain dispatch failed — fall through to direct spawn
+    console.log(JSON.stringify({
+      level: 'warn',
+      msg: 'Brain dispatch failed, falling back to direct spawn',
+      component: 'agent',
+      ts: new Date().toISOString(),
+    }));
+  }
 
   // Create job row for persistence
   let jobId: string | null = null;
@@ -368,6 +452,17 @@ export function parseAgentResponse(stdout: string): AgentIntent | null {
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       if (parsed.type === 'result' && parsed.result) {
         resultText = parsed.result;
+      }
+
+      // Handle pre-extracted agent intent (from brain server dispatch)
+      const validIntentTypes = ['reply', 'update', 'question', 'greeting', 'acknowledgment'];
+      if (!resultText && validIntentTypes.includes(parsed.type) && parsed.content) {
+        const validTones = ['casual', 'professional', 'urgent', 'playful'];
+        return {
+          type: parsed.type,
+          content: parsed.content,
+          tone: validTones.includes(parsed.tone) ? parsed.tone : 'casual',
+        };
       }
     }
 
