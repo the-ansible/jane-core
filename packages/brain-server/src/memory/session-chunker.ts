@@ -13,6 +13,7 @@ export interface RawMessage {
   content: string;
   timestamp: string;
   eventId?: string;
+  sender?: { id: string; displayName?: string; type: string }; // From CommunicationEvent.sender
 }
 
 export interface SessionChunk {
@@ -100,10 +101,43 @@ export function listSessionIds(): string[] {
 }
 
 /**
+ * Resolve the display name for a message speaker.
+ *
+ * Priority: explicit sender field → legacy content heuristics.
+ * New JSONL messages have sender set from CommunicationEvent.sender.
+ * Old JSONL messages fall back to content-based detection.
+ */
+function resolveSpeaker(message: RawMessage): string {
+  if (message.role === 'assistant') return 'Jane';
+
+  if (message.sender) {
+    const { id, displayName, type } = message.sender;
+    if (type === 'system' || type === 'agent') return `Jane (${displayName || id})`;
+    if (id === 'chris') return 'Chris';
+    if (id === 'jane') return 'Jane';
+    return displayName || id;
+  }
+
+  // Legacy fallback: content heuristics for old JSONL without sender field
+  const automatedPatterns = [
+    /^\s*(weekly|daily|monthly|hourly)\s+\w[\w\s]+\s+(audit|check|review|cleanup|scan)/i,
+    /^\s*health\s+check/i,
+    /^\s*good\s+morning,?\s+chris/i,
+    /^\s*storage\s+audit/i,
+    /^\s*efficiency\s+audit/i,
+    /^\s*log\s+cleanup/i,
+    /^\s*script\s+review/i,
+    /\bvault\s+healthy\b/i,
+    /audit\s+report\s+saved\s+to\s+operations\//i,
+  ];
+  return automatedPatterns.some((p) => p.test(message.content)) ? 'Jane (automated)' : 'Chris';
+}
+
+/**
  * Format messages as readable conversation text for Graphiti.
  */
 export function formatChunkAsText(messages: RawMessage[]): string {
   return messages
-    .map((m) => `${m.role === 'user' ? 'Chris' : 'Jane'}: ${m.content}`)
+    .map((m) => `${resolveSpeaker(m)}: ${m.content}`)
     .join('\n');
 }
