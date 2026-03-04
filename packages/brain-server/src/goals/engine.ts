@@ -24,6 +24,8 @@ import { generateCandidates, scoreCandidates } from './ollama.js';
 import { createJob } from '../jobs/registry.js';
 import { spawnAgent } from '../jobs/spawner.js';
 import type { CandidateAction } from './types.js';
+import { recordGoalCycleMemory } from '../memory/recorder.js';
+import { getGoalContextMemories } from '../memory/retriever.js';
 
 // 4 hours default
 const DEFAULT_CYCLE_INTERVAL_MS = 4 * 60 * 60 * 1000;
@@ -157,12 +159,31 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     await completeCycle(cycleId, goals.length, candidates.length, actionId, null);
     publishCycleStatus(nats, cycleId, 'done', `Executing: ${best.description}`, actionId);
 
+    recordGoalCycleMemory({
+      cycleId,
+      goalsAssessed: goals.length,
+      candidatesGenerated: candidates.length,
+      selectedAction: best.description,
+      outcome: 'done',
+      notes: null,
+    }).catch(() => {});
+
     log('info', 'Goal cycle complete', { cycleId, actionId, jobId, action: best.description.slice(0, 80) });
 
   } catch (err) {
     const errMsg = String(err);
     await failCycle(cycleId, errMsg).catch(() => {});
     publishCycleStatus(nats, cycleId, 'failed', errMsg, null);
+
+    recordGoalCycleMemory({
+      cycleId,
+      goalsAssessed: 0,
+      candidatesGenerated: 0,
+      selectedAction: null,
+      outcome: 'failed',
+      notes: errMsg.slice(0, 400),
+    }).catch(() => {});
+
     log('error', 'Goal cycle failed', { cycleId, error: errMsg });
   } finally {
     isCycleRunning = false;
@@ -174,9 +195,12 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function buildContext(): Promise<string> {
-  // Pull recent cycle results for context
   try {
-    const recent = await listCycles(3);
+    const [recent, memoryContext] = await Promise.all([
+      listCycles(3),
+      getGoalContextMemories().catch(() => '(memory unavailable)'),
+    ]);
+
     const cycleContext = recent
       .filter((c) => c.status === 'done' && c.cycle_notes)
       .map((c) => `- ${new Date(c.started_at).toISOString().slice(0, 10)}: ${c.cycle_notes}`)
@@ -186,6 +210,7 @@ async function buildContext(): Promise<string> {
       `Current time: ${new Date().toISOString()}`,
       `System: Jane's brain server (Node.js/TypeScript, PM2-managed)`,
       `Recent cycle activity:\n${cycleContext}`,
+      `Relevant memories:\n${memoryContext}`,
     ].join('\n\n');
   } catch {
     return `Current time: ${new Date().toISOString()}`;

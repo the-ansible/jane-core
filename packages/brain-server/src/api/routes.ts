@@ -42,6 +42,13 @@ import {
 import { listLayerEvents, listDirectives } from '../layers/registry.js';
 import { getLastMonitorResults } from '../layers/autonomic.js';
 import type { LayerName } from '../layers/types.js';
+import {
+  listMemories, getMemory, deleteMemory, countMemories, searchMemories, listPatterns,
+} from '../memory/registry.js';
+import { recordManualMemory } from '../memory/recorder.js';
+import { getRelevantMemories, formatMemoriesForContext } from '../memory/retriever.js';
+import { runConsolidation, isConsolidating, getLastConsolidationResult } from '../memory/consolidator.js';
+import type { MemoryType, MemorySource } from '../memory/types.js';
 
 const sc = StringCodec();
 
@@ -366,6 +373,159 @@ export function createApp(deps: ServerDeps): Hono {
     if (!status) return c.json({ error: 'Unknown layer' }, 404);
     const extra = name === 'autonomic' ? { monitors: getLastMonitorResults() } : {};
     return c.json({ ...status, ...extra });
+  });
+
+  // -------------------------------------------------------------------------
+  // Memory API
+  //
+  // GET  /api/memories            — list memories (filters: type, source, tags, minImportance, limit)
+  // GET  /api/memories/search     — keyword search (?q=...)
+  // GET  /api/memories/context    — retrieve + format relevant memories for LLM context (?q=, tags=)
+  // GET  /api/memories/patterns   — list learned patterns
+  // GET  /api/memories/stats      — summary stats
+  // GET  /api/memories/consolidation — consolidation state + last result
+  // POST /api/memories            — manually record a memory
+  // POST /api/memories/consolidate — trigger manual consolidation run
+  // GET  /api/memories/:id        — get a specific memory (increments access_count)
+  // DELETE /api/memories/:id      — delete a memory
+  // -------------------------------------------------------------------------
+
+  app.get('/api/memories/search', async (c) => {
+    try {
+      const q = c.req.query('q');
+      if (!q) return c.json({ error: 'q parameter is required' }, 400);
+      const limit = parseInt(c.req.query('limit') ?? '20', 10);
+      const memories = await searchMemories(q, Math.min(limit, 100));
+      return c.json({ memories, count: memories.length });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/memories/context', async (c) => {
+    try {
+      const q = c.req.query('q');
+      const tagsRaw = c.req.query('tags');
+      const tags = tagsRaw ? tagsRaw.split(',').map((t) => t.trim()) : undefined;
+      const limit = parseInt(c.req.query('limit') ?? '8', 10);
+      const memories = await getRelevantMemories({ query: q, tags, limit: Math.min(limit, 20) });
+      const text = formatMemoriesForContext(memories);
+      return c.json({ memories, text, count: memories.length });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/memories/patterns', async (c) => {
+    try {
+      const patternType = c.req.query('type');
+      const minConfidence = c.req.query('minConfidence') ? parseFloat(c.req.query('minConfidence')!) : undefined;
+      const limit = parseInt(c.req.query('limit') ?? '50', 10);
+      const patterns = await listPatterns({ patternType, minConfidence, limit: Math.min(limit, 200) });
+      return c.json({ patterns, count: patterns.length });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/memories/stats', async (c) => {
+    try {
+      const total = await countMemories();
+      return c.json({ total, ts: new Date().toISOString() });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/memories/consolidation', (c) => {
+    const { lastRunAt, result } = getLastConsolidationResult();
+    return c.json({ consolidating: isConsolidating(), lastRunAt, result });
+  });
+
+  app.post('/api/memories/consolidate', async (c) => {
+    if (isConsolidating()) return c.json({ error: 'Consolidation already running' }, 409);
+    try {
+      const result = await runConsolidation();
+      return c.json({ result }, result.error ? 500 : 200);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // Must be before /:id
+  app.get('/api/memories', async (c) => {
+    try {
+      const type = c.req.query('type') as MemoryType | undefined;
+      const source = c.req.query('source') as MemorySource | undefined;
+      const tagsRaw = c.req.query('tags');
+      const tags = tagsRaw ? tagsRaw.split(',').map((t) => t.trim()) : undefined;
+      const minImportance = c.req.query('minImportance') ? parseFloat(c.req.query('minImportance')!) : undefined;
+      const limit = parseInt(c.req.query('limit') ?? '50', 10);
+      const memories = await listMemories({ type, source, tags, minImportance, limit: Math.min(limit, 500) });
+      return c.json({ memories, count: memories.length });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/api/memories', async (c) => {
+    try {
+      const body = await c.req.json() as {
+        title?: string;
+        content?: string;
+        type?: string;
+        tags?: string[];
+        importance?: number;
+        expiresInMs?: number;
+        metadata?: Record<string, unknown>;
+        source?: string;
+      };
+
+      if (!body.title || !body.content) {
+        return c.json({ error: 'title and content are required' }, 400);
+      }
+
+      const validTypes = ['episodic', 'semantic', 'procedural', 'working'];
+      if (body.type && !validTypes.includes(body.type)) {
+        return c.json({ error: `type must be one of: ${validTypes.join(', ')}` }, 400);
+      }
+
+      const id = await recordManualMemory({
+        title: body.title,
+        content: body.content,
+        type: body.type as 'episodic' | 'semantic' | 'procedural' | 'working' | undefined,
+        tags: body.tags,
+        importance: body.importance,
+        expiresInMs: body.expiresInMs,
+        metadata: body.metadata,
+        source: body.source as MemorySource | undefined,
+      });
+
+      const memory = await getMemory(id);
+      return c.json({ memory }, 201);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/memories/:id', async (c) => {
+    try {
+      const memory = await getMemory(c.req.param('id'));
+      if (!memory) return c.json({ error: 'Not found' }, 404);
+      return c.json({ memory });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.delete('/api/memories/:id', async (c) => {
+    try {
+      const deleted = await deleteMemory(c.req.param('id'));
+      if (!deleted) return c.json({ error: 'Not found' }, 404);
+      return c.json({ id: c.req.param('id'), deleted: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
   });
 
   return app;

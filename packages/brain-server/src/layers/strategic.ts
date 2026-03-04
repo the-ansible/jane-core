@@ -19,6 +19,7 @@ import { listGoals, listGoalActions } from '../goals/registry.js';
 import { listCycles } from '../goals/registry.js';
 import { createJob } from '../jobs/registry.js';
 import { spawnAgent } from '../jobs/spawner.js';
+import { recordDirectiveMemory } from '../memory/recorder.js';
 
 const sc = StringCodec();
 
@@ -173,6 +174,7 @@ export async function issueDirective(
     ts: new Date().toISOString(),
   });
 
+  recordDirectiveMemory({ directiveId, targetLayer: params.targetLayer, directive: params.directive, params: params.directiveParams }).catch(() => {});
   log('info', 'Strategic directive issued', { directiveId, targetLayer: params.targetLayer, directive: params.directive });
   return directiveId;
 }
