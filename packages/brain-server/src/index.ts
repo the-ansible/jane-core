@@ -23,6 +23,7 @@ import { startHierarchicalControl } from './layers/controller.js';
 import { initMemoryRegistry } from './memory/registry.js';
 import { startConsolidator } from './memory/consolidator.js';
 import { initIngestionLog } from './memory/ingestion-log.js';
+import { startGraphitiIngestor } from './graphiti/ingestor.js';
 
 const PORT = parseInt(process.env.PORT || '3103', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
@@ -58,6 +59,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     startHeartbeatMonitor(deps.nats);
     startGoalEngine(deps.nats);
     await startHierarchicalControl(deps.nats);
+    startGraphitiIngestor(deps.nats);
     log('info', 'Brain server fully initialized', { port: PORT, natsUrl: NATS_URL });
   } catch (err) {
     log('error', 'Failed to connect to NATS — job submission via NATS unavailable', { error: String(err) });
