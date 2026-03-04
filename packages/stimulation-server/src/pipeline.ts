@@ -112,6 +112,8 @@ export async function processPipeline(
     content: event.content,
     timestamp: event.timestamp,
     eventId: event.id,
+    source: event.source ?? event.sender?.id,
+    source_type: event.source_type ?? event.sender?.type,
   });
 
   // Compact + ingest to Graphiti when session exceeds threshold (fire-and-forget)
@@ -353,6 +355,8 @@ async function handleAgentResponse(
       content: composedMessage,
       timestamp: responseEvent.timestamp,
       eventId: responseEvent.id,
+      source: 'jane',
+      source_type: 'agent',
     });
 
     console.log(JSON.stringify({
@@ -553,6 +557,8 @@ export async function resumeAliveJob(opts: {
       content: composedMessage,
       timestamp: responseEvent.timestamp,
       eventId: responseEvent.id,
+      source: 'jane',
+      source_type: 'agent',
     });
 
     await markJobCompleted(opts.jobId).catch(() => {});

@@ -12,6 +12,8 @@ export interface SessionMessage {
   content: string;
   timestamp: string;
   eventId?: string;
+  source?: string;       // Who sent this: "chris", "jane", "librarian-audit", etc.
+  source_type?: string;  // Category: "human", "agent", "system"
 }
 
 export interface SessionState {
