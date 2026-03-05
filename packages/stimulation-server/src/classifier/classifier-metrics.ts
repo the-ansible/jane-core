@@ -58,8 +58,8 @@ interface MetricsState {
 function createEmptyState(): MetricsState {
   return {
     total: 0,
-    tierCounts: { rules: 0, local_consensus: 0, claude_escalation: 0, fallback: 0 },
-    tierLatencySums: { rules: 0, local_consensus: 0, claude_escalation: 0, fallback: 0 },
+    tierCounts: { rules: 0, local_consensus: 0, mercury: 0, claude_escalation: 0, fallback: 0 },
+    tierLatencySums: { rules: 0, local_consensus: 0, mercury: 0, claude_escalation: 0, fallback: 0 },
     consensusVotes: 0,
     consensusAgreeingSum: 0,
     perfectAgreements: 0,
@@ -131,6 +131,7 @@ export function getClassifierMetrics(): ClassifierMetrics {
     latency: {
       rules: avgLatency('rules'),
       local_consensus: avgLatency('local_consensus'),
+      mercury: avgLatency('mercury'),
       claude_escalation: avgLatency('claude_escalation'),
       fallback: avgLatency('fallback'),
     },

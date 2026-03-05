@@ -1,18 +1,31 @@
 /**
  * Classifier orchestrator.
- * Routes messages through three tiers: rules → local consensus → Claude escalation.
- * Each tier is tried in order; the first to produce a result wins.
+ * Routes messages through a configurable waterfall:
+ *   rules → LLM classifiers (in order) → fallback.
+ *
+ * The LLM classifier chain is configured at startup. Default:
+ *   Mercury (instant) → Claude CLI (backup)
+ *
+ * Each LLM classifier implements the LlmClassifier interface, so new
+ * backends can be added by implementing classify() and dropping them
+ * into the chain.
  */
 
 import { classifyByRules } from './rules.js';
-import { classifyByConsensus } from './ollama.js';
-import { classifyByClaude } from './claude.js';
 import { recordClassification, getClassifierMetrics, resetClassifierMetrics } from './classifier-metrics.js';
-import type { ClassificationResult, ClassificationContext } from './types.js';
+import type { ClassificationResult, ClassificationContext, LlmClassifier } from './types.js';
 import type { SafetyGate } from '../safety/index.js';
 
-export type { ClassificationResult, ClassificationContext } from './types.js';
+// Concrete implementations — import the classes
+import { MercuryClassifier } from './mercury.js';
+import { ClaudeCliClassifier } from './claude.js';
+import { OllamaClassifier } from './ollama.js';
+
+export type { ClassificationResult, ClassificationContext, LlmClassifier } from './types.js';
 export { getClassifierMetrics, resetClassifierMetrics } from './classifier-metrics.js';
+export { MercuryClassifier } from './mercury.js';
+export { ClaudeCliClassifier } from './claude.js';
+export { OllamaClassifier } from './ollama.js';
 
 /** Default classification when all tiers fail */
 const FALLBACK_RESULT: ClassificationResult = {
@@ -35,8 +48,31 @@ function log(msg: string, data?: Record<string, unknown>) {
 }
 
 /**
+ * The configured LLM classifier chain.
+ * Default: Mercury → Claude CLI.
+ * Call setClassifierChain() to reconfigure.
+ */
+let classifierChain: LlmClassifier[] = [
+  new MercuryClassifier(),
+  new ClaudeCliClassifier(),
+];
+
+/** Replace the LLM classifier chain at runtime */
+export function setClassifierChain(chain: LlmClassifier[]): void {
+  classifierChain = chain;
+  log('Classifier chain updated', {
+    chain: chain.map((c) => c.name),
+  });
+}
+
+/** Get the current classifier chain (for inspection/testing) */
+export function getClassifierChain(): LlmClassifier[] {
+  return classifierChain;
+}
+
+/**
  * Classify a message through the tiered pipeline.
- * Rules → Ollama consensus → Claude escalation → fallback.
+ * Rules → LLM chain (in order) → fallback.
  */
 export async function classify(
   ctx: ClassificationContext,
@@ -44,7 +80,7 @@ export async function classify(
 ): Promise<ClassificationResult> {
   const start = Date.now();
 
-  // --- Tier 1: Rules ---
+  // --- Tier 1: Rules (always first) ---
   const rulesResult = classifyByRules(ctx);
   if (rulesResult) {
     const latencyMs = Date.now() - start;
@@ -61,70 +97,57 @@ export async function classify(
     return result;
   }
 
-  // --- Tier 2: Ollama Consensus ---
-  // Check safety gate before making LLM calls
-  const localCheck = safety?.canCallLocalLlm(ctx.channelType) ?? { allowed: true, reasons: [] };
-  if (localCheck.allowed) {
-    try {
-      const consensusResult = await classifyByConsensus(ctx);
-      if (consensusResult) {
-        const result: ClassificationResult = {
-          ...consensusResult.classification,
-          confidence: consensusResult.confidence,
-          tier: 'local_consensus',
-          agreement: consensusResult.agreement,
-          latencyMs: consensusResult.latencyMs,
-          model: consensusResult.model,
-        };
-        log('Classified by local consensus', {
-          agreement: consensusResult.agreement,
-          ...result,
-        });
-        // Record 3 LLM calls for rate limiting
-        safety?.recordLlmCall('local', ctx.channelType);
-        safety?.recordLlmCall('local', ctx.channelType);
-        safety?.recordLlmCall('local', ctx.channelType);
-        recordClassification(
-          'local_consensus', result.urgency, result.category, result.routing,
-          result.confidence, result.latencyMs, consensusResult.agreement
-        );
-        return result;
-      }
-      log('Local consensus failed — no agreement, escalating');
-    } catch (err) {
-      log('Ollama consensus error, escalating', { error: String(err) });
-    }
-  } else {
-    log('Local LLM blocked by safety gate', { reasons: localCheck.reasons });
-  }
+  // --- LLM Classifier Chain ---
+  for (const classifier of classifierChain) {
+    // Check safety gate — use 'claude' gate for Claude CLI, 'local' for others
+    const gateType = classifier.name === 'claude-cli' ? 'claude' : 'local';
+    const check = gateType === 'claude'
+      ? (safety?.canCallClaude(ctx.channelType) ?? { allowed: true, reasons: [] })
+      : (safety?.canCallLocalLlm(ctx.channelType) ?? { allowed: true, reasons: [] });
 
-  // --- Tier 3: Claude Escalation ---
-  const claudeCheck = safety?.canCallClaude(ctx.channelType) ?? { allowed: true, reasons: [] };
-  if (claudeCheck.allowed) {
+    if (!check.allowed) {
+      log(`${classifier.name} blocked by safety gate`, { reasons: check.reasons });
+      continue;
+    }
+
     try {
-      const claudeResult = await classifyByClaude(ctx);
-      if (claudeResult) {
+      const llmResult = await classifier.classify(ctx);
+      if (llmResult) {
         const result: ClassificationResult = {
-          ...claudeResult.classification,
-          confidence: 'high', // Claude is authoritative
-          tier: 'claude_escalation',
-          latencyMs: claudeResult.latencyMs,
-          model: claudeResult.model,
+          ...llmResult.classification,
+          confidence: llmResult.confidence,
+          tier: classifier.tier,
+          latencyMs: llmResult.latencyMs,
+          model: llmResult.model,
         };
-        log('Classified by Claude escalation', result as unknown as Record<string, unknown>);
-        safety?.recordLlmCall('claude', ctx.channelType);
+
+        // Attach agreement metadata if present (from Ollama consensus)
+        if (llmResult.metadata?.agreement) {
+          result.agreement = llmResult.metadata.agreement as { votes: number; agreeing: number };
+        }
+
+        log(`Classified by ${classifier.name}`, result as unknown as Record<string, unknown>);
+
+        // Record rate limiting — Ollama consensus counts as 3 calls
+        if (classifier.name === 'ollama') {
+          safety?.recordLlmCall('local', ctx.channelType);
+          safety?.recordLlmCall('local', ctx.channelType);
+          safety?.recordLlmCall('local', ctx.channelType);
+        } else if (classifier.name === 'claude-cli') {
+          safety?.recordLlmCall('claude', ctx.channelType);
+        }
+        // Mercury doesn't need rate limiting through our safety gate
+
         recordClassification(
-          'claude_escalation', result.urgency, result.category, result.routing,
-          result.confidence, result.latencyMs
+          classifier.tier, result.urgency, result.category, result.routing,
+          result.confidence, result.latencyMs, result.agreement
         );
         return result;
       }
-      log('Claude escalation returned no result');
+      log(`${classifier.name} returned no result, trying next`);
     } catch (err) {
-      log('Claude escalation error', { error: String(err) });
+      log(`${classifier.name} error, trying next`, { error: String(err) });
     }
-  } else {
-    log('Claude blocked by safety gate', { reasons: claudeCheck.reasons });
   }
 
   // --- Fallback ---

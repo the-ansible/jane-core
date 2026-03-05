@@ -8,6 +8,8 @@ import {
   type Classification,
   type ClassificationContext,
   type Confidence,
+  type LlmClassifier,
+  type LlmClassifyResult,
   isValidClassification,
   VALID_URGENCY,
   VALID_CATEGORY,
@@ -16,7 +18,7 @@ import {
 import { buildClassificationPrompt } from './prompt.js';
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_CLASSIFIER_MODEL || 'gemma3:12b';
+const OLLAMA_MODEL = process.env.OLLAMA_CLASSIFIER_MODEL || 'qwen3:8b';
 const CONSENSUS_COUNT = 3;
 const OLLAMA_TIMEOUT_MS = 30_000;
 
@@ -40,6 +42,7 @@ async function callOllamaOnce(
         temperature: 0.1, // low temp for consistency
         num_predict: 100, // classification is short
       },
+      think: false, // disable qwen3 thinking mode for faster, cleaner output
     }),
     signal: AbortSignal.timeout(OLLAMA_TIMEOUT_MS),
   });
@@ -180,4 +183,22 @@ export async function classifyByConsensus(
     latencyMs,
     model: OLLAMA_MODEL,
   };
+}
+
+export class OllamaClassifier implements LlmClassifier {
+  readonly name = 'ollama';
+  readonly tier = 'local_consensus';
+
+  async classify(ctx: ClassificationContext): Promise<LlmClassifyResult | null> {
+    const result = await classifyByConsensus(ctx);
+    if (!result) return null;
+
+    return {
+      classification: result.classification,
+      confidence: result.confidence,
+      latencyMs: result.latencyMs,
+      model: result.model,
+      metadata: { agreement: result.agreement },
+    };
+  }
 }

@@ -10,6 +10,8 @@ import { launchClaude, parseClaudeJsonOutput } from '@jane-core/claude-launcher'
 import {
   type Classification,
   type ClassificationContext,
+  type LlmClassifier,
+  type LlmClassifyResult,
   isValidClassification,
 } from './types.js';
 import { parseClassificationResponse } from './ollama.js';
@@ -63,5 +65,22 @@ export async function classifyByClaude(
       ts: new Date().toISOString(),
     }));
     return null;
+  }
+}
+
+export class ClaudeCliClassifier implements LlmClassifier {
+  readonly name = 'claude-cli';
+  readonly tier = 'claude_escalation';
+
+  async classify(ctx: ClassificationContext): Promise<LlmClassifyResult | null> {
+    const result = await classifyByClaude(ctx);
+    if (!result) return null;
+
+    return {
+      classification: result.classification,
+      confidence: 'high',
+      latencyMs: result.latencyMs,
+      model: result.model,
+    };
   }
 }
