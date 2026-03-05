@@ -9,6 +9,7 @@
 
 import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
+import { launchClaude } from '@jane-core/claude-launcher';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import type { NatsConnection } from 'nats';
@@ -345,58 +346,51 @@ export async function invokeAgent(context: AgentContext): Promise<AgentResult> {
   }
 }
 
-/** Strip CLAUDECODE env var so spawned Claude CLI doesn't think it's nested */
-function stripClaudeCodeEnv(): Record<string, string | undefined> {
+/** Build a clean env for the wrapper (mirrors what the launcher does internally) */
+function buildCleanEnv(extra?: Record<string, string>): Record<string, string | undefined> {
   const env = { ...process.env };
   delete env.CLAUDECODE;
-  return env;
+  env.JANE_NONINTERACTIVE = '1';
+  env.NO_COLOR = '1';
+  return { ...env, ...extra };
 }
 
 /**
  * Spawn the agent-job-wrapper which runs Claude CLI and handles persistence.
- * Falls back to direct Claude spawn if wrapper path doesn't exist.
+ * Falls back to direct Claude spawn via the launcher if wrapper path doesn't exist.
  */
 function spawnWrapper(prompt: string, outputFile: string, jobId: string | null): Promise<string | null> {
+  // Check if wrapper exists; fall back to launcher if not
+  if (!existsSync(WRAPPER_PATH)) {
+    console.log(JSON.stringify({
+      level: 'warn',
+      msg: 'Wrapper not found, falling back to direct claude spawn',
+      component: 'agent',
+      wrapperPath: WRAPPER_PATH,
+      ts: new Date().toISOString(),
+    }));
+    return launchClaude({
+      prompt,
+      timeout: AGENT_TIMEOUT_MS,
+    }).then((result) => {
+      if (result.exitCode !== 0 || result.timedOut) return null;
+      return result.stdout;
+    });
+  }
+
   return new Promise((resolve) => {
-    const env: Record<string, string | undefined> = {
-      ...stripClaudeCodeEnv(),
+    const env = buildCleanEnv({
       OUTPUT_FILE: outputFile,
       NATS_URL,
-    };
+    });
     if (jobId) env.JOB_ID = jobId;
 
-    let proc: ReturnType<typeof spawn>;
-
-    // Check if wrapper exists; fall back to direct claude if not
-    if (existsSync(WRAPPER_PATH)) {
-      proc = spawn('node', [WRAPPER_PATH], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: '/agent',
-        env,
-        timeout: AGENT_TIMEOUT_MS,
-      });
-    } else {
-      // Fallback: spawn claude directly (no wrapper persistence)
-      console.log(JSON.stringify({
-        level: 'warn',
-        msg: 'Wrapper not found, falling back to direct claude spawn',
-        component: 'agent',
-        wrapperPath: WRAPPER_PATH,
-        ts: new Date().toISOString(),
-      }));
-      proc = spawn('claude', [
-        '--print',
-        '--dangerously-skip-permissions',
-        '--output-format', 'json',
-        '--model', 'sonnet',
-        '-p', '-',
-      ], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: '/agent',
-        env: stripClaudeCodeEnv(),
-        timeout: AGENT_TIMEOUT_MS,
-      });
-    }
+    const proc = spawn('node', [WRAPPER_PATH], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: '/agent',
+      env,
+      timeout: AGENT_TIMEOUT_MS,
+    });
 
     let stdout = '';
     let stderr = '';

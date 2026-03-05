@@ -3,12 +3,10 @@
  * Spawns `claude` CLI in headless mode using the OAuth-authenticated Max account.
  * Only called when local consensus fails (all models disagree).
  *
- * Uses the same spawn pattern as the executor: --print --dangerously-skip-permissions
- * --output-format json -p - (prompt via stdin). This ensures it uses the logged-in
- * OAuth token (Max 5x account) rather than an API key.
+ * Uses @jane-core/claude-launcher for standardized Claude CLI spawning.
  */
 
-import { spawn } from 'node:child_process';
+import { launchClaude, parseClaudeJsonOutput } from '@jane-core/claude-launcher';
 import {
   type Classification,
   type ClassificationContext,
@@ -36,27 +34,19 @@ export async function classifyByClaude(
   const start = Date.now();
   const prompt = buildClassificationPrompt(ctx);
 
-  const args = [
-    '--print',
-    '--dangerously-skip-permissions',
-    '--output-format',
-    'json',
-    '--max-turns',
-    '1',
-    '--model',
-    CLAUDE_MODEL,
-    '-p',
-    '-',
-  ];
-
   try {
-    const result = await spawnClaude(args, prompt);
+    const result = await launchClaude({
+      model: CLAUDE_MODEL,
+      prompt,
+      maxTurns: 1,
+      timeout: CLAUDE_TIMEOUT_MS,
+    });
     const latencyMs = Date.now() - start;
 
-    if (!result) return null;
+    if (result.exitCode !== 0 || result.timedOut) return null;
 
     // Parse the Claude CLI JSON output to extract the result text
-    const resultText = parseClaudeJsonOutput(result);
+    const resultText = result.resultText;
     if (!resultText) return null;
 
     // Parse the classification from the result text
@@ -74,72 +64,4 @@ export async function classifyByClaude(
     }));
     return null;
   }
-}
-
-function spawnClaude(args: string[], prompt: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    const proc = spawn('claude', args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/agent',
-      env: { ...process.env },
-      timeout: CLAUDE_TIMEOUT_MS,
-    });
-
-    let stdout = '';
-    let timedOut = false;
-
-    proc.stdin.write(prompt);
-    proc.stdin.end();
-
-    proc.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-
-    proc.stderr.on('data', () => {
-      // Ignore stderr for classification
-    });
-
-    proc.on('close', (code, signal) => {
-      if (signal === 'SIGTERM' || signal === 'SIGKILL') timedOut = true;
-      if (timedOut || code !== 0) {
-        resolve(null);
-        return;
-      }
-      resolve(stdout);
-    });
-
-    proc.on('error', () => {
-      resolve(null);
-    });
-
-    // Hard timeout
-    setTimeout(() => {
-      if (proc.exitCode === null) {
-        timedOut = true;
-        proc.kill('SIGTERM');
-      }
-    }, CLAUDE_TIMEOUT_MS + 2000);
-  });
-}
-
-/**
- * Parse Claude CLI --output-format json output.
- * The output is a JSON array of message objects. We want the "result" type's "result" field.
- */
-function parseClaudeJsonOutput(stdout: string): string | null {
-  try {
-    const messages = JSON.parse(stdout) as Array<{
-      type: string;
-      result?: string;
-    }>;
-    for (const msg of messages) {
-      if (msg.type === 'result' && msg.result) {
-        return msg.result;
-      }
-    }
-  } catch {
-    // If not JSON array, treat raw stdout as the result
-    return stdout.trim() || null;
-  }
-  return null;
 }

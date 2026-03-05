@@ -17,11 +17,11 @@
  * Publishes stimulation.agent_jobs.completed to NATS on exit.
  */
 
-import { spawn } from 'node:child_process';
 import { createWriteStream, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import pg from 'pg';
 import { connect, StringCodec } from 'nats';
+import { launchClaude } from '@jane-core/claude-launcher';
 
 const { Pool } = pg;
 const sc = StringCodec();
@@ -73,8 +73,23 @@ async function main(prompt) {
     } catch (_) {}
   }, 30_000);
 
-  // Spawn Claude CLI and pipe output to file
-  const success = await spawnClaude(prompt, OUTPUT_FILE);
+  // Spawn Claude CLI via shared launcher, stream output to file
+  const fileStream = createWriteStream(OUTPUT_FILE, { flags: 'w' });
+
+  const result = await launchClaude({
+    prompt,
+    timeout: 900_000,
+    onStdout: (chunk) => {
+      fileStream.write(chunk);
+      try { process.stdout.write(chunk); } catch (_) {}
+    },
+    onStderr: (chunk) => {
+      try { process.stderr.write(chunk); } catch (_) {}
+    },
+  });
+
+  fileStream.end();
+  const success = result.exitCode === 0;
 
   clearInterval(heartbeat);
 
@@ -104,50 +119,4 @@ async function main(prompt) {
     // Non-fatal — main server will detect agent_done status on next check
     process.stderr.write(`agent-job-wrapper: NATS publish failed (non-fatal): ${err.message}\n`);
   }
-}
-
-function spawnClaude(prompt, outputFile) {
-  return new Promise((resolve) => {
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
-
-    const proc = spawn('claude', [
-      '--print',
-      '--dangerously-skip-permissions',
-      '--output-format', 'json',
-      '--model', 'sonnet',
-      '-p', '-',
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/agent',
-      env,
-      timeout: 900_000,
-    });
-
-    const fileStream = createWriteStream(outputFile, { flags: 'w' });
-
-    proc.stdin.write(prompt, 'utf8');
-    proc.stdin.end();
-
-    proc.stdout.pipe(fileStream);
-
-    // Also mirror to wrapper's stdout so the parent process can read it
-    proc.stdout.on('data', (chunk) => {
-      try { process.stdout.write(chunk); } catch (_) {}
-    });
-
-    proc.stderr.on('data', (chunk) => {
-      try { process.stderr.write(chunk); } catch (_) {}
-    });
-
-    proc.on('close', (code) => {
-      fileStream.end(() => resolve(code === 0));
-    });
-
-    proc.on('error', (err) => {
-      fileStream.end();
-      process.stderr.write(`agent-job-wrapper: claude spawn error: ${err}\n`);
-      resolve(false);
-    });
-  });
 }

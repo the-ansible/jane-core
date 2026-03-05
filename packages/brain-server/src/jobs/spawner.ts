@@ -8,11 +8,12 @@
  * - Results published to NATS on completion
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
+import { launchClaude } from '@jane-core/claude-launcher';
 import {
   markJobRunning,
   markJobDone,
@@ -79,119 +80,91 @@ export async function spawnAgent(params: {
     scratchDir = createScratchDir(jobId);
   }
 
-  const env: Record<string, string | undefined> = {
-    ...stripClaudeCodeEnv(),
-    SCRATCH_DIR: scratchDir,
+  const additionalEnv: Record<string, string> = {
     JOB_ID: jobId,
     NATS_URL: process.env.NATS_URL || 'nats://life-system-nats:4222',
   };
-  if (scratchDir) env.SCRATCH_DIR = scratchDir;
+  if (scratchDir) additionalEnv.SCRATCH_DIR = scratchDir;
 
-  const proc = spawn('claude', [
-    '--print',
-    '--dangerously-skip-permissions',
-    '--output-format', 'json',
-    '--model', 'sonnet',
-    '-p', '-',
-  ], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    cwd: workdir,
-    env,
-    // No timeout — heartbeat monitor handles unresponsive detection
-  });
-
-  const pid = proc.pid!;
   const startedAt = Date.now();
+  let stdoutLen = 0;
+  let stderr = '';
 
-  await markJobRunning(jobId, pid, {
-    worktreePath,
-    scratchDir,
-    outputFile,
-  });
-
+  // We need a fake proc-like object for the running jobs map
+  // The launcher doesn't expose the child process, so we track activity via callbacks
   const running: RunningJob = {
-    proc,
+    proc: null as unknown as ChildProcess, // filled below if needed for kill
     startedAt,
     lastActivityAt: startedAt,
     jobId,
   };
   runningJobs.set(jobId, running);
 
-  log('info', 'Spawned agent', { jobId, pid, workdir, type: request.type });
-
-  let stdout = '';
-  let stderr = '';
-
-  proc.stdin!.write(request.prompt);
-  proc.stdin!.end();
-
-  proc.stdout!.on('data', (chunk: Buffer) => {
-    stdout += chunk.toString();
-    running.lastActivityAt = Date.now();
-    updateHeartbeat(jobId).catch(() => {});
-
-    // Publish heartbeat to NATS
-    nats.publish(`agent.jobs.heartbeat.${jobId}`, sc.encode(JSON.stringify({
-      jobId,
-      ts: new Date().toISOString(),
-      bytesReceived: stdout.length,
-    })));
+  await markJobRunning(jobId, process.pid, {
+    worktreePath,
+    scratchDir,
+    outputFile,
   });
 
-  proc.stderr!.on('data', (chunk: Buffer) => {
-    stderr += chunk.toString();
-    running.lastActivityAt = Date.now();
-    // stderr counts as activity (tool use, progress, etc.)
+  log('info', 'Spawned agent', { jobId, workdir, type: request.type });
+
+  // Use the shared launcher — no timeout (brain server design principle)
+  const launchResult = await launchClaude({
+    prompt: request.prompt,
+    cwd: workdir,
+    timeout: 0,
+    additionalEnv,
+    onStdout: (chunk) => {
+      stdoutLen += chunk.length;
+      running.lastActivityAt = Date.now();
+      updateHeartbeat(jobId).catch(() => {});
+
+      nats.publish(`agent.jobs.heartbeat.${jobId}`, sc.encode(JSON.stringify({
+        jobId,
+        ts: new Date().toISOString(),
+        bytesReceived: stdoutLen,
+      })));
+    },
+    onStderr: (chunk) => {
+      stderr += chunk;
+      running.lastActivityAt = Date.now();
+    },
   });
 
-  proc.on('close', async (code, signal) => {
-    runningJobs.delete(jobId);
-    const durationMs = Date.now() - startedAt;
+  runningJobs.delete(jobId);
+  const durationMs = Date.now() - startedAt;
 
-    // Cleanup isolation artifacts
-    if (worktreePath && request.projectPath) {
-      await removeWorktree(jobId, request.projectPath).catch(() => {});
-    }
-    if (scratchDir) {
-      cleanupScratchDir(jobId);
-    }
+  // Cleanup isolation artifacts
+  if (worktreePath && request.projectPath) {
+    await removeWorktree(jobId, request.projectPath).catch(() => {});
+  }
+  if (scratchDir) {
+    cleanupScratchDir(jobId);
+  }
 
-    if (code !== 0 || signal) {
-      const error = signal
-        ? `Killed by signal ${signal}`
-        : `Exited with code ${code}. stderr: ${stderr.slice(0, 500)}`;
+  if (launchResult.exitCode !== 0 || launchResult.signal) {
+    const error = launchResult.signal
+      ? `Killed by signal ${launchResult.signal}`
+      : `Exited with code ${launchResult.exitCode}. stderr: ${stderr.slice(0, 500)}`;
 
-      await markJobFailed(jobId, error).catch(() => {});
+    await markJobFailed(jobId, error).catch(() => {});
 
-      const result: JobResult = { jobId, clientId: request.clientId, status: 'failed', error, durationMs };
-      publishResult(nats, request.replySubject, jobId, result);
-
-      log('error', 'Agent exited with error', { jobId, code, signal, durationMs });
-      return;
-    }
-
-    // Extract result text from Claude CLI JSON output
-    const resultText = extractResult(stdout) ?? stdout.trim();
-
-    await markJobDone(jobId, resultText).catch(() => {});
-
-    const result: JobResult = { jobId, clientId: request.clientId, status: 'done', result: resultText, durationMs };
+    const result: JobResult = { jobId, clientId: request.clientId, status: 'failed', error, durationMs };
     publishResult(nats, request.replySubject, jobId, result);
 
-    log('info', 'Agent completed', { jobId, durationMs, resultLength: resultText.length });
-  });
+    log('error', 'Agent exited with error', { jobId, exitCode: launchResult.exitCode, signal: launchResult.signal, durationMs });
+    return;
+  }
 
-  proc.on('error', async (err) => {
-    runningJobs.delete(jobId);
-    const durationMs = Date.now() - startedAt;
+  // Extract result text from Claude CLI JSON output (launcher already parsed it)
+  const resultText = launchResult.resultText ?? launchResult.stdout.trim();
 
-    await markJobFailed(jobId, String(err)).catch(() => {});
+  await markJobDone(jobId, resultText).catch(() => {});
 
-    const result: JobResult = { jobId, clientId: request.clientId, status: 'failed', error: String(err), durationMs };
-    publishResult(nats, request.replySubject, jobId, result);
+  const result: JobResult = { jobId, clientId: request.clientId, status: 'done', result: resultText, durationMs };
+  publishResult(nats, request.replySubject, jobId, result);
 
-    log('error', 'Agent spawn error', { jobId, error: String(err) });
-  });
+  log('info', 'Agent completed', { jobId, durationMs, resultLength: resultText.length });
 }
 
 /** Kill a running job by PID */
@@ -233,45 +206,6 @@ function publishResult(nats: NatsConnection, replySubject: string | undefined, j
   }
 }
 
-/** Extract the result text from Claude CLI JSON output */
-function extractResult(stdout: string): string | null {
-  try {
-    const parsed = JSON.parse(stdout);
-
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      if (parsed.type === 'result' && parsed.result) return String(parsed.result);
-    }
-
-    if (Array.isArray(parsed)) {
-      for (const msg of parsed) {
-        if (msg.type === 'result' && msg.result) return String(msg.result);
-      }
-      // Fall back to assistant text blocks
-      for (const msg of parsed) {
-        if (msg.type === 'assistant' && msg.message?.content) {
-          const text = Array.isArray(msg.message.content)
-            ? msg.message.content
-                .filter((b: { type: string }) => b.type === 'text')
-                .map((b: { text: string }) => b.text)
-                .join('\n')
-            : typeof msg.message.content === 'string'
-              ? msg.message.content
-              : null;
-          if (text) return text;
-        }
-      }
-    }
-  } catch {
-    // Not JSON — return null to use raw stdout
-  }
-  return null;
-}
-
-function stripClaudeCodeEnv(): Record<string, string | undefined> {
-  const env = { ...process.env };
-  delete env.CLAUDECODE;
-  return env;
-}
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {
   console.log(JSON.stringify({ level, msg, component: 'brain-spawner', ts: new Date().toISOString(), ...extra }));
