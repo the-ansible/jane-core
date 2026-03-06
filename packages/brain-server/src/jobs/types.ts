@@ -56,6 +56,8 @@ export interface JobResult {
   result?: string;
   error?: string;
   durationMs: number;
+  /** Path to the captured output log file */
+  logPath?: string;
 }
 
 /** Published on `agent.jobs.alert.<jobId>` */

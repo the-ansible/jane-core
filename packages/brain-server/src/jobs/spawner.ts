@@ -9,8 +9,9 @@
  */
 
 import { type ChildProcess } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, createWriteStream, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { WriteStream } from 'node:fs';
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { launchClaude } from '@jane-core/claude-launcher';
@@ -21,9 +22,10 @@ import {
   updateHeartbeat,
 } from './registry.js';
 import { createScratchDir, createWorktree, removeWorktree, cleanupScratchDir } from './worktree.js';
+import { getGoalActionByJobId, updateGoalAction } from '../goals/registry.js';
 import type { JobRequest, JobResult } from './types.js';
 
-const OUTPUT_BASE = '/tmp/brain-output';
+const OUTPUT_BASE = '/agent/command/results';
 const DEFAULT_WORKDIR = '/agent';
 
 const sc = StringCodec();
@@ -57,8 +59,13 @@ export async function spawnAgent(params: {
 }): Promise<void> {
   const { jobId, request, nats } = params;
 
-  mkdirSync(OUTPUT_BASE, { recursive: true });
-  const outputFile = join(OUTPUT_BASE, `${jobId}.txt`);
+  const jobResultDir = join(OUTPUT_BASE, jobId);
+  mkdirSync(jobResultDir, { recursive: true });
+  const outputFile = join(jobResultDir, 'output.log');
+  const metaFile = join(jobResultDir, 'meta.json');
+
+  // Open a write stream for the output log
+  const logStream: WriteStream = createWriteStream(outputFile, { flags: 'a' });
 
   // Resolve working directory
   let workdir = request.workdir ?? DEFAULT_WORKDIR;
@@ -87,8 +94,9 @@ export async function spawnAgent(params: {
   if (scratchDir) additionalEnv.SCRATCH_DIR = scratchDir;
 
   const startedAt = Date.now();
+  const startTime = new Date(startedAt).toISOString();
   let stdoutLen = 0;
-  let stderr = '';
+  let stderrBuf = '';
 
   // We need a fake proc-like object for the running jobs map
   // The launcher doesn't expose the child process, so we track activity via callbacks
@@ -106,7 +114,7 @@ export async function spawnAgent(params: {
     outputFile,
   });
 
-  log('info', 'Spawned agent', { jobId, workdir, type: request.type });
+  log('info', 'Spawned agent', { jobId, workdir, type: request.type, logPath: outputFile });
 
   // Use the shared launcher — no timeout (brain server design principle)
   const launchResult = await launchClaude({
@@ -117,6 +125,7 @@ export async function spawnAgent(params: {
     onStdout: (chunk) => {
       stdoutLen += chunk.length;
       running.lastActivityAt = Date.now();
+      logStream.write(chunk);
       updateHeartbeat(jobId).catch(() => {});
 
       nats.publish(`agent.jobs.heartbeat.${jobId}`, sc.encode(JSON.stringify({
@@ -126,10 +135,13 @@ export async function spawnAgent(params: {
       })));
     },
     onStderr: (chunk) => {
-      stderr += chunk;
+      stderrBuf += chunk;
       running.lastActivityAt = Date.now();
+      logStream.write(`[STDERR] ${chunk}`);
     },
   });
+
+  logStream.end();
 
   runningJobs.delete(jobId);
   const durationMs = Date.now() - startedAt;
@@ -142,29 +154,45 @@ export async function spawnAgent(params: {
     cleanupScratchDir(jobId);
   }
 
+  const goalId = (request.context?.goalId as string | undefined) ?? undefined;
+
   if (launchResult.exitCode !== 0 || launchResult.signal) {
     const error = launchResult.signal
       ? `Killed by signal ${launchResult.signal}`
-      : `Exited with code ${launchResult.exitCode}. stderr: ${stderr.slice(0, 500)}`;
+      : `Exited with code ${launchResult.exitCode}. stderr: ${stderrBuf.slice(0, 500)}`;
+
+    writeMeta(metaFile, { jobId, goalId, startTime, exitCode: launchResult.exitCode ?? -1, durationMs, status: 'failed' });
 
     await markJobFailed(jobId, error).catch(() => {});
 
-    const result: JobResult = { jobId, clientId: request.clientId, status: 'failed', error, durationMs };
+    // Update linked goal_action if this job was spawned by the goal engine
+    getGoalActionByJobId(jobId).then((action) => {
+      if (action) updateGoalAction(action.id, { status: 'failed', outcomeText: error.slice(0, 1000) }).catch(() => {});
+    }).catch(() => {});
+
+    const result: JobResult = { jobId, clientId: request.clientId, status: 'failed', error, durationMs, logPath: outputFile };
     publishResult(nats, request.replySubject, jobId, result);
 
-    log('error', 'Agent exited with error', { jobId, exitCode: launchResult.exitCode, signal: launchResult.signal, durationMs });
+    log('error', 'Agent exited with error', { jobId, exitCode: launchResult.exitCode, signal: launchResult.signal, durationMs, logPath: outputFile });
     return;
   }
 
   // Extract result text from Claude CLI JSON output (launcher already parsed it)
   const resultText = launchResult.resultText ?? launchResult.stdout.trim();
 
+  writeMeta(metaFile, { jobId, goalId, startTime, exitCode: 0, durationMs, status: 'done' });
+
   await markJobDone(jobId, resultText).catch(() => {});
 
-  const result: JobResult = { jobId, clientId: request.clientId, status: 'done', result: resultText, durationMs };
+  // Update linked goal_action if this job was spawned by the goal engine
+  getGoalActionByJobId(jobId).then((action) => {
+    if (action) updateGoalAction(action.id, { status: 'done', outcomeText: resultText.slice(0, 1000) }).catch(() => {});
+  }).catch(() => {});
+
+  const result: JobResult = { jobId, clientId: request.clientId, status: 'done', result: resultText, durationMs, logPath: outputFile };
   publishResult(nats, request.replySubject, jobId, result);
 
-  log('info', 'Agent completed', { jobId, durationMs, resultLength: resultText.length });
+  log('info', 'Agent completed', { jobId, durationMs, resultLength: resultText.length, logPath: outputFile });
 }
 
 /** Kill a running job by PID */
@@ -206,6 +234,17 @@ function publishResult(nats: NatsConnection, replySubject: string | undefined, j
   }
 }
 
+
+function writeMeta(
+  metaFile: string,
+  data: { jobId: string; goalId?: string; startTime: string; exitCode: number; durationMs: number; status: string },
+): void {
+  try {
+    writeFileSync(metaFile, JSON.stringify(data, null, 2));
+  } catch (err) {
+    log('warn', 'Failed to write meta.json', { metaFile, error: String(err) });
+  }
+}
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {
   console.log(JSON.stringify({ level, msg, component: 'brain-spawner', ts: new Date().toISOString(), ...extra }));

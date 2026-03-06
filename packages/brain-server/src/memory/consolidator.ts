@@ -12,13 +12,13 @@
  * Conservative by design — does not delete source episodic memories.
  */
 
+import { launchClaude } from '@jane-core/claude-launcher';
 import { listMemories, recordMemory, recordPattern, applyImportanceDecay, purgeExpiredMemories } from './registry.js';
 import type { Memory } from './types.js';
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma3:12b';
+const CLAUDE_MODEL = process.env.CONSOLIDATION_CLAUDE_MODEL || 'claude-sonnet-4-6';
 const CONSOLIDATION_INTERVAL_MS = parseInt(process.env.MEMORY_CONSOLIDATION_INTERVAL_MS || String(12 * 60 * 60 * 1000), 10);
-const FETCH_TIMEOUT_MS = 120_000;
+const LAUNCH_TIMEOUT_MS = 120_000;
 
 let consolidationTimer: ReturnType<typeof setTimeout> | null = null;
 let isRunning = false;
@@ -146,7 +146,7 @@ Respond ONLY with valid JSON, no markdown:
 Extract 0-3 patterns and 0-3 semantic memories. Only include genuinely useful, non-obvious insights. If nothing notable, return empty arrays.`;
 
   try {
-    const raw = await ollamaGenerate(prompt);
+    const raw = await claudeGenerate(prompt);
     const parsed = extractJson(raw) as {
       patterns?: Array<{ type: string; description: string; confidence: number }>;
       semantic_memories?: Array<{ title: string; content: string; tags: string[]; importance: number }>;
@@ -206,30 +206,20 @@ function scheduleNext(): void {
   }, CONSOLIDATION_INTERVAL_MS);
 }
 
-async function ollamaGenerate(prompt: string): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+async function claudeGenerate(prompt: string): Promise<string> {
+  const result = await launchClaude({
+    prompt,
+    model: CLAUDE_MODEL,
+    outputFormat: 'text',
+    maxTurns: 1,
+    timeout: LAUNCH_TIMEOUT_MS,
+  });
 
-  try {
-    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt,
-        stream: false,
-        options: { temperature: 0.4, num_predict: 1024 },
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) throw new Error(`Ollama HTTP ${res.status}: ${await res.text()}`);
-    const data = await res.json() as { response?: string };
-    if (!data.response) throw new Error('Ollama returned empty response');
-    return data.response;
-  } finally {
-    clearTimeout(timer);
-  }
+  if (result.timedOut) throw new Error('Claude launcher timed out');
+  if (result.exitCode !== 0) throw new Error(`Claude launcher exited with code ${result.exitCode}`);
+  const text = result.stdout.trim();
+  if (!text) throw new Error('Claude launcher returned empty response');
+  return text;
 }
 
 function extractJson(text: string): unknown {

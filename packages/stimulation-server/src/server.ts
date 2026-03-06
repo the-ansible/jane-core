@@ -1,8 +1,9 @@
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
-import { uuidv7 } from '@the-ansible/life-system-shared';
+import { uuidv7, COMMUNICATION_EVENT_VERSION } from '@the-ansible/life-system-shared';
 import { getMetrics } from './metrics.js';
+import { getTimeline, recordTimelineEvent } from './event-timeline.js';
 import { getRecentEvents, onEvent, pushEvent } from './events.js';
 import { getClassifierMetrics } from './classifier/index.js';
 import { listSessions, getMessageCount, getSession, getContextMessages, appendMessage, getDiskMessageCount } from './sessions/store.js';
@@ -10,7 +11,7 @@ import { getActivePlan, listPlans, createPlan, setActivePlan } from './context/p
 import { db as contextDb } from './context/db.js';
 import type { ContextPlanConfig } from './context/types.js';
 import { getPipelineStats } from './pipeline-stats.js';
-import type { NatsClient } from './nats/client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 import type { SafetyGate } from './safety/index.js';
 import { getQueueStatus } from './outbound-queue.js';
 import { compose } from './composer/index.js';
@@ -41,6 +42,7 @@ function buildMetricsSnapshot(deps: ServerDeps) {
       active: getActiveRuns(),
       activeCount: getActiveRuns().length,
     },
+    timeline: getTimeline(),
   };
 }
 
@@ -61,6 +63,107 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     return c.json(buildMetricsSnapshot(deps));
   });
 
+  app.get('/api/timeline', (c) => {
+    return c.json({ timeline: getTimeline() });
+  });
+
+  // --- Interactive session capture (Claude Code terminal conversations) ---
+  // Accepts hook data from UserPromptSubmit and Stop events.
+  // Stores in session JSONL and publishes to NATS on communication.interactive.*
+  // These events are NOT processed by the pipeline — storage only.
+
+  app.post('/api/interactive/capture', async (c) => {
+    let body: Record<string, unknown>;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+
+    const hookEvent = body.hook_event_name as string | undefined;
+    const sessionId = (body.session_id as string) || 'interactive-unknown';
+
+    // Derive a stable interactive session ID from the Claude Code session ID
+    const interactiveSessionId = `interactive-${sessionId}`;
+
+    if (hookEvent === 'UserPromptSubmit') {
+      const prompt = body.prompt as string;
+      if (!prompt) return c.json({ skipped: true, reason: 'empty prompt' });
+
+      // Store in session
+      const now = new Date().toISOString();
+      appendMessage(interactiveSessionId, {
+        role: 'user',
+        content: prompt,
+        timestamp: now,
+        sender: { id: 'chris', displayName: 'Chris', type: 'person' },
+      });
+
+      // Publish to NATS if connected (fire-and-forget)
+      if (deps.nats?.isConnected()) {
+        try {
+          const event = {
+            v: COMMUNICATION_EVENT_VERSION,
+            id: uuidv7(),
+            sessionId: interactiveSessionId,
+            channelType: 'interactive',
+            direction: 'inbound' as const,
+            contentType: 'markdown' as const,
+            content: prompt,
+            sender: { id: 'chris', displayName: 'Chris', type: 'person' as const },
+            recipients: [{ id: 'jane', displayName: 'Jane', type: 'agent' as const }],
+            metadata: { source: 'claude-code', hookEvent },
+            timestamp: now,
+          };
+          await deps.nats.publish('communication.interactive.inbound', event);
+        } catch { /* fire-and-forget */ }
+      }
+
+      return c.json({ captured: true, direction: 'inbound', sessionId: interactiveSessionId });
+    }
+
+    if (hookEvent === 'Stop') {
+      const assistantMessage = body.last_assistant_message as string;
+      if (!assistantMessage) return c.json({ skipped: true, reason: 'empty response' });
+
+      // Skip if this is a stop-hook continuation (avoid double-capture)
+      if (body.stop_hook_active) return c.json({ skipped: true, reason: 'stop_hook_active' });
+
+      const now = new Date().toISOString();
+      appendMessage(interactiveSessionId, {
+        role: 'assistant',
+        content: assistantMessage,
+        timestamp: now,
+        sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
+      });
+
+      // Publish to NATS if connected
+      if (deps.nats?.isConnected()) {
+        try {
+          const event = {
+            v: COMMUNICATION_EVENT_VERSION,
+            id: uuidv7(),
+            sessionId: interactiveSessionId,
+            channelType: 'interactive',
+            direction: 'outbound' as const,
+            contentType: 'markdown' as const,
+            content: assistantMessage,
+            sender: { id: 'jane', displayName: 'Jane', type: 'agent' as const },
+            recipients: [{ id: 'chris', displayName: 'Chris', type: 'person' as const }],
+            metadata: { source: 'claude-code', hookEvent },
+            timestamp: now,
+          };
+          await deps.nats.publish('communication.interactive.outbound', event);
+        } catch { /* fire-and-forget */ }
+      }
+
+      return c.json({ captured: true, direction: 'outbound', sessionId: interactiveSessionId });
+    }
+
+    // Unknown hook event — ignore gracefully
+    return c.json({ skipped: true, reason: `unhandled hook event: ${hookEvent}` });
+  });
+
   // --- Admin/Debug endpoints ---
 
   app.get('/api/events/recent', (c) => {
@@ -79,6 +182,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       channelType?: string;
       sessionId?: string;
       parentId?: string;
+      sender?: { id: string; displayName?: string; type?: string };
     }>();
 
     if (!body.message) {
@@ -93,14 +197,21 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       }
     }
 
+    const sender = {
+      id: body.sender?.id ?? 'jane',
+      displayName: body.sender?.displayName ?? 'Jane',
+      type: (body.sender?.type ?? 'agent') as 'person' | 'system' | 'agent' | 'channel' | 'group',
+    };
+
     const event = {
+      v: COMMUNICATION_EVENT_VERSION,
       id: uuidv7(),
       sessionId: body.sessionId || uuidv7(),
       channelType: body.channelType || 'realtime',
       direction: 'outbound' as const,
       contentType: 'markdown' as const,
       content: body.message,
-      sender: { id: 'jane', displayName: 'Jane', type: 'agent' as const },
+      sender,
       metadata: {},
       timestamp: new Date().toISOString(),
       ...(body.parentId ? { parentId: body.parentId } : {}),
@@ -113,6 +224,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     // Record the send for rate limiting and flood detection
     deps.safety?.recordSend();
     pushEvent(event as any, subject);
+    recordTimelineEvent({ channelType: event.channelType, direction: 'outbound' });
 
     console.log(JSON.stringify({
       level: 'info',
@@ -139,6 +251,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       tone?: 'casual' | 'professional' | 'urgent' | 'playful';
       channelType?: string;
       sessionId?: string;
+      sender?: { id: string; displayName?: string; type?: string };
     }>();
 
     if (!body.message) {
@@ -175,18 +288,21 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       }
     }
 
+    const sender = {
+      id: body.sender?.id ?? 'jane',
+      displayName: body.sender?.displayName ?? 'Jane',
+      type: (body.sender?.type ?? 'agent') as 'person' | 'system' | 'agent' | 'channel' | 'group',
+    };
+
     const event = {
+      v: COMMUNICATION_EVENT_VERSION,
       id: uuidv7(),
       sessionId,
       channelType: body.channelType || 'realtime',
       direction: 'outbound' as const,
       contentType: 'markdown' as const,
       content: finalMessage,
-      sender: {
-        id: 'jane',
-        displayName: 'Jane',
-        type: 'agent' as const,
-      },
+      sender,
       metadata: { composedFrom: 'api' },
       timestamp: new Date().toISOString(),
     };
@@ -196,6 +312,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     await deps.nats.publish(subject, event);
     deps.safety?.recordSend();
     pushEvent(event as any, subject);
+    recordTimelineEvent({ channelType: event.channelType, direction: 'outbound' });
 
     // Record in session for continuity
     appendMessage(sessionId, {
@@ -203,7 +320,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       content: finalMessage,
       timestamp: event.timestamp,
       eventId: event.id,
-      sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
+      sender,
     });
 
     console.log(JSON.stringify({
@@ -238,6 +355,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     }>();
 
     const event = {
+      v: COMMUNICATION_EVENT_VERSION,
       id: uuidv7(),
       sessionId: body.sessionId || uuidv7(),
       channelType: body.channelType || 'realtime',
@@ -299,6 +417,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     }
 
     const event = {
+      v: COMMUNICATION_EVENT_VERSION,
       id: uuidv7(),
       sessionId: sessionId || uuidv7(),
       channelType: 'realtime' as const,

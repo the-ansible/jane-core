@@ -43,6 +43,7 @@ const validEvent = {
   direction: 'inbound',
   contentType: 'markdown',
   content: 'Daily health check report',
+  sender: { id: 'chris', displayName: 'Chris', type: 'person' },
   hints: { category: 'informational', urgency: 'low', routing: 'log_only' }, // Complete hints → rules tier, no Ollama needed
   metadata: {},
   timestamp: '2026-02-28T12:00:00.000Z',

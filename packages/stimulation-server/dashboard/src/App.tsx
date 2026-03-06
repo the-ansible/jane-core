@@ -9,6 +9,7 @@ import { TestSender } from '@/components/TestSender';
 import { EventsFeed } from '@/components/EventsFeed';
 import { SessionsPanel } from '@/components/SessionsPanel';
 import { PipelineRunsPanel } from '@/components/PipelineRunsPanel';
+import { TimelinePanel } from '@/components/TimelinePanel';
 
 export default function App() {
   const { metrics, metricsHistory, events, sessions, natsConnected, sseConnected, pipelineRuns, recoveryReport } = useDashboardData();
@@ -22,6 +23,10 @@ export default function App() {
           Pipeline Counters
         </div>
         <CounterCards metrics={metrics} history={metricsHistory} />
+
+        <div className="mt-4">
+          <TimelinePanel timeline={metrics?.timeline ?? null} />
+        </div>
 
         <div className="mt-4">
           <PipelineRunsPanel pipelineRuns={pipelineRuns} recoveryReport={recoveryReport} />

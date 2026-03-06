@@ -8,7 +8,7 @@ import {
   createDefaultBreakers,
   type CircuitBreakers,
 } from './circuit-breaker.js';
-import type { NatsClient } from '../nats/client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 
 export interface SafetyCheckResult {
   allowed: boolean;

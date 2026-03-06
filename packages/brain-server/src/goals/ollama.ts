@@ -1,17 +1,17 @@
 /**
- * Ollama HTTP helpers for the Goal Engine.
+ * Claude launcher helpers for the Goal Engine.
  *
  * - Candidate generation: given goals + context, produce actionable next steps
  * - Scoring: rate each candidate against the full goal set
  *
- * Model: gemma3:12b (default). Falls back gracefully if Ollama unavailable.
+ * Uses the shared claude-launcher instead of Ollama.
  */
 
+import { launchClaude } from '@jane-core/claude-launcher';
 import type { Goal, CandidateAction } from './types.js';
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma3:12b';
-const FETCH_TIMEOUT_MS = 120_000; // 2 min — LLM can be slow
+const CLAUDE_MODEL = process.env.GOAL_CLAUDE_MODEL || 'claude-sonnet-4-6';
+const LAUNCH_TIMEOUT_MS = 120_000; // 2 min
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -26,8 +26,11 @@ export async function generateCandidates(
   context: string
 ): Promise<CandidateAction[]> {
   const goalSummary = goals
-    .map((g) => `[${g.level.toUpperCase()} P${g.priority}] ${g.title}: ${g.description}`)
-    .join('\n');
+    .map((g) => {
+      const notes = g.progress_notes ? `\n  Recent progress: ${g.progress_notes.slice(0, 400)}` : '';
+      return `[${g.level.toUpperCase()} P${g.priority}] ${g.title}: ${g.description}${notes}`;
+    })
+    .join('\n\n');
 
   const prompt = `You are Jane's strategic planning assistant. Based on Jane's current goals and context, generate 5-8 specific, actionable next steps Jane could take right now.
 
@@ -42,6 +45,7 @@ Generate 5-8 concrete actions. Each action should:
 - Be completable in a single work session (minutes to hours)
 - Directly advance one or more of the listed goals
 - Be specific enough that an AI agent can execute it without further clarification
+- NOT duplicate work already described in the "Recent progress" notes above
 
 Respond ONLY with a JSON array, no markdown, no explanation:
 [
@@ -53,7 +57,7 @@ Respond ONLY with a JSON array, no markdown, no explanation:
 ]`;
 
   try {
-    const raw = await ollamaGenerate(prompt);
+    const raw = await claudeGenerate(prompt);
     const parsed = extractJson(raw);
     if (!Array.isArray(parsed)) return [];
 
@@ -110,7 +114,7 @@ Respond ONLY with a JSON array of scores in order, no markdown:
 [score0, score1, score2, ...]`;
 
   try {
-    const raw = await ollamaGenerate(prompt);
+    const raw = await claudeGenerate(prompt);
     const scores = extractJson(raw);
     if (!Array.isArray(scores)) return candidates;
 
@@ -132,31 +136,20 @@ Respond ONLY with a JSON array of scores in order, no markdown:
 // Internals
 // ---------------------------------------------------------------------------
 
-async function ollamaGenerate(prompt: string): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+async function claudeGenerate(prompt: string): Promise<string> {
+  const result = await launchClaude({
+    prompt,
+    model: CLAUDE_MODEL,
+    outputFormat: 'text',
+    maxTurns: 1,
+    timeout: LAUNCH_TIMEOUT_MS,
+  });
 
-  try {
-    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt,
-        stream: false,
-        options: { temperature: 0.7, num_predict: 1024 },
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) throw new Error(`Ollama HTTP ${res.status}: ${await res.text()}`);
-
-    const data = await res.json() as { response?: string };
-    if (!data.response) throw new Error('Ollama returned empty response');
-    return data.response;
-  } finally {
-    clearTimeout(timer);
-  }
+  if (result.timedOut) throw new Error('Claude launcher timed out');
+  if (result.exitCode !== 0) throw new Error(`Claude launcher exited with code ${result.exitCode}`);
+  const text = result.stdout.trim();
+  if (!text) throw new Error('Claude launcher returned empty response');
+  return text;
 }
 
 function extractJson(text: string): unknown {

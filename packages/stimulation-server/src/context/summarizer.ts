@@ -1,5 +1,5 @@
 /**
- * Summarizer — Ollama-based conversation summarization with structured output.
+ * Summarizer — Claude-based conversation summarization with structured output.
  * Extracts summary text, topics, and entities from a chunk of messages.
  */
 
@@ -7,9 +7,9 @@ import type { SessionMessage } from '../sessions/store.js';
 import type { ContextPlanConfig, SummaryRecord } from './types.js';
 import { estimateTokens } from './tokens.js';
 import { uuidv7 } from '@the-ansible/life-system-shared';
+import { launchClaude } from '@jane-core/claude-launcher';
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
-const SUMMARIZATION_TIMEOUT_MS = 10_000; // 10 seconds
+const SUMMARIZATION_TIMEOUT_MS = 60_000; // 60 seconds (Claude CLI startup + inference)
 
 const PROMPT_TEMPLATES: Record<string, string> = {
   default_v1: `Summarize this conversation segment concisely. Preserve:
@@ -76,28 +76,19 @@ export async function summarizeChunk(
   let entities: string[];
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), SUMMARIZATION_TIMEOUT_MS);
-
-    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: plan.summaryModel || 'gemma3:12b',
-        prompt,
-        stream: false,
-      }),
-      signal: controller.signal,
+    const result = await launchClaude({
+      model: plan.summaryModel || 'haiku',
+      prompt,
+      maxTurns: 1,
+      timeout: SUMMARIZATION_TIMEOUT_MS,
+      outputFormat: 'text',
     });
 
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      throw new Error(`Ollama returned ${response.status}`);
+    if (result.exitCode !== 0 || result.timedOut || !result.resultText) {
+      throw new Error(`Claude exited ${result.exitCode ?? 'null'}, timedOut=${result.timedOut}`);
     }
 
-    const data = (await response.json()) as { response: string };
-    const parsed = parseStructuredResponse(data.response);
+    const parsed = parseStructuredResponse(result.resultText);
     summary = parsed.summary;
     topics = parsed.topics;
     entities = parsed.entities;
@@ -133,7 +124,7 @@ export async function summarizeChunk(
     msgCount: messages.length,
     tsStart,
     tsEnd,
-    model: plan.summaryModel || 'gemma3:12b',
+    model: plan.summaryModel || 'haiku',
     promptTokens: estimateTokens(prompt),
     outputTokens: estimateTokens(summary),
     latencyMs,

@@ -4,10 +4,10 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { uuidv7 } from '@the-ansible/life-system-shared';
+import { uuidv7, COMMUNICATION_EVENT_VERSION } from '@the-ansible/life-system-shared';
 import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 import type { ClassificationResult } from './classifier/types.js';
-import type { NatsClient } from './nats/client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 import type { SafetyGate } from './safety/index.js';
 import { route, type RouteDecision } from './router/index.js';
 import { invokeAgent, parseAgentResponse, type AgentIntent } from './agent/index.js';
@@ -316,6 +316,7 @@ async function handleAgentResponse(
   }
 
   const responseEvent = {
+    v: COMMUNICATION_EVENT_VERSION,
     id: uuidv7(),
     parentId: event.id,
     sessionId: event.sessionId,
@@ -515,6 +516,7 @@ export async function resumeAliveJob(opts: {
     completeRun(run.runId, 'failure', { error: 'NATS not connected' });
     const queueId = uuidv7();
     enqueueForRetry(subject, {
+      v: COMMUNICATION_EVENT_VERSION,
       id: queueId,
       parentId: event.id,
       sessionId: event.sessionId,
@@ -531,6 +533,7 @@ export async function resumeAliveJob(opts: {
   }
 
   const responseEvent = {
+    v: COMMUNICATION_EVENT_VERSION,
     id: uuidv7(),
     parentId: event.id,
     sessionId: event.sessionId,

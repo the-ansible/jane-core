@@ -80,9 +80,11 @@ export async function ingestEpisode(
   if (!content.trim()) return { episodeId: null, error: null };
 
   const referenceTime = messages.find((m) => m.timestamp)?.timestamp ?? new Date().toISOString();
-  // Use first message timestamp as unique identifier for this chunk
-  const chunkTs = messages[0]?.timestamp ?? new Date().toISOString();
-  const episodeName = `${sessionId}-${chunkTs}`;
+  // Use the first message's event ID as episode name — globally unique (UUIDv7),
+  // works even without a session, and traces directly back to the source event.
+  // Falls back to sessionId-timestamp for messages without eventId (legacy data).
+  const firstEventId = messages.find((m) => m.eventId)?.eventId;
+  const episodeName = firstEventId ?? `${sessionId}-${messages[0]?.timestamp ?? new Date().toISOString()}`;
 
   try {
     const controller = new AbortController();

@@ -8,6 +8,7 @@ const validEvent = {
   direction: 'inbound' as const,
   contentType: 'markdown' as const,
   content: 'Hello from Slack',
+  sender: { id: 'chris', displayName: 'Chris', type: 'person' as const },
   metadata: {},
   timestamp: '2026-02-28T12:00:00.000Z',
 };

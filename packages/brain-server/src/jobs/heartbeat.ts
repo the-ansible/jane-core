@@ -12,6 +12,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { getRunningJobs, markJobUnresponsive } from './registry.js';
 import { getLastActivity } from './spawner.js';
+import { failExecutingGoalActionByJobId } from '../goals/registry.js';
 import type { JobAlert } from './types.js';
 
 const POLL_INTERVAL_MS = 30_000;           // check every 30s
@@ -70,6 +71,14 @@ async function checkRunningJobs(nats: NatsConnection): Promise<void> {
 
       // Mark in DB
       await markJobUnresponsive(job.id).catch(() => {});
+
+      // Fail any linked goal_action so the goal cycle can proceed
+      failExecutingGoalActionByJobId(
+        job.id,
+        `Job marked unresponsive after ${Math.round(silentMs / 60000)} minutes without activity. PID ${job.pid ?? 'unknown'}.`
+      ).then((updated) => {
+        if (updated) log('info', 'Cleared stale executing goal_action for unresponsive job', { jobId: job.id });
+      }).catch(() => {});
 
       // Publish alert
       const alert: JobAlert = {

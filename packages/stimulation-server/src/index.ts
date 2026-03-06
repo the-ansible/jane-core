@@ -1,6 +1,6 @@
 import { serve } from '@hono/node-server';
 import { createApp, type ServerDeps } from './server.js';
-import { createNatsClient } from './nats/client.js';
+import { createNatsClient } from '@jane-core/nats-client';
 import { startConsumer, setSafetyGate, setNatsClient } from './nats/consumer.js';
 import { SafetyGate } from './safety/index.js';
 import { startRetryLoop, stopRetryLoop } from './outbound-queue.js';
@@ -54,7 +54,11 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
 // Connect to NATS and start consuming
 (async () => {
   try {
-    deps.nats = await createNatsClient(NATS_URL);
+    deps.nats = await createNatsClient({
+      url: NATS_URL,
+      name: 'stimulation-server',
+      sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
+    });
     safety.setNats(deps.nats);
     setNatsClient(deps.nats);
     setAgentNatsConnection(deps.nats.nc);
@@ -91,7 +95,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
       },
     });
     // Start consumer in background (infinite loop)
-    startConsumer(deps.nats.js).catch((err) => {
+    startConsumer(deps.nats.js!).catch((err) => {
       console.log(JSON.stringify({
         level: 'error',
         msg: 'Consumer fatal error',

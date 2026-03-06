@@ -1,0 +1,27 @@
+{
+  "name": "@jane-core/nats-client",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsc --watch",
+    "build": "tsc",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@the-ansible/life-system-shared": "file:../../../../packages/life-system-shared",
+    "nats": "^2.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^1.2.0"
+  }
+}

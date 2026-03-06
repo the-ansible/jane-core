@@ -54,6 +54,7 @@ export interface Metrics {
     active: PipelineRun[];
     activeCount: number;
   } | null;
+  timeline?: TimelineBucket[];
 }
 
 export type PipelineRunStatus = 'running' | 'success' | 'failure';
@@ -104,6 +105,20 @@ export interface RecoveryReport {
   alive: RecoveryJobEntry[];
   requeued: RecoveryJobEntry[];
   deadLettered: RecoveryJobEntry[];
+}
+
+export interface TimelineBucket {
+  startMs: number;
+  total: number;
+  byChannel: Record<string, number>;
+  byTier: Record<string, number>;
+  byDirection: Record<string, number>;
+  byUrgency: Record<string, number>;
+  byCategory: Record<string, number>;
+  byRouting: Record<string, number>;
+  deduplicated: number;
+  classified: number;
+  errors: number;
 }
 
 export interface StoredEvent {

@@ -11,7 +11,7 @@
  */
 
 import { serve } from '@hono/node-server';
-import { createNatsClient } from './nats/client.js';
+import { createNatsClient } from '@jane-core/nats-client';
 import { startConsumer } from './nats/consumer.js';
 import { startHeartbeatMonitor } from './jobs/heartbeat.js';
 import { initJobRegistry } from './jobs/registry.js';
@@ -54,7 +54,13 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
 // Connect to NATS, then start consuming, heartbeat monitoring, and goal engine
 (async () => {
   try {
-    deps.nats = await createNatsClient(NATS_URL);
+    const natsClient = await createNatsClient({
+      url: NATS_URL,
+      name: 'brain-server',
+      sender: { id: 'jane-brain', displayName: 'Jane (Brain)', type: 'agent' },
+      useJetStream: false,
+    });
+    deps.nats = natsClient.nc;
     startConsumer(deps.nats);
     startHeartbeatMonitor(deps.nats);
     startGoalEngine(deps.nats);

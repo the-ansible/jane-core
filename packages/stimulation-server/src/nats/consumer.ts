@@ -8,8 +8,9 @@ import { communicationEventSchema } from '@the-ansible/life-system-shared';
 import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 import { increment } from '../metrics.js';
 import { pushEvent } from '../events.js';
+import { recordTimelineEvent, recordTimelineDedup, recordTimelineError } from '../event-timeline.js';
 import type { SafetyGate } from '../safety/index.js';
-import type { NatsClient } from './client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 import { classify, type ClassificationResult, type ClassificationContext } from '../classifier/index.js';
 import { processPipeline, type PipelineDeps } from '../pipeline.js';
 import { completeRun } from '../pipeline-runs.js';
@@ -104,6 +105,18 @@ async function preProcess(msg: JsMsg): Promise<PreProcessResult | null> {
   const result = communicationEventSchema.safeParse(data);
 
   if (!result.success) {
+    // Check if this is an interactive event that somehow landed on the inbound subject
+    const rawChannelType = (data as any)?.channelType;
+    if (rawChannelType === 'interactive') {
+      console.log(JSON.stringify({
+        level: 'info',
+        msg: 'Interactive event on inbound subject — skipping pipeline',
+        subject: msg.subject,
+        ts: new Date().toISOString(),
+      }));
+      msg.ack();
+      return null;
+    }
     console.log(JSON.stringify({
       level: 'warn',
       msg: 'Validation failed',
@@ -118,6 +131,20 @@ async function preProcess(msg: JsMsg): Promise<PreProcessResult | null> {
 
   increment('validated');
 
+  // Block interactive events from entering the pipeline.
+  // These are terminal Claude Code conversations — stored directly via /api/interactive/capture.
+  if (result.data.channelType === 'interactive') {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'Interactive event skipped — not routed through pipeline',
+      eventId: result.data.id,
+      subject: msg.subject,
+      ts: new Date().toISOString(),
+    }));
+    msg.ack();
+    return null;
+  }
+
   // Deduplication check — skip redelivered messages
   if (isDuplicate(result.data.id)) {
     console.log(JSON.stringify({
@@ -128,6 +155,7 @@ async function preProcess(msg: JsMsg): Promise<PreProcessResult | null> {
       ts: new Date().toISOString(),
     }));
     increment('deduplicated');
+    recordTimelineDedup();
     msg.ack();
     return null;
   }
@@ -170,6 +198,16 @@ async function preProcess(msg: JsMsg): Promise<PreProcessResult | null> {
     confidence: classification.confidence,
     tier: classification.tier,
   } : undefined);
+
+  // Record in timeline histogram
+  recordTimelineEvent({
+    channelType: result.data.channelType,
+    direction: result.data.direction,
+    tier: classification?.tier,
+    urgency: classification?.urgency,
+    category: classification?.category,
+    routing: classification?.routing,
+  });
 
   // Publish classification result to ephemeral NATS subject so external listeners
   // (e.g. n8n) can react to how a message was classified, keyed by the original event ID.
@@ -257,6 +295,7 @@ async function executePipeline(
       ts: new Date().toISOString(),
     }));
     increment('errors');
+    recordTimelineError();
   }
 
   // ACK only AFTER full pipeline completion — this is the critical fix.

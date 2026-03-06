@@ -8,12 +8,12 @@
  *   4. Publish memory.session.compacted to NATS
  */
 
-import type { NatsClient } from '../nats/client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 import { getSession, compactSession } from '../sessions/store.js';
 import { ingestEpisode, resolveSpeaker } from './client.js';
 import type { SessionMessage } from '../sessions/store.js';
+import { launchClaude } from '@jane-core/claude-launcher';
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
 const COMPACTION_SUBJECT = 'memory.session.compacted';
 // Mirrors KEEP_RECENT in store.ts — messages to preserve after compaction
 const KEEP_RECENT = 10;
@@ -27,24 +27,19 @@ async function summarizeForCompaction(messages: SessionMessage[]): Promise<strin
     .join('\n');
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
-
-    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'gemma3:12b',
-        prompt: `Summarize this conversation concisely. Preserve key decisions, facts, questions asked, answers given, and action items:\n\n${formatted}`,
-        stream: false,
-      }),
-      signal: controller.signal,
+    const result = await launchClaude({
+      model: 'haiku',
+      prompt: `Summarize this conversation concisely. Preserve key decisions, facts, questions asked, answers given, and action items:\n\n${formatted}`,
+      maxTurns: 1,
+      timeout: 60_000,
+      outputFormat: 'text',
     });
 
-    clearTimeout(timeout);
-    if (!res.ok) throw new Error(`Ollama ${res.status}`);
-    const data = (await res.json()) as { response: string };
-    return data.response.trim() || `[summarization_empty] ${formatted.slice(0, 300)}`;
+    if (result.exitCode !== 0 || result.timedOut || !result.resultText) {
+      throw new Error(`Claude exited ${result.exitCode ?? 'null'}, timedOut=${result.timedOut}`);
+    }
+
+    return result.resultText.trim() || `[summarization_empty] ${formatted.slice(0, 300)}`;
   } catch (err) {
     log('warn', 'Compaction summarization failed, using fallback', { error: String(err) });
     return `[summarization_failed] ${formatted.slice(0, 500)}`;

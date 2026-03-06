@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock fetch globally
-const mockFetch = vi.fn();
-vi.stubGlobal('fetch', mockFetch);
+// Mock Claude launcher — summarizer uses launchClaude, not fetch
+const mockLaunchClaude = vi.fn();
+vi.mock('@jane-core/claude-launcher', () => ({
+  launchClaude: (...args: any[]) => mockLaunchClaude(...args),
+}));
 
 // Mock uuidv7
 vi.mock('@the-ansible/life-system-shared', () => ({
@@ -41,33 +43,28 @@ describe('Context Summarizer', () => {
   it('constructs correct prompt from messages', async () => {
     const messages = makeMessages(4);
 
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        response: 'SUMMARY: Test summary\nTOPICS: topic1, topic2\nENTITIES: Chris, Jane',
-      }),
+    mockLaunchClaude.mockResolvedValueOnce({
+      exitCode: 0,
+      timedOut: false,
+      resultText: 'SUMMARY: Test summary\nTOPICS: topic1, topic2\nENTITIES: Chris, Jane',
+      stdout: '',
     });
 
     await summarizeChunk(messages, defaultPlan, 'test-session', 0, 3);
 
-    expect(mockFetch).toHaveBeenCalledOnce();
-    const [url, opts] = mockFetch.mock.calls[0];
-    expect(url).toContain('/api/generate');
-
-    const body = JSON.parse(opts.body);
-    expect(body.model).toBe('gemma3:12b');
-    expect(body.stream).toBe(false);
-    expect(body.prompt).toContain('User: Message 1 content here');
-    expect(body.prompt).toContain('Jane: Message 2 content here');
-    expect(body.prompt).toContain('Summarize this conversation segment');
+    expect(mockLaunchClaude).toHaveBeenCalledOnce();
+    const [opts] = mockLaunchClaude.mock.calls[0];
+    expect(opts.prompt).toContain('User: Message 1 content here');
+    expect(opts.prompt).toContain('Jane: Message 2 content here');
+    expect(opts.prompt).toContain('Summarize this conversation segment');
   });
 
   it('parses SUMMARY/TOPICS/ENTITIES format correctly', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        response: 'SUMMARY: Chris asked about the weather. Jane said it was sunny.\nTOPICS: weather, small talk\nENTITIES: Chris, Jane, San Jose',
-      }),
+    mockLaunchClaude.mockResolvedValueOnce({
+      exitCode: 0,
+      timedOut: false,
+      resultText: 'SUMMARY: Chris asked about the weather. Jane said it was sunny.\nTOPICS: weather, small talk\nENTITIES: Chris, Jane, San Jose',
+      stdout: '',
     });
 
     const messages = makeMessages(4);
@@ -79,11 +76,11 @@ describe('Context Summarizer', () => {
   });
 
   it('handles missing TOPICS/ENTITIES sections', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        response: 'SUMMARY: Just a simple summary with no topic or entity extraction.',
-      }),
+    mockLaunchClaude.mockResolvedValueOnce({
+      exitCode: 0,
+      timedOut: false,
+      resultText: 'SUMMARY: Just a simple summary with no topic or entity extraction.',
+      stdout: '',
     });
 
     const messages = makeMessages(2);
@@ -94,8 +91,8 @@ describe('Context Summarizer', () => {
     expect(result.entities).toEqual([]);
   });
 
-  it('falls back to naive concatenation on Ollama failure', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Connection refused'));
+  it('falls back to naive concatenation on Claude failure', async () => {
+    mockLaunchClaude.mockRejectedValueOnce(new Error('Connection refused'));
 
     const messages = makeMessages(3);
     const result = await summarizeChunk(messages, defaultPlan, 'test-session', 0, 2);
@@ -105,10 +102,12 @@ describe('Context Summarizer', () => {
     expect(result.entities).toEqual([]);
   });
 
-  it('falls back on non-OK HTTP response', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
+  it('falls back on non-zero exit code', async () => {
+    mockLaunchClaude.mockResolvedValueOnce({
+      exitCode: 1,
+      timedOut: false,
+      resultText: null,
+      stdout: '',
     });
 
     const messages = makeMessages(2);
@@ -118,11 +117,11 @@ describe('Context Summarizer', () => {
   });
 
   it('records correct metadata in returned SummaryRecord', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        response: 'SUMMARY: A summary\nTOPICS: coding\nENTITIES: Chris',
-      }),
+    mockLaunchClaude.mockResolvedValueOnce({
+      exitCode: 0,
+      timedOut: false,
+      resultText: 'SUMMARY: A summary\nTOPICS: coding\nENTITIES: Chris',
+      stdout: '',
     });
 
     const messages = makeMessages(6);

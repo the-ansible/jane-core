@@ -29,6 +29,44 @@ import { getJob } from '../jobs/registry.js';
 const sc = StringCodec();
 const GRAPHITI_URL = process.env.GRAPHITI_SERVICE_URL || 'http://localhost:3200';
 const INGEST_TIMEOUT_MS = 120_000;
+const DEDUP_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
+// Dedup state: tracks last ingested alert per monitor (autonomic) or subject key (reflexive)
+interface DeduplicatedAlert {
+  severity: string;
+  message: string;
+  ingestedAt: number;
+}
+const alertDedup = new Map<string, DeduplicatedAlert>();
+const layerEventDedup = new Map<string, { key: string; ingestedAt: number }>();
+
+function shouldIngestAlert(monitor: string, severity: string, message: string): boolean {
+  const existing = alertDedup.get(monitor);
+  const now = Date.now();
+  if (!existing) return true;
+  if (existing.severity !== severity) return true; // severity changed
+  if (existing.message !== message) return true;   // different issue
+  if (now - existing.ingestedAt >= DEDUP_COOLDOWN_MS) return true; // cooldown elapsed
+  return false;
+}
+
+function recordAlertIngested(monitor: string, severity: string, message: string): void {
+  alertDedup.set(monitor, { severity, message, ingestedAt: Date.now() });
+}
+
+function shouldIngestLayerEvent(layerName: string, eventType: string, message: string): boolean {
+  const key = `${layerName}:${eventType}:${message}`;
+  const existing = layerEventDedup.get(key);
+  const now = Date.now();
+  if (!existing) return true;
+  if (now - existing.ingestedAt >= DEDUP_COOLDOWN_MS) return true;
+  return false;
+}
+
+function recordLayerEventIngested(layerName: string, eventType: string, message: string): void {
+  const key = `${layerName}:${eventType}:${message}`;
+  layerEventDedup.set(key, { key, ingestedAt: Date.now() });
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -37,8 +75,10 @@ const INGEST_TIMEOUT_MS = 120_000;
 export function startGraphitiIngestor(nats: NatsConnection): void {
   subscribeGoalCycle(nats);
   subscribeAgentResults(nats);
-  subscribeAutonomicAlerts(nats);
-  subscribeLayerEvents(nats, 'layer.reflexive.>', 'reflexive-layer');
+  // Autonomic alerts and reflexive events are routine health-check noise (fires every 60s).
+  // Not worth entity-extracting — they overwhelm the LLM with hundreds of calls/min.
+  // subscribeAutonomicAlerts(nats);
+  // subscribeLayerEvents(nats, 'layer.reflexive.>', 'reflexive-layer');
   subscribeLayerEvents(nats, 'layer.cognitive.>', 'cognitive-layer');
   subscribeLayerEvents(nats, 'layer.strategic.>', 'strategic-layer');
   subscribeSessionCompacted(nats);
@@ -163,6 +203,11 @@ function subscribeAutonomicAlerts(nats: NatsConnection): void {
           ts: string;
         };
 
+        // Deduplicate: skip if same monitor+severity+message was recently ingested
+        if (!shouldIngestAlert(payload.monitor, payload.severity, payload.message)) {
+          continue;
+        }
+
         const content = formatEpisode({
           who: 'Jane (autonomic-layer, brain-server)',
           what: `Health monitor alert — ${payload.monitor} is ${payload.severity}. ${payload.message}`,
@@ -178,6 +223,8 @@ function subscribeAutonomicAlerts(nats: NatsConnection): void {
           source_description: `Jane's autonomic layer detected a ${payload.severity} alert on ${payload.monitor}`,
           reference_time: payload.ts,
         });
+
+        recordAlertIngested(payload.monitor, payload.severity, payload.message);
       } catch (err) {
         log('warn', 'Failed to ingest layer.autonomic.alert', { error: String(err) });
       }
@@ -199,6 +246,12 @@ function subscribeLayerEvents(nats: NatsConnection, subject: string, layerName: 
 
         const summary = buildLayerSummary(layerName, eventType, payload);
 
+        // Deduplicate repetitive layer events (e.g., reflexive "handled" for same alert)
+        const dedupMessage = (payload.message as string) ?? summary;
+        if (!shouldIngestLayerEvent(layerName, eventType, dedupMessage)) {
+          continue;
+        }
+
         const content = formatEpisode({
           who: `Jane (${layerName}, brain-server)`,
           what: summary,
@@ -214,6 +267,8 @@ function subscribeLayerEvents(nats: NatsConnection, subject: string, layerName: 
           source_description: `Jane's ${layerName} triggered a ${eventType} event`,
           reference_time: ts,
         });
+
+        recordLayerEventIngested(layerName, eventType, dedupMessage);
       } catch (err) {
         log('warn', `Failed to ingest ${subject} event`, { error: String(err) });
       }

@@ -25,6 +25,9 @@
  */
 
 import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { streamSSE } from 'hono/streaming';
+import { serveStatic } from '@hono/node-server/serve-static';
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listJobs, getJob, killJob, createJob } from '../jobs/registry.js';
@@ -58,10 +61,10 @@ export interface ServerDeps {
   nats: NatsConnection | null;
 }
 
-export function createApp(deps: ServerDeps): Hono {
-  const app = new Hono();
-  const startTime = Date.now();
+const GATEWAY_PREFIX = '/apps/brain';
+const startTime = Date.now();
 
+function registerRoutes(app: Hono, deps: ServerDeps): void {
   app.get('/health', (c) => {
     return c.json({
       status: 'ok',
@@ -565,6 +568,97 @@ export function createApp(deps: ServerDeps): Hono {
       return c.json({ error: String(err) }, 500);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // SSE endpoint — pushes a goal/cycle/metrics snapshot every 10s
+  // -------------------------------------------------------------------------
+
+  app.get('/api/events/stream', (c) => {
+    return streamSSE(c, async (stream) => {
+      let eventId = 0;
+
+      async function pushSnapshot() {
+        try {
+          const [goalsResult, cyclesResult] = await Promise.all([
+            listGoals(undefined),
+            listCycles(20),
+          ]);
+          const snapshot = {
+            goals: goalsResult,
+            cycles: cyclesResult,
+            cycleRunning: isCycleActive(),
+            metrics: {
+              runningJobs: getRunningJobCount(),
+              runningJobIds: getRunningJobIds(),
+              uptimeMs: Date.now() - startTime,
+              ts: new Date().toISOString(),
+            },
+            natsConnected: deps.nats !== null,
+          };
+          await stream.writeSSE({
+            event: 'snapshot',
+            data: JSON.stringify(snapshot),
+            id: String(++eventId),
+          });
+        } catch { /* ignore */ }
+      }
+
+      // Initial push
+      await pushSnapshot();
+
+      // Heartbeat to keep connection alive
+      const heartbeatInterval = setInterval(() => {
+        stream.writeSSE({ event: 'heartbeat', data: '', id: String(++eventId) }).catch(() => {});
+      }, 15_000);
+
+      // Periodic snapshot
+      const snapshotInterval = setInterval(() => {
+        pushSnapshot().catch(() => {});
+      }, 10_000);
+
+      stream.onAbort(() => {
+        clearInterval(heartbeatInterval);
+        clearInterval(snapshotInterval);
+      });
+
+      // Keep alive
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 30_000));
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Dashboard SPA
+  // -------------------------------------------------------------------------
+
+  app.get('/dashboard', (c) => {
+    const url = new URL(c.req.url);
+    return c.redirect(url.pathname + '/');
+  });
+
+  app.get('/dashboard/assets/*', serveStatic({
+    root: './dashboard/dist',
+    rewriteRequestPath: (path) => path.replace(/^.*\/dashboard/, ''),
+  }));
+
+  app.get('/dashboard/', serveStatic({
+    root: './dashboard/dist',
+    rewriteRequestPath: () => '/index.html',
+  }));
+
+  app.get('/', (c) => c.redirect('/dashboard'));
+}
+
+export function createApp(deps: ServerDeps): Hono {
+  const app = new Hono();
+  app.use('*', cors());
+  registerRoutes(app, deps);
+
+  const gatewayApp = new Hono();
+  gatewayApp.use('*', cors());
+  registerRoutes(gatewayApp, deps);
+  app.route(GATEWAY_PREFIX, gatewayApp);
 
   return app;
 }

@@ -6,7 +6,7 @@
  * attempts to re-publish queued messages when NATS reconnects.
  */
 
-import type { NatsClient } from './nats/client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 
 export interface QueuedMessage {
   subject: string;

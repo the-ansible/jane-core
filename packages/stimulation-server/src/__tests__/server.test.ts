@@ -37,7 +37,7 @@ import { recordPipelineOutcome, resetPipelineStats } from '../pipeline-stats.js'
 import { panicClearJobs } from '../agent/job-registry.js';
 
 const mockPanicClearJobs = vi.mocked(panicClearJobs);
-import type { NatsClient } from '../nats/client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 
 const mockCompose = vi.mocked(compose);
 
@@ -45,9 +45,11 @@ function makeMockNats(connected: boolean): NatsClient {
   return {
     nc: {} as any,
     js: {} as any,
+    sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
     isConnected: () => connected,
     close: async () => {},
     publish: vi.fn(async () => {}),
+    publishEvent: vi.fn(async () => {}),
   };
 }
 
@@ -411,6 +413,160 @@ describe('POST /api/compose-and-send', () => {
     expect(session.messages.length).toBe(1);
     expect(session.messages[0].role).toBe('assistant');
     expect(session.messages[0].content).toBe('Composed');
+  });
+});
+
+describe('POST /api/interactive/capture', () => {
+  beforeEach(() => {
+    clearAllSessions();
+  });
+
+  it('captures UserPromptSubmit as inbound user message', async () => {
+    const mockNats = makeMockNats(true);
+    const deps: ServerDeps = { nats: mockNats, safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/interactive/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'abc-123',
+        prompt: 'How do I fix this bug?',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.captured).toBe(true);
+    expect(body.direction).toBe('inbound');
+    expect(body.sessionId).toBe('interactive-abc-123');
+
+    // Check session was stored
+    const { getSession } = await import('../sessions/store.js');
+    const session = getSession('interactive-abc-123');
+    expect(session.messages.length).toBe(1);
+    expect(session.messages[0].role).toBe('user');
+    expect(session.messages[0].content).toBe('How do I fix this bug?');
+    expect(session.messages[0].sender?.id).toBe('chris');
+
+    // Check NATS publish
+    expect(mockNats.publish).toHaveBeenCalledWith(
+      'communication.interactive.inbound',
+      expect.objectContaining({
+        channelType: 'interactive',
+        direction: 'inbound',
+        content: 'How do I fix this bug?',
+        sender: expect.objectContaining({ id: 'chris' }),
+      })
+    );
+  });
+
+  it('captures Stop as outbound assistant message', async () => {
+    const mockNats = makeMockNats(true);
+    const deps: ServerDeps = { nats: mockNats, safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/interactive/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hook_event_name: 'Stop',
+        session_id: 'stop-test',
+        last_assistant_message: 'Here is the fix...',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.captured).toBe(true);
+    expect(body.direction).toBe('outbound');
+
+    const { getSession } = await import('../sessions/store.js');
+    const session = getSession('interactive-stop-test');
+    expect(session.messages.length).toBe(1);
+    expect(session.messages[0].role).toBe('assistant');
+    expect(session.messages[0].sender?.id).toBe('jane');
+  });
+
+  it('skips stop_hook_active events to avoid double capture', async () => {
+    const deps: ServerDeps = { nats: makeMockNats(true), safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/interactive/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hook_event_name: 'Stop',
+        session_id: 'stop-active-test',
+        last_assistant_message: 'Continued...',
+        stop_hook_active: true,
+      }),
+    });
+    const body = await res.json();
+
+    expect(body.skipped).toBe(true);
+    expect(body.reason).toBe('stop_hook_active');
+  });
+
+  it('skips empty prompts', async () => {
+    const deps: ServerDeps = { nats: makeMockNats(true), safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/interactive/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'empty-prompt-test',
+        prompt: '',
+      }),
+    });
+    const body = await res.json();
+
+    expect(body.skipped).toBe(true);
+  });
+
+  it('works without NATS connected', async () => {
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/interactive/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'no-nats-test',
+        prompt: 'test without nats',
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.captured).toBe(true);
+
+    // Session should still be stored locally
+    const { getSession } = await import('../sessions/store.js');
+    const session = getSession('interactive-no-nats-test');
+    expect(session.messages.length).toBe(1);
+  });
+
+  it('handles unknown hook events gracefully', async () => {
+    const deps: ServerDeps = { nats: null, safety: null };
+    const app = createApp(deps);
+
+    const res = await app.request('/api/interactive/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        session_id: 'unknown-hook-test',
+      }),
+    });
+    const body = await res.json();
+
+    expect(body.skipped).toBe(true);
+    expect(body.reason).toContain('unhandled');
   });
 });
 

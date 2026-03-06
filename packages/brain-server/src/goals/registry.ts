@@ -239,12 +239,93 @@ export async function listGoalActions(goalId: string, limit = 20): Promise<GoalA
   return rows;
 }
 
+/** Return the most recent completed (done/failed) actions across all goals, for deduplication context. */
+export async function listRecentDoneActions(limit = 6): Promise<{ description: string; status: string; goalTitle: string }[]> {
+  const { rows } = await getPool().query<{ description: string; status: string; goal_title: string }>(
+    `SELECT ga.description, ga.status, g.title AS goal_title
+     FROM brain.goal_actions ga
+     JOIN brain.goals g ON g.id = ga.goal_id
+     WHERE ga.status IN ('done', 'failed')
+     ORDER BY ga.updated_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return rows.map((r) => ({ description: r.description, status: r.status, goalTitle: r.goal_title }));
+}
+
 export async function getGoalActionByJobId(jobId: string): Promise<GoalAction | null> {
   const { rows } = await getPool().query<GoalAction>(
     `SELECT * FROM brain.goal_actions WHERE job_id = $1 LIMIT 1`,
     [jobId]
   );
   return rows[0] ?? null;
+}
+
+export async function listExecutingGoalIds(): Promise<string[]> {
+  const { rows } = await getPool().query<{ goal_id: string }>(
+    `SELECT DISTINCT goal_id FROM brain.goal_actions WHERE status = 'executing'`
+  );
+  return rows.map((r) => r.goal_id);
+}
+
+/**
+ * At startup, recover any goal_actions stuck in 'executing' where the linked job
+ * has already finished (done/failed/unresponsive). This handles the case where the
+ * server restarted while jobs were running — NATS subscriptions are lost but DB rows
+ * remain in 'executing', blocking future cycles from picking up those goals.
+ *
+ * Also handles orphaned 'running' jobs: if a job is still marked 'running' but
+ * hasn't had activity in over 30 minutes, the brain-server process that spawned it
+ * has died and the job is orphaned. Mark them failed immediately rather than waiting
+ * for the heartbeat monitor to catch them.
+ */
+export async function recoverStaleGoalActions(): Promise<number> {
+  // Case 1: job already finished (done/failed/unresponsive) — map to goal_action status
+  const r1 = await getPool().query(`
+    UPDATE brain.goal_actions
+    SET status = CASE WHEN aj.status = 'done' THEN 'done' ELSE 'failed' END,
+        outcome_text = COALESCE(
+          brain.goal_actions.outcome_text,
+          'Recovered at startup: job was ' || aj.status
+        ),
+        updated_at = now()
+    FROM brain.agent_jobs aj
+    WHERE brain.goal_actions.job_id = aj.id
+      AND brain.goal_actions.status = 'executing'
+      AND aj.status IN ('done', 'failed', 'unresponsive')
+  `);
+
+  // Case 2: job still 'running' but orphaned — no activity for >30 minutes means
+  // the spawning process died and this job will never self-report completion.
+  const r2 = await getPool().query(`
+    UPDATE brain.goal_actions
+    SET status = 'failed',
+        outcome_text = 'Recovered at startup: job was orphaned (running with no activity for >30min)',
+        updated_at = now()
+    FROM brain.agent_jobs aj
+    WHERE brain.goal_actions.job_id = aj.id
+      AND brain.goal_actions.status = 'executing'
+      AND aj.status = 'running'
+      AND COALESCE(aj.last_activity_at, aj.started_at, aj.created_at) < now() - INTERVAL '30 minutes'
+  `);
+
+  return (r1.rowCount ?? 0) + (r2.rowCount ?? 0);
+}
+
+/**
+ * Fail a single executing goal_action by job_id. Called by the heartbeat monitor
+ * when it marks a job as unresponsive, to unblock the goal cycle.
+ */
+export async function failExecutingGoalActionByJobId(jobId: string, reason: string): Promise<boolean> {
+  const result = await getPool().query(
+    `UPDATE brain.goal_actions
+     SET status = 'failed',
+         outcome_text = $1,
+         updated_at = now()
+     WHERE job_id = $2 AND status = 'executing'`,
+    [reason.slice(0, 1000), jobId]
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 // ---------------------------------------------------------------------------

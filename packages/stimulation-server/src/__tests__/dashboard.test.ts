@@ -10,15 +10,17 @@ import { resetMetrics } from '../metrics.js';
 import { pushEvent, clearEvents, onEvent } from '../events.js';
 import { clearAllSessions } from '../sessions/store.js';
 import { resetPipelineStats } from '../pipeline-stats.js';
-import type { NatsClient } from '../nats/client.js';
+import type { NatsClient } from '@jane-core/nats-client';
 
 function makeMockNats(connected: boolean): NatsClient {
   return {
     nc: {} as any,
     js: {} as any,
+    sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
     isConnected: () => connected,
     close: async () => {},
     publish: vi.fn(async () => {}),
+    publishEvent: vi.fn(async () => {}),
   };
 }
 
