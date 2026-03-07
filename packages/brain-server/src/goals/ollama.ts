@@ -19,7 +19,7 @@ const LAUNCH_TIMEOUT_MS = 120_000; // 2 min
 
 /**
  * Generate 5-8 candidate actions across the provided goals.
- * Returns [] if Ollama is unavailable.
+ * Returns [] if Claude returns no parseable candidates or none match active goals.
  */
 export async function generateCandidates(
   goals: Goal[],
@@ -62,7 +62,11 @@ Respond ONLY with a JSON array, no markdown, no explanation:
     if (!Array.isArray(parsed)) return [];
 
     return parsed.flatMap((item): CandidateAction[] => {
-      const goal = goals.find((g) => g.title === item.goalTitle);
+      const titleLower = String(item.goalTitle ?? '').toLowerCase();
+      // Exact match first, then case-insensitive, then substring
+      const goal = goals.find((g) => g.title === item.goalTitle)
+        ?? goals.find((g) => g.title.toLowerCase() === titleLower)
+        ?? goals.find((g) => g.title.toLowerCase().includes(titleLower) || titleLower.includes(g.title.toLowerCase()));
       if (!goal || !item.description) return [];
       return [{
         goalId: goal.id,
@@ -80,10 +84,12 @@ Respond ONLY with a JSON array, no markdown, no explanation:
 /**
  * Score each candidate 1-10 against the full goal set.
  * Mutates candidates in-place with a .score, returns sorted desc.
+ * Pass context (from buildContext) to penalize already-completed work.
  */
 export async function scoreCandidates(
   candidates: CandidateAction[],
-  goals: Goal[]
+  goals: Goal[],
+  context?: string
 ): Promise<CandidateAction[]> {
   if (candidates.length === 0) return [];
 
@@ -95,11 +101,15 @@ export async function scoreCandidates(
     .map((c, i) => `${i}: ${c.description} (for goal: ${c.goalTitle})`)
     .join('\n');
 
+  const recentActionsSection = context
+    ? `\n## Recent Action History (penalize duplicates heavily)\n${context}\n`
+    : '';
+
   const prompt = `You are scoring candidate actions for an AI assistant named Jane.
 
 ## Jane's Goals (higher priority = more important)
 ${goalSummary}
-
+${recentActionsSection}
 ## Candidates to Score
 ${candidateList}
 
@@ -107,8 +117,9 @@ Score each candidate 1-10 where:
 - 10 = directly advances a high-priority goal, high feasibility, concrete outcome
 - 5  = moderate impact or indirect benefit
 - 1  = low impact, tangential, or impractical
+- 1  = ALSO assign 1 if this duplicates a recently completed or failed action above
 
-Consider: goal alignment, priority weighting, feasibility, expected outcome clarity.
+Consider: goal alignment, priority weighting, feasibility, expected outcome clarity, and whether the action was already attempted recently.
 
 Respond ONLY with a JSON array of scores in order, no markdown:
 [score0, score1, score2, ...]`;
@@ -140,23 +151,31 @@ async function claudeGenerate(prompt: string): Promise<string> {
   const result = await launchClaude({
     prompt,
     model: CLAUDE_MODEL,
-    outputFormat: 'text',
+    outputFormat: 'json',
     maxTurns: 1,
     timeout: LAUNCH_TIMEOUT_MS,
   });
 
   if (result.timedOut) throw new Error('Claude launcher timed out');
   if (result.exitCode !== 0) throw new Error(`Claude launcher exited with code ${result.exitCode}`);
-  const text = result.stdout.trim();
+  const text = result.resultText ?? result.stdout.trim();
   if (!text) throw new Error('Claude launcher returned empty response');
   return text;
 }
 
 function extractJson(text: string): unknown {
+  // Try direct parse first (ideal case: Claude returned pure JSON)
+  const trimmed = text.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch { /* fall through to extraction */ }
+
   // Find the first [ or { and try to parse from there
   const start = text.search(/[\[{]/);
   if (start === -1) throw new Error('No JSON found in response');
-  const end = text.lastIndexOf(text[start] === '[' ? ']' : '}');
+  const startChar = text[start];
+  const endChar = startChar === '[' ? ']' : '}';
+  const end = text.lastIndexOf(endChar);
   if (end === -1) throw new Error('Unclosed JSON in response');
   return JSON.parse(text.slice(start, end + 1));
 }

@@ -137,13 +137,13 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     if (candidates.length === 0) {
       // Still mark goals as evaluated even when Ollama is unavailable
       for (const g of goals) await touchGoalEvaluated(g.id);
-      await completeCycle(cycleId, goals.length, 0, null, 'No candidates generated — Ollama may be unavailable');
+      await completeCycle(cycleId, goals.length, 0, null, 'No candidates generated — Claude returned empty array or no matching goal titles');
       publishCycleStatus(nats, cycleId, 'done', 'No candidates generated', null);
       return;
     }
 
-    // 4. Score candidates
-    const scored = await scoreCandidates(candidates, goals);
+    // 4. Score candidates — pass context so scorer can penalize duplicates
+    const scored = await scoreCandidates(candidates, goals, context);
 
     // 5. Select best
     const best = scored[0];
