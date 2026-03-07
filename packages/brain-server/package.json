@@ -1,6 +1,6 @@
 {
   "name": "brain-server",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "@hono/node-server": "^1.19.9",
     "@jane-core/claude-launcher": "file:../../../../packages/claude-launcher",
     "@jane-core/nats-client": "workspace:*",
