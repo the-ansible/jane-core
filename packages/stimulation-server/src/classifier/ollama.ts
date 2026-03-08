@@ -1,6 +1,6 @@
 /**
  * Tier 2: Ollama consensus classifier.
- * Runs 3 parallel prompts to a local LLM, takes majority vote.
+ * Runs 3 parallel prompts via the executor's Ollama adapter, takes majority vote.
  * Free to run, compensates for individual model unreliability through consensus.
  */
 
@@ -16,43 +16,26 @@ import {
   VALID_ROUTING,
 } from './types.js';
 import { buildClassificationPrompt } from './prompt.js';
+import { invoke } from '../executor-client.js';
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://host.docker.internal:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_CLASSIFIER_MODEL || 'qwen3:8b';
 const CONSENSUS_COUNT = 3;
-const OLLAMA_TIMEOUT_MS = 30_000;
 
 /**
- * Call Ollama once and parse the JSON response.
+ * Call the executor's Ollama adapter once and parse the JSON response.
  * Returns a Classification or null if the response can't be parsed.
  */
-async function callOllamaOnce(
-  prompt: string,
-  fetchFn: typeof fetch = globalThis.fetch
-): Promise<Classification | null> {
-
-  const response = await fetchFn(`${OLLAMA_URL}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      prompt,
-      stream: false,
-      options: {
-        temperature: 0.1, // low temp for consistency
-        num_predict: 100, // classification is short
-      },
-      think: false, // disable qwen3 thinking mode for faster, cleaner output
-    }),
-    signal: AbortSignal.timeout(OLLAMA_TIMEOUT_MS),
+async function callOllamaOnce(prompt: string): Promise<Classification | null> {
+  const result = await invoke({
+    runtime: 'ollama',
+    model: OLLAMA_MODEL,
+    prompt,
+    temperature: 0.1,
+    timeoutMs: 30_000,
   });
 
-  if (!response.ok) {
-    return null;
-  }
-
-  const data = (await response.json()) as { response: string };
-  return parseClassificationResponse(data.response);
+  if (!result.success || !result.resultText) return null;
+  return parseClassificationResponse(result.resultText);
 }
 
 /**
@@ -147,19 +130,18 @@ export interface ConsensusResult {
 }
 
 /**
- * Run consensus classification: 3 parallel Ollama calls, majority vote.
+ * Run consensus classification: 3 parallel executor Ollama calls, majority vote.
  * Returns null if no consensus could be reached (all disagree or all fail).
  */
 export async function classifyByConsensus(
   ctx: ClassificationContext,
-  fetchFn: typeof fetch = globalThis.fetch
 ): Promise<ConsensusResult | null> {
   const start = Date.now();
   const prompt = buildClassificationPrompt(ctx);
 
-  // Run N calls in parallel
+  // Run N calls in parallel via the executor
   const promises = Array.from({ length: CONSENSUS_COUNT }, () =>
-    callOllamaOnce(prompt, fetchFn).catch(() => null)
+    callOllamaOnce(prompt).catch(() => null)
   );
 
   const votes = await Promise.all(promises);

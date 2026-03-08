@@ -4,6 +4,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { StringCodec } from 'nats';
 import { uuidv7, COMMUNICATION_EVENT_VERSION } from '@the-ansible/life-system-shared';
 import type { CommunicationEvent } from '@the-ansible/life-system-shared';
 import type { ClassificationResult } from './classifier/types.js';
@@ -13,6 +14,7 @@ import { route, type RouteDecision } from './router/index.js';
 import { invokeAgent, parseAgentResponse, type AgentIntent } from './agent/index.js';
 import { markJobCompleted, markJobFailed, getJobById, type AgentJob } from './agent/job-registry.js';
 import { compose } from './composer/index.js';
+import { extractAndDispatchTask } from './composer/task-extractor.js';
 import { recordPipelineOutcome } from './pipeline-stats.js';
 import { enqueueForRetry } from './outbound-queue.js';
 import { pushEvent } from './events.js';
@@ -295,6 +297,46 @@ async function handleAgentResponse(
   }
   completeStage(runId, 'composer', `${composerMs}ms`);
   setRunOutputs(runId, { composerOutput: composedMessage });
+
+  // 5.5 Dispatch task to brain server (fire-and-forget)
+  if (deps.nats?.isConnected()) {
+    if (intent.task?.description) {
+      // Fast path: agent already identified the task — dispatch directly without extra LLM call
+      const taskRequest = {
+        type: intent.task.type ?? 'task',
+        prompt: intent.task.description,
+        role: 'executor',
+        runtime: { tool: 'claude-code', model: 'sonnet' },
+        context: {
+          triggeredBy: 'conversation',
+          eventId: event.id,
+          sessionId: event.sessionId,
+          senderName,
+        },
+      };
+      const sc = StringCodec();
+      deps.nats.nc.publish('agent.jobs.request', sc.encode(JSON.stringify(taskRequest)));
+      console.log(JSON.stringify({
+        level: 'info',
+        msg: 'Task dispatched to brain server (agent intent)',
+        component: 'pipeline',
+        eventId: event.id,
+        taskType: taskRequest.type,
+        descriptionPreview: intent.task.description.slice(0, 120),
+        ts: new Date().toISOString(),
+      }));
+    } else {
+      // Fallback: use Haiku to analyze the composed reply and extract any implicit task
+      const nats = deps.nats;
+      extractAndDispatchTask({
+        composedMessage: composedMessage,
+        inboundMessage: event.content,
+        senderName,
+        sessionId: event.sessionId,
+        eventId: event.id,
+      }, nats).catch(() => {});
+    }
+  }
 
   // 6. Publish outbound response
   beginStage(runId, 'publish');

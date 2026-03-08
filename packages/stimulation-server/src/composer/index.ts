@@ -7,20 +7,18 @@
  * into one consistent voice. The Agent produces WHAT to say.
  * The Composer produces HOW to say it.
  *
- * Uses Mercury (mercury-2) via OpenAI-compatible API for faster, cheaper composition.
+ * Routes through the brain server's executor with Mercury adapter.
  */
 
 import { readFileSync, existsSync } from 'node:fs';
 import type { AgentIntent } from '../agent/index.js';
+import { invoke } from '../executor-client.js';
 
 export interface ComposerInput {
   intent: AgentIntent;
   senderName?: string;
 }
 
-const COMPOSER_TIMEOUT_MS = 30_000; // 30 seconds — Mercury is fast
-const MERCURY_BASE_URL = 'https://api.inceptionlabs.ai/v1';
-const MERCURY_MODEL = 'mercury-2';
 const INNER_VOICE_PATH = '/agent/INNER_VOICE.md';
 const VOICE_PROFILE_PATH = '/agent/data/vault/Projects/jane-core/Voice-Profile.md';
 
@@ -139,31 +137,7 @@ Content: ${input.intent.content}`);
 }
 
 /**
- * Read MERCURY_API_KEY from process env or fall back to PID 1 environ.
- * Docker Desktop injects vars into PID 1 but they don't always propagate
- * down the process tree to child processes.
- */
-function getMercuryApiKey(): string | undefined {
-  if (process.env.MERCURY_API_KEY) return process.env.MERCURY_API_KEY;
-
-  try {
-    const environ = readFileSync('/proc/1/environ');
-    const vars = environ.toString().split('\0');
-    for (const v of vars) {
-      if (v.startsWith('MERCURY_API_KEY=')) {
-        const val = v.slice('MERCURY_API_KEY='.length);
-        if (val) return val;
-      }
-    }
-  } catch {
-    // /proc/1/environ not available — not on Linux or no permission
-  }
-
-  return undefined;
-}
-
-/**
- * Compose a message in Jane's voice via Mercury API.
+ * Compose a message in Jane's voice via the executor's Mercury adapter.
  * Takes structured intent and produces the final outbound message.
  */
 export async function compose(input: ComposerInput): Promise<string | null> {
@@ -171,14 +145,23 @@ export async function compose(input: ComposerInput): Promise<string | null> {
   const start = Date.now();
 
   try {
-    const result = await callMercury(prompt);
+    const result = await invoke({
+      runtime: 'mercury',
+      model: 'mercury-2',
+      prompt,
+      maxTokens: 4096,
+      reasoningEffort: 'instant',
+      timeoutMs: 30_000,
+    });
+
     const latencyMs = Date.now() - start;
 
-    if (!result) {
+    if (!result.success || !result.resultText) {
       console.log(JSON.stringify({
         level: 'error',
         msg: 'Composer returned no result',
         component: 'composer',
+        error: result.error,
         latencyMs,
         ts: new Date().toISOString(),
       }));
@@ -191,13 +174,13 @@ export async function compose(input: ComposerInput): Promise<string | null> {
       level: 'info',
       msg: 'Composer produced message',
       component: 'composer',
-      model: MERCURY_MODEL,
+      model: 'mercury-2',
       latencyMs,
-      messageLength: result.length,
+      messageLength: result.resultText.length,
       ts: new Date().toISOString(),
     }));
 
-    return result;
+    return cleanText(result.resultText);
   } catch (err) {
     console.log(JSON.stringify({
       level: 'error',
@@ -211,73 +194,6 @@ export async function compose(input: ComposerInput): Promise<string | null> {
     // Graceful degradation: return raw intent
     return input.intent.content;
   }
-}
-
-async function callMercury(prompt: string): Promise<string | null> {
-  const apiKey = getMercuryApiKey();
-  if (!apiKey) {
-    console.log(JSON.stringify({
-      level: 'error',
-      msg: 'MERCURY_API_KEY not set — cannot compose with Mercury',
-      component: 'composer',
-      ts: new Date().toISOString(),
-    }));
-    return null;
-  }
-
-  const response = await fetch(`${MERCURY_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: MERCURY_MODEL,
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 4096,
-      reasoning_effort: 'instant',
-    }),
-    signal: AbortSignal.timeout(COMPOSER_TIMEOUT_MS),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    console.log(JSON.stringify({
-      level: 'error',
-      msg: 'Mercury API error',
-      component: 'composer',
-      status: response.status,
-      body: text.slice(0, 300),
-      ts: new Date().toISOString(),
-    }));
-    return null;
-  }
-
-  const data = await response.json() as { choices?: Array<{ message?: { content?: string }; finish_reason?: string }> };
-  const choice = data?.choices?.[0];
-  const content = choice?.message?.content;
-  const finishReason = choice?.finish_reason ?? 'unknown';
-
-  console.log(JSON.stringify({
-    level: 'info',
-    msg: 'Mercury response received',
-    component: 'composer',
-    finish_reason: finishReason,
-    promptChars: prompt.length,
-    responseChars: content?.length ?? 0,
-    ts: new Date().toISOString(),
-  }));
-
-  if (finishReason === 'length') {
-    console.log(JSON.stringify({
-      level: 'warn',
-      msg: 'Mercury hit token limit — response may be truncated',
-      component: 'composer',
-      ts: new Date().toISOString(),
-    }));
-  }
-
-  return content ? cleanText(content) : null;
 }
 
 function cleanText(text: string): string {

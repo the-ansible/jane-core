@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock Claude launcher — summarizer uses launchClaude, not fetch
-const mockLaunchClaude = vi.fn();
-vi.mock('@jane-core/claude-launcher', () => ({
-  launchClaude: (...args: any[]) => mockLaunchClaude(...args),
+// Mock executor client -- summarizer uses invoke() via the brain server
+const mockInvoke = vi.fn();
+vi.mock('../executor-client.js', () => ({
+  invoke: (...args: any[]) => mockInvoke(...args),
 }));
 
 // Mock uuidv7
@@ -35,6 +35,14 @@ function makeMessages(count: number): SessionMessage[] {
   }));
 }
 
+function mockSuccess(resultText: string) {
+  return { success: true, resultText, durationMs: 10 };
+}
+
+function mockFailure(error: string) {
+  return { success: false, resultText: null, durationMs: 10, error };
+}
+
 describe('Context Summarizer', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -43,29 +51,25 @@ describe('Context Summarizer', () => {
   it('constructs correct prompt from messages', async () => {
     const messages = makeMessages(4);
 
-    mockLaunchClaude.mockResolvedValueOnce({
-      exitCode: 0,
-      timedOut: false,
-      resultText: 'SUMMARY: Test summary\nTOPICS: topic1, topic2\nENTITIES: Chris, Jane',
-      stdout: '',
-    });
+    mockInvoke.mockResolvedValueOnce(
+      mockSuccess('SUMMARY: Test summary\nTOPICS: topic1, topic2\nENTITIES: Chris, Jane')
+    );
 
     await summarizeChunk(messages, defaultPlan, 'test-session', 0, 3);
 
-    expect(mockLaunchClaude).toHaveBeenCalledOnce();
-    const [opts] = mockLaunchClaude.mock.calls[0];
+    expect(mockInvoke).toHaveBeenCalledOnce();
+    const [opts] = mockInvoke.mock.calls[0];
     expect(opts.prompt).toContain('User: Message 1 content here');
     expect(opts.prompt).toContain('Jane: Message 2 content here');
     expect(opts.prompt).toContain('Summarize this conversation segment');
+    expect(opts.runtime).toBe('claude-code');
+    expect(opts.model).toBe('gemma3:12b');
   });
 
   it('parses SUMMARY/TOPICS/ENTITIES format correctly', async () => {
-    mockLaunchClaude.mockResolvedValueOnce({
-      exitCode: 0,
-      timedOut: false,
-      resultText: 'SUMMARY: Chris asked about the weather. Jane said it was sunny.\nTOPICS: weather, small talk\nENTITIES: Chris, Jane, San Jose',
-      stdout: '',
-    });
+    mockInvoke.mockResolvedValueOnce(
+      mockSuccess('SUMMARY: Chris asked about the weather. Jane said it was sunny.\nTOPICS: weather, small talk\nENTITIES: Chris, Jane, San Jose')
+    );
 
     const messages = makeMessages(4);
     const result = await summarizeChunk(messages, defaultPlan, 'test-session', 0, 3);
@@ -76,12 +80,9 @@ describe('Context Summarizer', () => {
   });
 
   it('handles missing TOPICS/ENTITIES sections', async () => {
-    mockLaunchClaude.mockResolvedValueOnce({
-      exitCode: 0,
-      timedOut: false,
-      resultText: 'SUMMARY: Just a simple summary with no topic or entity extraction.',
-      stdout: '',
-    });
+    mockInvoke.mockResolvedValueOnce(
+      mockSuccess('SUMMARY: Just a simple summary with no topic or entity extraction.')
+    );
 
     const messages = makeMessages(2);
     const result = await summarizeChunk(messages, defaultPlan, 'test-session', 0, 1);
@@ -91,8 +92,8 @@ describe('Context Summarizer', () => {
     expect(result.entities).toEqual([]);
   });
 
-  it('falls back to naive concatenation on Claude failure', async () => {
-    mockLaunchClaude.mockRejectedValueOnce(new Error('Connection refused'));
+  it('falls back to naive concatenation on executor failure', async () => {
+    mockInvoke.mockResolvedValueOnce(mockFailure('Connection refused'));
 
     const messages = makeMessages(3);
     const result = await summarizeChunk(messages, defaultPlan, 'test-session', 0, 2);
@@ -102,13 +103,8 @@ describe('Context Summarizer', () => {
     expect(result.entities).toEqual([]);
   });
 
-  it('falls back on non-zero exit code', async () => {
-    mockLaunchClaude.mockResolvedValueOnce({
-      exitCode: 1,
-      timedOut: false,
-      resultText: null,
-      stdout: '',
-    });
+  it('falls back when executor returns no result', async () => {
+    mockInvoke.mockResolvedValueOnce(mockFailure('no result'));
 
     const messages = makeMessages(2);
     const result = await summarizeChunk(messages, defaultPlan, 'test-session', 0, 1);
@@ -117,12 +113,9 @@ describe('Context Summarizer', () => {
   });
 
   it('records correct metadata in returned SummaryRecord', async () => {
-    mockLaunchClaude.mockResolvedValueOnce({
-      exitCode: 0,
-      timedOut: false,
-      resultText: 'SUMMARY: A summary\nTOPICS: coding\nENTITIES: Chris',
-      stdout: '',
-    });
+    mockInvoke.mockResolvedValueOnce(
+      mockSuccess('SUMMARY: A summary\nTOPICS: coding\nENTITIES: Chris')
+    );
 
     const messages = makeMessages(6);
     const result = await summarizeChunk(messages, defaultPlan, 'sess-123', 5, 10);

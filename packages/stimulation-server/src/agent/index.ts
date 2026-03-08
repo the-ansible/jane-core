@@ -3,26 +3,29 @@
  * Receives inbound message + session history, reasons about it,
  * produces structured intent for the Composer.
  *
- * Uses Claude CLI with OAuth session (Max 5x) via --print mode.
- * Spawns agent-job-wrapper.mjs for job persistence and restart recovery.
+ * Routes all AI calls through the brain server's executor.
+ * Primary: NATS request/reply to brain server (executor path).
+ * Fallback: Direct HTTP to brain server's executor invoke endpoint.
  */
 
-import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
-import { launchClaude } from '@jane-core/claude-launcher';
-import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { ClassificationResult } from '../classifier/types.js';
 import type { AssembledContext } from '../context/types.js';
 import type { MemoryFact } from '../graphiti/client.js';
 import { createJob, markJobFailed } from './job-registry.js';
+import { invoke } from '../executor-client.js';
 
 export interface AgentIntent {
   type: 'reply' | 'update' | 'question' | 'greeting' | 'acknowledgment';
   content: string;
   tone?: 'casual' | 'professional' | 'urgent' | 'playful';
+  /** If set, the pipeline will dispatch this as a real job to the brain server */
+  task?: {
+    description: string;
+    type?: 'task' | 'research' | 'maintenance';
+  };
 }
 
 export interface AgentContext {
@@ -32,7 +35,7 @@ export interface AgentContext {
   assembledContext: AssembledContext;
   // Long-term memory facts retrieved from Graphiti for this message
   graphitiMemory?: MemoryFact[];
-  // Job recovery context — stored in agent_jobs.context_json for requeue
+  // Job recovery context -- stored in agent_jobs.context_json for requeue
   recoveryContext?: { event: any; classification: any };
   // Set when this job is a recovery of a previously interrupted job
   recoveryInfo?: { recoveryCount: number; originalStartedAt: string };
@@ -43,8 +46,7 @@ export interface AgentResult {
   jobId: string | null;
 }
 
-const AGENT_TIMEOUT_MS = 900_000; // 15 minutes — agent can be slow under contention
-const BRAIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — brain server request timeout
+const BRAIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes -- brain server request timeout
 const INNER_VOICE_PATH = '/agent/INNER_VOICE.md';
 
 const brainSc = StringCodec();
@@ -53,13 +55,6 @@ let agentNats: NatsConnection | null = null;
 export function setAgentNatsConnection(nc: NatsConnection): void {
   agentNats = nc;
 }
-
-// Resolve wrapper path relative to this file (works in both dev/prod)
-const __dirname = dirname(fileURLToPath(import.meta.url));
-// dev: src/agent/ → ../../agent-job-wrapper.mjs
-// prod: dist/agent/ → ../../agent-job-wrapper.mjs
-const WRAPPER_PATH = resolve(__dirname, '../../agent-job-wrapper.mjs');
-const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
 
 /** Cache INNER_VOICE.md in memory, reload every 5 minutes */
 let innerVoiceCache: string | null = null;
@@ -105,19 +100,27 @@ You are Jane, responding to a message from your user. You are having a conversat
 The user's name is Chris. You have an ongoing collaborative relationship.
 
 IMPORTANT RULES:
-- Respond naturally as yourself — you are Jane, not "an AI assistant"
+- Respond naturally as yourself -- you are Jane, not "an AI assistant"
 - Be direct, warm, genuine. Not corporate. Not robotic.
 - Match the tone of the conversation (casual chat vs serious work vs urgent alert)
 - Keep responses concise unless the topic requires depth
 - You can express opinions, preferences, and personality
 - If you don't know something, say so honestly
-- If this is a continuation of a recent conversation, maintain continuity — acknowledge context from previous messages
+- If this is a continuation of a recent conversation, maintain continuity -- acknowledge context from previous messages
 
 Respond with ONLY a JSON object in this format:
 {"type":"reply","content":"your response here","tone":"casual"}
 
 Where type is one of: reply, update, question, greeting, acknowledgment
 And tone is one of: casual, professional, urgent, playful
+
+IMPORTANT -- TASK DISPATCH:
+If this message requires real action (code changes, file edits, research, system work, implementing something), you MUST include a "task" field. This causes a real Claude Code agent to be spawned to do the work. Without it, nothing happens -- you just talk.
+
+{"type":"reply","content":"On it.","tone":"casual","task":{"description":"Full self-contained prompt for the Claude Code agent to execute","type":"task"}}
+
+task.type: "task" (code/file work -- default), "research" (information gathering), "maintenance" (system upkeep)
+task.description: Complete standalone prompt. Include all context needed -- file paths, what to change, acceptance criteria. The agent won't have this conversation history.
 
 Do NOT include any text outside the JSON object.`;
 }
@@ -131,7 +134,7 @@ function buildConversationPrompt(context: AgentContext): string {
   if (facts && facts.length > 0) {
     parts.push('LONG-TERM MEMORY (relevant facts from past conversations):');
     for (const f of facts) {
-      parts.push(`• ${f.fact}`);
+      parts.push(`\u2022 ${f.fact}`);
     }
     parts.push('');
   }
@@ -155,7 +158,7 @@ function buildConversationPrompt(context: AgentContext): string {
   // Add raw messages section (recent conversation verbatim)
   if (assembledContext.recentMessages.length > 0) {
     if (assembledContext.summaries.length > 0) {
-      parts.push('[Recent messages — verbatim]');
+      parts.push('[Recent messages -- verbatim]');
     }
     for (const msg of assembledContext.recentMessages) {
       const role = msg.role === 'user' ? (context.senderName || 'User') : 'Jane';
@@ -164,10 +167,10 @@ function buildConversationPrompt(context: AgentContext): string {
     parts.push('');
   }
 
-  // Recovery notice — prepend if this job is recovering from an interruption
+  // Recovery notice -- prepend if this job is recovering from an interruption
   if (context.recoveryInfo) {
     const { recoveryCount, originalStartedAt } = context.recoveryInfo;
-    parts.push(`⚠️ RECOVERY CONTEXT: This is recovery attempt #${recoveryCount} of an interrupted job (originally started: ${originalStartedAt}). The previous run was cut off mid-execution. Check for partial state or side effects before proceeding. If this has been recovered ${recoveryCount >= 3 ? 'multiple times' : 'more than once'}, surface that to the user rather than silently retrying.`);
+    parts.push(`\u26A0\uFE0F RECOVERY CONTEXT: This is recovery attempt #${recoveryCount} of an interrupted job (originally started: ${originalStartedAt}). The previous run was cut off mid-execution. Check for partial state or side effects before proceeding. If this has been recovered ${recoveryCount >= 3 ? 'multiple times' : 'more than once'}, surface that to the user rather than silently retrying.`);
     parts.push('');
   }
 
@@ -185,13 +188,18 @@ function buildConversationPrompt(context: AgentContext): string {
 
 /**
  * Dispatch the prompt to the brain server via NATS request/reply.
- * Returns raw Claude CLI stdout, or null on failure/timeout.
+ * Returns raw result text, or null on failure/timeout.
  */
 async function dispatchViaBrain(fullPrompt: string): Promise<string | null> {
   if (!agentNats) return null;
 
   try {
-    const payload = brainSc.encode(JSON.stringify({ type: 'task', prompt: fullPrompt }));
+    const payload = brainSc.encode(JSON.stringify({
+      type: 'task',
+      prompt: fullPrompt,
+      role: 'communicator',
+      runtime: { tool: 'claude-code', model: 'sonnet' },
+    }));
     const reply = await agentNats.request('agent.jobs.request', payload, { timeout: BRAIN_TIMEOUT_MS });
     const jobResult = JSON.parse(brainSc.decode(reply.data)) as { status: string; result?: string; error?: string };
 
@@ -221,6 +229,43 @@ async function dispatchViaBrain(fullPrompt: string): Promise<string | null> {
 }
 
 /**
+ * Fallback: call the executor's invoke endpoint directly via HTTP.
+ * Used when NATS dispatch fails.
+ */
+async function dispatchViaExecutorHttp(fullPrompt: string): Promise<string | null> {
+  try {
+    const result = await invoke({
+      runtime: 'claude-code',
+      model: 'sonnet',
+      prompt: fullPrompt,
+      timeoutMs: BRAIN_TIMEOUT_MS,
+    });
+
+    if (result.success && result.resultText) {
+      return result.resultText;
+    }
+
+    console.log(JSON.stringify({
+      level: 'warn',
+      msg: 'Executor HTTP fallback returned failure',
+      component: 'agent',
+      error: result.error,
+      ts: new Date().toISOString(),
+    }));
+    return null;
+  } catch (err) {
+    console.log(JSON.stringify({
+      level: 'error',
+      msg: 'Executor HTTP fallback failed',
+      component: 'agent',
+      error: String(err),
+      ts: new Date().toISOString(),
+    }));
+    return null;
+  }
+}
+
+/**
  * Invoke the agent to process an inbound message.
  * Returns structured intent for the Composer, plus the job ID for completion tracking.
  */
@@ -231,220 +276,57 @@ export async function invokeAgent(context: AgentContext): Promise<AgentResult> {
 
   const start = Date.now();
 
-  // Try brain server first — if connected, dispatch via NATS and return early
-  if (agentNats) {
-    const brainResult = await dispatchViaBrain(fullPrompt);
-    if (brainResult !== null) {
-      const latencyMs = Date.now() - start;
-      const intent = parseAgentResponse(brainResult);
-      if (intent) {
-        console.log(JSON.stringify({
-          level: 'info',
-          msg: 'Agent (brain) produced intent',
-          component: 'agent',
-          intentType: intent.type,
-          tone: intent.tone,
-          contentLength: intent.content.length,
-          latencyMs,
-          ts: new Date().toISOString(),
-        }));
-      } else {
-        console.log(JSON.stringify({
-          level: 'error',
-          msg: 'Agent (brain) returned empty result',
-          component: 'agent',
-          latencyMs,
-          ts: new Date().toISOString(),
-        }));
-      }
-      return { intent, jobId: null };
-    }
-    // Brain dispatch failed — fall through to direct spawn
+  // Try brain server via NATS first
+  let rawResult = await dispatchViaBrain(fullPrompt);
+
+  // Fallback to executor HTTP endpoint if NATS fails
+  if (rawResult === null) {
     console.log(JSON.stringify({
       level: 'warn',
-      msg: 'Brain dispatch failed, falling back to direct spawn',
+      msg: 'NATS dispatch failed, falling back to executor HTTP',
       component: 'agent',
       ts: new Date().toISOString(),
     }));
+    rawResult = await dispatchViaExecutorHttp(fullPrompt);
   }
 
-  // Create job row for persistence
-  let jobId: string | null = null;
-  const outputFile = `/tmp/agent-jobs/${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
+  const latencyMs = Date.now() - start;
 
-  try {
-    jobId = await createJob({
-      sessionId: context.recoveryContext?.event?.sessionId ?? 'unknown',
-      command: context.content,
-      contextJson: context.recoveryContext ?? {},
-      outputFile,
-    });
-  } catch (err) {
-    // Non-fatal — continue without persistence
-    console.log(JSON.stringify({
-      level: 'warn',
-      msg: 'Failed to create agent job row — proceeding without persistence',
-      component: 'agent',
-      error: String(err),
-      ts: new Date().toISOString(),
-    }));
-  }
-
-  try {
-    const result = await spawnWrapper(fullPrompt, outputFile, jobId);
-    const latencyMs = Date.now() - start;
-
-    if (!result) {
-      if (jobId) await markJobFailed(jobId, 'Agent returned no result').catch(() => {});
-      console.log(JSON.stringify({
-        level: 'error',
-        msg: 'Agent returned no result',
-        component: 'agent',
-        latencyMs,
-        ts: new Date().toISOString(),
-      }));
-      return { intent: null, jobId };
-    }
-
-    const intent = parseAgentResponse(result);
-
-    if (intent) {
-      console.log(JSON.stringify({
-        level: 'info',
-        msg: 'Agent produced intent',
-        component: 'agent',
-        intentType: intent.type,
-        tone: intent.tone,
-        contentLength: intent.content.length,
-        latencyMs,
-        ts: new Date().toISOString(),
-      }));
-    } else {
-      if (jobId) await markJobFailed(jobId, 'Agent returned empty result').catch(() => {});
-      console.log(JSON.stringify({
-        level: 'error',
-        msg: 'Agent returned empty result',
-        component: 'agent',
-        rawPreview: result.slice(0, 500),
-        latencyMs,
-        ts: new Date().toISOString(),
-      }));
-    }
-
-    return { intent, jobId };
-  } catch (err) {
-    if (jobId) await markJobFailed(jobId, String(err)).catch(() => {});
+  if (rawResult === null) {
     console.log(JSON.stringify({
       level: 'error',
-      msg: 'Agent invocation failed',
+      msg: 'Agent returned no result (all paths failed)',
       component: 'agent',
-      error: String(err),
-      latencyMs: Date.now() - start,
+      latencyMs,
       ts: new Date().toISOString(),
     }));
-    return { intent: null, jobId };
+    return { intent: null, jobId: null };
   }
-}
 
-/** Build a clean env for the wrapper (mirrors what the launcher does internally) */
-function buildCleanEnv(extra?: Record<string, string>): Record<string, string | undefined> {
-  const env = { ...process.env };
-  delete env.CLAUDECODE;
-  env.JANE_NONINTERACTIVE = '1';
-  env.NO_COLOR = '1';
-  return { ...env, ...extra };
-}
-
-/**
- * Spawn the agent-job-wrapper which runs Claude CLI and handles persistence.
- * Falls back to direct Claude spawn via the launcher if wrapper path doesn't exist.
- */
-function spawnWrapper(prompt: string, outputFile: string, jobId: string | null): Promise<string | null> {
-  // Check if wrapper exists; fall back to launcher if not
-  if (!existsSync(WRAPPER_PATH)) {
+  const intent = parseAgentResponse(rawResult);
+  if (intent) {
     console.log(JSON.stringify({
-      level: 'warn',
-      msg: 'Wrapper not found, falling back to direct claude spawn',
+      level: 'info',
+      msg: 'Agent produced intent',
       component: 'agent',
-      wrapperPath: WRAPPER_PATH,
+      intentType: intent.type,
+      tone: intent.tone,
+      contentLength: intent.content.length,
+      latencyMs,
       ts: new Date().toISOString(),
     }));
-    return launchClaude({
-      prompt,
-      timeout: AGENT_TIMEOUT_MS,
-    }).then((result) => {
-      if (result.exitCode !== 0 || result.timedOut) return null;
-      return result.stdout;
-    });
+  } else {
+    console.log(JSON.stringify({
+      level: 'error',
+      msg: 'Agent returned unparseable result',
+      component: 'agent',
+      rawPreview: rawResult.slice(0, 500),
+      latencyMs,
+      ts: new Date().toISOString(),
+    }));
   }
 
-  return new Promise((resolve) => {
-    const env = buildCleanEnv({
-      OUTPUT_FILE: outputFile,
-      NATS_URL,
-    });
-    if (jobId) env.JOB_ID = jobId;
-
-    const proc = spawn('node', [WRAPPER_PATH], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/agent',
-      env,
-      timeout: AGENT_TIMEOUT_MS,
-    });
-
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-
-    proc.stdin!.write(prompt);
-    proc.stdin!.end();
-
-    proc.stdout!.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-
-    proc.stderr!.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    proc.on('close', (code, signal) => {
-      if (signal === 'SIGTERM' || signal === 'SIGKILL') timedOut = true;
-      if (timedOut || code !== 0) {
-        if (stderr) {
-          console.log(JSON.stringify({
-            level: 'warn',
-            msg: 'Agent Claude CLI stderr',
-            component: 'agent',
-            stderr: stderr.slice(0, 500),
-            code,
-            signal,
-            ts: new Date().toISOString(),
-          }));
-        }
-        resolve(null);
-        return;
-      }
-      resolve(stdout);
-    });
-
-    proc.on('error', (err) => {
-      console.log(JSON.stringify({
-        level: 'error',
-        msg: 'Agent Claude CLI spawn error',
-        component: 'agent',
-        error: String(err),
-        ts: new Date().toISOString(),
-      }));
-      resolve(null);
-    });
-
-    setTimeout(() => {
-      if (proc.exitCode === null) {
-        timedOut = true;
-        proc.kill('SIGTERM');
-      }
-    }, AGENT_TIMEOUT_MS + 2000);
-  });
+  return { intent, jobId: null };
 }
 
 /** Parse Claude CLI JSON output to extract the agent's response */
@@ -465,10 +347,17 @@ export function parseAgentResponse(stdout: string): AgentIntent | null {
       const validIntentTypes = ['reply', 'update', 'question', 'greeting', 'acknowledgment'];
       if (!resultText && validIntentTypes.includes(parsed.type) && parsed.content) {
         const validTones = ['casual', 'professional', 'urgent', 'playful'];
+        const validTaskTypes = ['task', 'research', 'maintenance'];
         return {
           type: parsed.type,
           content: parsed.content,
           tone: validTones.includes(parsed.tone) ? parsed.tone : 'casual',
+          ...(parsed.task?.description ? {
+            task: {
+              description: parsed.task.description,
+              type: validTaskTypes.includes(parsed.task.type) ? parsed.task.type : 'task',
+            },
+          } : {}),
         };
       }
     }
@@ -515,7 +404,7 @@ export function parseAgentResponse(stdout: string): AgentIntent | null {
     // Extract JSON from possible markdown code blocks
     const jsonMatch = resultText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      // No JSON found — treat the whole response as a reply
+      // No JSON found -- treat the whole response as a reply
       return {
         type: 'reply',
         content: resultText,
@@ -527,14 +416,21 @@ export function parseAgentResponse(stdout: string): AgentIntent | null {
 
     const validTypes = ['reply', 'update', 'question', 'greeting', 'acknowledgment'];
     const validTones = ['casual', 'professional', 'urgent', 'playful'];
+    const validTaskTypes = ['task', 'research', 'maintenance'];
 
     return {
       type: validTypes.includes(parsed.type) ? parsed.type : 'reply',
       content: parsed.content || resultText,
       tone: validTones.includes(parsed.tone) ? parsed.tone : 'casual',
+      ...(parsed.task?.description ? {
+        task: {
+          description: parsed.task.description,
+          type: validTaskTypes.includes(parsed.task.type) ? parsed.task.type : 'task',
+        },
+      } : {}),
     };
   } catch {
-    // JSON parse failed — use raw text as reply
+    // JSON parse failed -- use raw text as reply
     return {
       type: 'reply',
       content: resultText,

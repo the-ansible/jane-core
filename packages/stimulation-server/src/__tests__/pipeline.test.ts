@@ -20,6 +20,10 @@ vi.mock('../composer/index.js', () => ({
   compose: vi.fn(),
 }));
 
+vi.mock('../composer/task-extractor.js', () => ({
+  extractAndDispatchTask: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock context assembler
 vi.mock('../context/assembler.js', () => ({
   assembleContext: vi.fn().mockResolvedValue({
@@ -74,6 +78,7 @@ vi.mock('../graphiti/client.js', () => ({
 
 import { invokeAgent } from '../agent/index.js';
 import { compose } from '../composer/index.js';
+import { extractAndDispatchTask } from '../composer/task-extractor.js';
 import { assembleContext } from '../context/assembler.js';
 import { updateAssemblyOutcome } from '../context/db.js';
 import { startRun, beginStage, completeStage, failStage, completeRun } from '../pipeline-runs.js';
@@ -81,6 +86,7 @@ import { searchMemory } from '../graphiti/client.js';
 
 const mockInvokeAgent = vi.mocked(invokeAgent);
 const mockCompose = vi.mocked(compose);
+const mockExtractAndDispatchTask = vi.mocked(extractAndDispatchTask);
 const mockSearchMemory = vi.mocked(searchMemory);
 const mockAssembleContext = vi.mocked(assembleContext);
 const mockUpdateOutcome = vi.mocked(updateAssemblyOutcome);
@@ -689,6 +695,89 @@ describe('Pipeline', () => {
 
       expect(result.action).toBe('escalate');
       expect(mockInvokeAgent).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('task dispatch', () => {
+    it('dispatches via nc.publish when agent intent includes a task', async () => {
+      const ncPublish = vi.fn();
+      const mockNats = {
+        isConnected: () => true,
+        publish: vi.fn().mockResolvedValue(undefined),
+        nc: { publish: ncPublish },
+      } as any;
+
+      mockInvokeAgent.mockResolvedValue({
+        intent: {
+          type: 'reply',
+          content: 'On it.',
+          tone: 'casual',
+          task: { description: 'Fix the login bug in auth.ts', type: 'task' },
+        },
+        jobId: null,
+      });
+      mockCompose.mockResolvedValue('On it.');
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps({ nats: mockNats })
+      );
+
+      expect(ncPublish).toHaveBeenCalledOnce();
+      const [subject, encoded] = ncPublish.mock.calls[0];
+      expect(subject).toBe('agent.jobs.request');
+      const payload = JSON.parse(new TextDecoder().decode(encoded));
+      expect(payload.prompt).toBe('Fix the login bug in auth.ts');
+      expect(payload.type).toBe('task');
+      // Fast-path should NOT call the extractor
+      expect(mockExtractAndDispatchTask).not.toHaveBeenCalled();
+    });
+
+    it('calls extractAndDispatchTask when agent intent has no task field', async () => {
+      const mockNats = {
+        isConnected: () => true,
+        publish: vi.fn().mockResolvedValue(undefined),
+        nc: { publish: vi.fn() },
+      } as any;
+
+      mockInvokeAgent.mockResolvedValue({
+        intent: { type: 'reply', content: 'Sure, I can help with that.', tone: 'casual' },
+        jobId: null,
+      });
+      mockCompose.mockResolvedValue('Sure, I can help with that.');
+
+      await processPipeline(
+        makeEvent({ content: 'Can you fix the bug?' }),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps({ nats: mockNats })
+      );
+
+      expect(mockExtractAndDispatchTask).toHaveBeenCalledOnce();
+      expect(mockExtractAndDispatchTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          composedMessage: 'Sure, I can help with that.',
+          inboundMessage: 'Can you fix the bug?',
+          senderName: 'Chris',
+        }),
+        mockNats
+      );
+    });
+
+    it('does not call extractAndDispatchTask when NATS is not connected', async () => {
+      mockInvokeAgent.mockResolvedValue({
+        intent: { type: 'reply', content: 'Hello!', tone: 'casual' },
+        jobId: null,
+      });
+      mockCompose.mockResolvedValue('Hello!');
+
+      await processPipeline(
+        makeEvent(),
+        makeClassification({ routing: 'reflexive_reply' }),
+        makeDeps({ nats: null })
+      );
+
+      expect(mockExtractAndDispatchTask).not.toHaveBeenCalled();
     });
   });
 });

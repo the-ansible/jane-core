@@ -1,5 +1,5 @@
 /**
- * Summarizer — Claude-based conversation summarization with structured output.
+ * Summarizer — conversation summarization via the executor's claude-code adapter.
  * Extracts summary text, topics, and entities from a chunk of messages.
  */
 
@@ -7,9 +7,7 @@ import type { SessionMessage } from '../sessions/store.js';
 import type { ContextPlanConfig, SummaryRecord } from './types.js';
 import { estimateTokens } from './tokens.js';
 import { uuidv7 } from '@the-ansible/life-system-shared';
-import { launchClaude } from '@jane-core/claude-launcher';
-
-const SUMMARIZATION_TIMEOUT_MS = 60_000; // 60 seconds (Claude CLI startup + inference)
+import { invoke } from '../executor-client.js';
 
 const PROMPT_TEMPLATES: Record<string, string> = {
   default_v1: `Summarize this conversation segment concisely. Preserve:
@@ -76,16 +74,15 @@ export async function summarizeChunk(
   let entities: string[];
 
   try {
-    const result = await launchClaude({
+    const result = await invoke({
+      runtime: 'claude-code',
       model: plan.summaryModel || 'haiku',
       prompt,
-      maxTurns: 1,
-      timeout: SUMMARIZATION_TIMEOUT_MS,
-      outputFormat: 'text',
+      timeoutMs: 60_000,
     });
 
-    if (result.exitCode !== 0 || result.timedOut || !result.resultText) {
-      throw new Error(`Claude exited ${result.exitCode ?? 'null'}, timedOut=${result.timedOut}`);
+    if (!result.success || !result.resultText) {
+      throw new Error(`Executor returned: ${result.error ?? 'no result'}`);
     }
 
     const parsed = parseStructuredResponse(result.resultText);

@@ -2,9 +2,9 @@
  * Compactor — wires session compaction with Graphiti episode ingestion.
  *
  * Flow:
- *   1. Session exceeds 40 messages → pipeline calls compactAndIngest()
+ *   1. Session exceeds 40 messages -> pipeline calls compactAndIngest()
  *   2. Before compaction destroys old messages, ingest them to Graphiti
- *   3. Compact session (summarize → rewrite JSONL)
+ *   3. Compact session (summarize -> rewrite JSONL)
  *   4. Publish memory.session.compacted to NATS
  */
 
@@ -12,12 +12,12 @@ import type { NatsClient } from '@jane-core/nats-client';
 import { getSession, compactSession } from '../sessions/store.js';
 import { ingestEpisode, resolveSpeaker } from './client.js';
 import type { SessionMessage } from '../sessions/store.js';
-import { launchClaude } from '@jane-core/claude-launcher';
+import { invoke } from '../executor-client.js';
 
 const COMPACTION_SUBJECT = 'memory.session.compacted';
-// Mirrors KEEP_RECENT in store.ts — messages to preserve after compaction
+// Mirrors KEEP_RECENT in store.ts -- messages to preserve after compaction
 const KEEP_RECENT = 10;
-// Max messages per Graphiti episode — keeps each call within the timeout budget
+// Max messages per Graphiti episode -- keeps each call within the timeout budget
 const CHUNK_SIZE = 15;
 
 async function summarizeForCompaction(messages: SessionMessage[]): Promise<string> {
@@ -27,16 +27,15 @@ async function summarizeForCompaction(messages: SessionMessage[]): Promise<strin
     .join('\n');
 
   try {
-    const result = await launchClaude({
+    const result = await invoke({
+      runtime: 'claude-code',
       model: 'haiku',
       prompt: `Summarize this conversation concisely. Preserve key decisions, facts, questions asked, answers given, and action items:\n\n${formatted}`,
-      maxTurns: 1,
-      timeout: 60_000,
-      outputFormat: 'text',
+      timeoutMs: 60_000,
     });
 
-    if (result.exitCode !== 0 || result.timedOut || !result.resultText) {
-      throw new Error(`Claude exited ${result.exitCode ?? 'null'}, timedOut=${result.timedOut}`);
+    if (!result.success || !result.resultText) {
+      throw new Error(`Executor returned: ${result.error ?? 'no result'}`);
     }
 
     return result.resultText.trim() || `[summarization_empty] ${formatted.slice(0, 300)}`;
@@ -89,7 +88,7 @@ export async function compactAndIngest(
   await compactSession(sessionId, summarizeForCompaction);
 
   // Emit core NATS event so brain-server can track memory state.
-  // Using nc.publish() (not JetStream) — no stream required for this event.
+  // Using nc.publish() (not JetStream) -- no stream required for this event.
   if (nats?.isConnected()) {
     try {
       const payload = JSON.stringify({

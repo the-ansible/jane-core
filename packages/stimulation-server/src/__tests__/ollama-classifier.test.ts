@@ -1,6 +1,21 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { parseClassificationResponse, majorityVote, classifyByConsensus } from '../classifier/ollama.js';
 import type { Classification } from '../classifier/types.js';
+import type { ClassificationContext } from '../classifier/types.js';
+
+// Mock executor client
+const mockInvoke = vi.fn();
+vi.mock('../executor-client.js', () => ({
+  invoke: (...args: any[]) => mockInvoke(...args),
+}));
+
+function makeCtx(content = 'test message'): ClassificationContext {
+  return {
+    content,
+    channelType: 'slack',
+    sessionState: 'active_conversation',
+  };
+}
 
 describe('parseClassificationResponse', () => {
   it('parses clean JSON', () => {
@@ -92,15 +107,20 @@ describe('majorityVote', () => {
 });
 
 describe('classifyByConsensus', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('returns consensus when 3/3 agree', async () => {
     const mockResponse = { urgency: 'normal', category: 'question', routing: 'deliberate_thought' };
 
-    const mockFetch = async () => ({
-      ok: true,
-      json: async () => ({ response: JSON.stringify(mockResponse) }),
-    } as Response);
+    mockInvoke.mockResolvedValue({
+      success: true,
+      resultText: JSON.stringify(mockResponse),
+      durationMs: 10,
+    });
 
-    const result = await classifyByConsensus('What is this?', mockFetch);
+    const result = await classifyByConsensus(makeCtx('What is this?'));
     expect(result).not.toBeNull();
     expect(result!.classification).toEqual(mockResponse);
     expect(result!.agreement.agreeing).toBe(3);
@@ -108,48 +128,46 @@ describe('classifyByConsensus', () => {
   });
 
   it('returns null when all calls fail', async () => {
-    const mockFetch = async () => {
-      throw new Error('connection refused');
-    };
+    mockInvoke.mockRejectedValue(new Error('connection refused'));
 
-    const result = await classifyByConsensus('test', mockFetch as unknown as typeof fetch);
+    const result = await classifyByConsensus(makeCtx('test'));
     expect(result).toBeNull();
   });
 
   it('returns null when models all disagree', async () => {
-    let callNum = 0;
     const responses = [
       { urgency: 'normal', category: 'question', routing: 'deliberate_thought' },
       { urgency: 'low', category: 'social', routing: 'reflexive_reply' },
       { urgency: 'immediate', category: 'alert', routing: 'escalate' },
     ];
 
-    const mockFetch = async () => ({
-      ok: true,
-      json: async () => ({ response: JSON.stringify(responses[callNum++]) }),
-    } as Response);
+    let callNum = 0;
+    mockInvoke.mockImplementation(async () => ({
+      success: true,
+      resultText: JSON.stringify(responses[callNum++]),
+      durationMs: 10,
+    }));
 
-    const result = await classifyByConsensus('ambiguous message', mockFetch);
+    const result = await classifyByConsensus(makeCtx('ambiguous message'));
     // All disagree — should return null (no consensus)
     expect(result).toBeNull();
   });
 
-  it('returns consensus when 2/3 agree with one null', async () => {
+  it('returns consensus when 2/3 agree with one failure', async () => {
     let callNum = 0;
-    const mockFetch = async () => {
+    mockInvoke.mockImplementation(async () => {
       callNum++;
       if (callNum === 2) {
-        return { ok: false, json: async () => ({}) } as Response;
+        return { success: false, resultText: null, durationMs: 10, error: 'timeout' };
       }
       return {
-        ok: true,
-        json: async () => ({
-          response: '{"urgency":"low","category":"social","routing":"reflexive_reply"}',
-        }),
-      } as Response;
-    };
+        success: true,
+        resultText: '{"urgency":"low","category":"social","routing":"reflexive_reply"}',
+        durationMs: 10,
+      };
+    });
 
-    const result = await classifyByConsensus('hello', mockFetch);
+    const result = await classifyByConsensus(makeCtx('hello'));
     expect(result).not.toBeNull();
     expect(result!.agreement.votes).toBe(2);
     expect(result!.agreement.agreeing).toBe(2);
