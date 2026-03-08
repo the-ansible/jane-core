@@ -11,6 +11,7 @@
  */
 
 import { serve } from '@hono/node-server';
+import { StringCodec } from 'nats';
 import { createNatsClient } from '@jane-core/nats-client';
 import { startConsumer } from './nats/consumer.js';
 import { startHeartbeatMonitor } from './jobs/heartbeat.js';
@@ -24,6 +25,7 @@ import { initMemoryRegistry } from './memory/registry.js';
 import { startConsolidator } from './memory/consolidator.js';
 import { initIngestionLog } from './memory/ingestion-log.js';
 import { startGraphitiIngestor } from './graphiti/ingestor.js';
+import { initExecutor, initContextSchema } from './executor/index.js';
 
 const PORT = parseInt(process.env.PORT || '3103', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
@@ -45,6 +47,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     await seedInitialGoals();
     await initMemoryRegistry();
     await initIngestionLog();
+    await initContextSchema();
     startConsolidator();
   } catch (err) {
     log('error', 'Failed to initialize DB schemas', { error: String(err) });
@@ -61,12 +64,24 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
       useJetStream: false,
     });
     deps.nats = natsClient.nc;
+    initExecutor(deps.nats);
     startConsumer(deps.nats);
     startHeartbeatMonitor(deps.nats);
     startGoalEngine(deps.nats);
     await startHierarchicalControl(deps.nats);
     startGraphitiIngestor(deps.nats);
     log('info', 'Brain server fully initialized', { port: PORT, natsUrl: NATS_URL });
+
+    // Announce that outbound communication is now routed through NATS directly
+    const sc = StringCodec();
+    const startupJobId = crypto.randomUUID();
+    deps.nats.publish(
+      `communication.agent-results.${startupJobId}`,
+      sc.encode(JSON.stringify({
+        status: 'done',
+        content: 'Brain server started. Outbound communication to Chris is now routed directly through NATS (communication.outbound.jane) instead of HTTP to the stimulation server. The notifyChris function in goals/engine.ts publishes CommunicationEvents directly to NATS.',
+      })),
+    );
   } catch (err) {
     log('error', 'Failed to connect to NATS — job submission via NATS unavailable', { error: String(err) });
   }

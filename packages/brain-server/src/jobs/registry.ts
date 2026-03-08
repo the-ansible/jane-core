@@ -44,8 +44,16 @@ export async function initJobRegistry(): Promise<void> {
       error_message        TEXT
     )
   `);
+  // Add session_id column if not present (executor integration)
+  await p.query(`
+    DO $$ BEGIN
+      ALTER TABLE brain.agent_jobs ADD COLUMN IF NOT EXISTS session_id UUID;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END $$
+  `);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_brain_jobs_status ON brain.agent_jobs (status)`);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_brain_jobs_created ON brain.agent_jobs (created_at DESC)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_brain_jobs_session ON brain.agent_jobs (session_id) WHERE session_id IS NOT NULL`);
 
   log('info', 'Brain job registry initialized');
 }

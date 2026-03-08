@@ -14,11 +14,10 @@
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { LayerStatus } from './types.js';
-import { recordLayerEvent, createDirective } from './registry.js';
+import { recordLayerEvent, createDirective, getSchedulerState, setSchedulerState } from './registry.js';
 import { listGoals, listGoalActions } from '../goals/registry.js';
 import { listCycles } from '../goals/registry.js';
-import { createJob } from '../jobs/registry.js';
-import { spawnAgent } from '../jobs/spawner.js';
+import { launchAgent } from '../executor/index.js';
 import { recordDirectiveMemory } from '../memory/recorder.js';
 
 const sc = StringCodec();
@@ -31,9 +30,11 @@ let evaluationTimer: ReturnType<typeof setInterval> | null = null;
 let cognitiveResultSub: { unsubscribe: () => void } | null = null;
 let lastActivity: Date | null = null;
 let evaluationCount = 0;
+let nextRunAt: Date | null = null;
 
 // Daily strategic evaluation
 const EVALUATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const STRATEGIC_STATE_KEY = 'strategic_schedule';
 
 // Track cognitive results to batch for strategic review
 const pendingResults: Array<{ jobId: string; ts: Date }> = [];
@@ -43,20 +44,16 @@ const BATCH_THRESHOLD = 5; // Evaluate after 5 cognitive completions
 // Public API
 // ---------------------------------------------------------------------------
 
-export function startStrategicLayer(nats: NatsConnection): void {
+export async function startStrategicLayer(nats: NatsConnection): Promise<void> {
   if (evaluationTimer) return;
 
   // Subscribe to cognitive results for reactive evaluation
   cognitiveResultSub = subscribeCognitiveResults(nats);
 
-  // Daily scheduled evaluation
-  evaluationTimer = setInterval(() => {
-    runStrategicEvaluation(nats, 'scheduled').catch((err) =>
-      log('error', 'Scheduled strategic evaluation failed', { error: String(err) })
-    );
-  }, EVALUATION_INTERVAL_MS);
+  // Load persisted schedule state and set up timer with catch-up
+  await scheduleWithRecovery(nats);
 
-  log('info', 'Strategic layer started', { evaluationIntervalMs: EVALUATION_INTERVAL_MS });
+  log('info', 'Strategic layer started', { evaluationIntervalMs: EVALUATION_INTERVAL_MS, nextRunAt: nextRunAt?.toISOString() });
 }
 
 export function stopStrategicLayer(): void {
@@ -78,12 +75,71 @@ export function getStrategicStatus(): LayerStatus {
       evaluationCount,
       pendingResults: pendingResults.length,
       evaluationIntervalMs: EVALUATION_INTERVAL_MS,
+      nextRunAt: nextRunAt?.toISOString() ?? null,
     },
   };
 }
 
 export async function triggerStrategicEvaluation(nats: NatsConnection): Promise<string> {
   return runStrategicEvaluation(nats, 'manual');
+}
+
+// ---------------------------------------------------------------------------
+// Persistent scheduling with restart recovery
+// ---------------------------------------------------------------------------
+
+async function scheduleWithRecovery(nats: NatsConnection): Promise<void> {
+  const state = await getSchedulerState(STRATEGIC_STATE_KEY).catch(() => null);
+  const now = Date.now();
+
+  if (state?.lastRunAt) {
+    const lastRun = new Date(state.lastRunAt as string).getTime();
+    const elapsed = now - lastRun;
+    const remaining = EVALUATION_INTERVAL_MS - elapsed;
+
+    // Restore evaluationCount from persisted state
+    if (typeof state.evaluationCount === 'number') {
+      evaluationCount = state.evaluationCount;
+    }
+
+    if (remaining <= 0) {
+      // Overdue — run immediately then switch to regular interval
+      log('info', 'Strategic evaluation overdue, running now', { overdueMs: -remaining });
+      nextRunAt = new Date(now + EVALUATION_INTERVAL_MS);
+      runStrategicEvaluation(nats, 'catch-up').catch((err) =>
+        log('error', 'Catch-up strategic evaluation failed', { error: String(err) })
+      );
+      evaluationTimer = setInterval(() => {
+        runStrategicEvaluation(nats, 'scheduled').catch((err) =>
+          log('error', 'Scheduled strategic evaluation failed', { error: String(err) })
+        );
+      }, EVALUATION_INTERVAL_MS);
+    } else {
+      // Not yet due — fire a one-shot timeout for the remaining window, then start the regular interval
+      nextRunAt = new Date(now + remaining);
+      log('info', 'Scheduling strategic evaluation catch-up timer', { remainingMs: remaining, nextRunAt: nextRunAt.toISOString() });
+      evaluationTimer = setTimeout(() => {
+        runStrategicEvaluation(nats, 'scheduled').catch((err) =>
+          log('error', 'Scheduled strategic evaluation failed', { error: String(err) })
+        );
+        // Switch to regular interval after the catch-up fires
+        evaluationTimer = setInterval(() => {
+          runStrategicEvaluation(nats, 'scheduled').catch((err) =>
+            log('error', 'Scheduled strategic evaluation failed', { error: String(err) })
+          );
+        }, EVALUATION_INTERVAL_MS);
+      }, remaining) as unknown as ReturnType<typeof setInterval>;
+    }
+  } else {
+    // No prior state — schedule at normal interval from now
+    nextRunAt = new Date(now + EVALUATION_INTERVAL_MS);
+    log('info', 'No prior strategic schedule state, scheduling first run', { nextRunAt: nextRunAt.toISOString() });
+    evaluationTimer = setInterval(() => {
+      runStrategicEvaluation(nats, 'scheduled').catch((err) =>
+        log('error', 'Scheduled strategic evaluation failed', { error: String(err) })
+      );
+    }, EVALUATION_INTERVAL_MS);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +150,14 @@ async function runStrategicEvaluation(nats: NatsConnection, trigger: string): Pr
   lastActivity = new Date();
   evaluationCount++;
 
+  // Persist the run time so restarts can recover the schedule
+  nextRunAt = new Date(lastActivity.getTime() + EVALUATION_INTERVAL_MS);
+  setSchedulerState(STRATEGIC_STATE_KEY, {
+    lastRunAt: lastActivity.toISOString(),
+    nextRunAt: nextRunAt.toISOString(),
+    evaluationCount,
+  }).catch((err) => log('warn', 'Failed to persist strategic scheduler state', { error: String(err) }));
+
   log('info', 'Starting strategic evaluation', { trigger, evaluationCount });
 
   // Build strategic context
@@ -101,23 +165,13 @@ async function runStrategicEvaluation(nats: NatsConnection, trigger: string): Pr
 
   const prompt = buildEvaluationPrompt(context, trigger);
 
-  const jobId = await createJob({
-    jobType: 'reflection',
+  const result = await launchAgent({
+    role: 'analyst',
     prompt,
-    contextJson: {
-      source: 'strategic-layer',
-      trigger,
-      evaluationCount,
-      goalCount: context.goals.length,
-      cycleCount: context.recentCycles.length,
-    },
+    runtime: { tool: 'claude-code', model: 'opus' },
+    jobType: 'reflection',
   });
-
-  spawnAgent({
-    jobId,
-    request: { type: 'reflection', prompt },
-    nats,
-  }).catch((err) => log('error', 'Failed to spawn strategic evaluation job', { error: String(err) }));
+  const jobId = result.jobId;
 
   await recordLayerEvent({
     layer: 'strategic',

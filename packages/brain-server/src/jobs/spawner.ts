@@ -22,7 +22,6 @@ import {
   updateHeartbeat,
 } from './registry.js';
 import { createScratchDir, createWorktree, removeWorktree, cleanupScratchDir } from './worktree.js';
-import { getGoalActionByJobId, updateGoalAction } from '../goals/registry.js';
 import type { JobRequest, JobResult } from './types.js';
 
 const OUTPUT_BASE = '/agent/command/results';
@@ -51,6 +50,10 @@ export function getRunningJobIds(): string[] {
 /**
  * Spawn a claude CLI agent for the given job.
  * Returns immediately — completion is async via NATS.
+ *
+ * @deprecated Use `launchAgent()` from `executor/index.ts` instead.
+ * This function is kept for backward compatibility with the legacy NATS consumer path.
+ * The executor's Claude Code adapter wraps the same @jane-core/claude-launcher.
  */
 export async function spawnAgent(params: {
   jobId: string;
@@ -165,10 +168,7 @@ export async function spawnAgent(params: {
 
     await markJobFailed(jobId, error).catch(() => {});
 
-    // Update linked goal_action if this job was spawned by the goal engine
-    getGoalActionByJobId(jobId).then((action) => {
-      if (action) updateGoalAction(action.id, { status: 'failed', outcomeText: error.slice(0, 1000) }).catch(() => {});
-    }).catch(() => {});
+    // Goal action state is managed by the brain (engine.ts subscribeJobResult), not the spawner.
 
     const result: JobResult = { jobId, clientId: request.clientId, status: 'failed', error, durationMs, logPath: outputFile };
     publishResult(nats, request.replySubject, jobId, result);
@@ -184,10 +184,7 @@ export async function spawnAgent(params: {
 
   await markJobDone(jobId, resultText).catch(() => {});
 
-  // Update linked goal_action if this job was spawned by the goal engine
-  getGoalActionByJobId(jobId).then((action) => {
-    if (action) updateGoalAction(action.id, { status: 'done', outcomeText: resultText.slice(0, 1000) }).catch(() => {});
-  }).catch(() => {});
+  // Goal action state is managed by the brain (engine.ts subscribeJobResult), not the spawner.
 
   const result: JobResult = { jobId, clientId: request.clientId, status: 'done', result: resultText, durationMs, logPath: outputFile };
   publishResult(nats, request.replySubject, jobId, result);

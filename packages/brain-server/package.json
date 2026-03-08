@@ -11,7 +11,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.78.0",
     "@hono/node-server": "^1.19.9",
     "@jane-core/claude-launcher": "file:../../../../packages/claude-launcher",
     "@jane-core/nats-client": "workspace:*",

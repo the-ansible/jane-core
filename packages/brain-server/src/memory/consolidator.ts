@@ -14,11 +14,13 @@
 
 import { launchClaude } from '@jane-core/claude-launcher';
 import { listMemories, recordMemory, recordPattern, applyImportanceDecay, purgeExpiredMemories } from './registry.js';
+import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
 import type { Memory } from './types.js';
 
 const CLAUDE_MODEL = process.env.CONSOLIDATION_CLAUDE_MODEL || 'claude-sonnet-4-6';
 const CONSOLIDATION_INTERVAL_MS = parseInt(process.env.MEMORY_CONSOLIDATION_INTERVAL_MS || String(12 * 60 * 60 * 1000), 10);
 const LAUNCH_TIMEOUT_MS = 120_000;
+const SCHEDULER_KEY = 'memory-consolidator';
 
 let consolidationTimer: ReturnType<typeof setTimeout> | null = null;
 let isRunning = false;
@@ -39,8 +41,36 @@ export interface ConsolidationResult {
 // ---------------------------------------------------------------------------
 
 export function startConsolidator(): void {
-  scheduleNext();
   log('info', 'Memory consolidator started', { intervalMs: CONSOLIDATION_INTERVAL_MS });
+
+  // Check persisted state and catch up if needed, then schedule next run
+  getSchedulerState(SCHEDULER_KEY)
+    .then((state) => {
+      if (!state?.nextRunAt) {
+        scheduleNext();
+        return;
+      }
+
+      const remaining = new Date(state.nextRunAt as string).getTime() - Date.now();
+
+      if (remaining <= 0) {
+        // Overdue — run immediately then schedule normally
+        log('info', 'Memory consolidator overdue — running catch-up', { overdueMs: -remaining });
+        runConsolidation()
+          .catch((err) => log('error', 'Catch-up consolidation failed', { error: String(err) }))
+          .finally(() => scheduleNext());
+      } else {
+        // Not yet due — schedule for the right time, then switch to regular interval
+        log('info', 'Memory consolidator rescheduling to match persisted schedule', { remainingMs: remaining });
+        consolidationTimer = setTimeout(async () => {
+          try { await runConsolidation(); } catch (err) {
+            log('error', 'Scheduled consolidation threw', { error: String(err) });
+          }
+          scheduleNext();
+        }, remaining);
+      }
+    })
+    .catch(() => scheduleNext()); // If DB unavailable, proceed with normal schedule
 }
 
 export function stopConsolidator(): void {
@@ -196,6 +226,10 @@ Extract 0-3 patterns and 0-3 semantic memories. Only include genuinely useful, n
 // ---------------------------------------------------------------------------
 
 function scheduleNext(): void {
+  setSchedulerState(SCHEDULER_KEY, {
+    nextRunAt: new Date(Date.now() + CONSOLIDATION_INTERVAL_MS).toISOString(),
+  }).catch(() => {});
+
   consolidationTimer = setTimeout(async () => {
     try {
       await runConsolidation();

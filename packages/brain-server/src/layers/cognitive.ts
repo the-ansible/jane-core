@@ -18,6 +18,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { LayerStatus } from './types.js';
 import { recordLayerEvent } from './registry.js';
+import { getGoalActionByJobId } from '../goals/registry.js';
 
 const sc = StringCodec();
 
@@ -150,17 +151,21 @@ function subscribeJobResults(nats: NatsConnection): void {
         const payload = JSON.parse(sc.decode(msg.data)) as {
           jobId?: string;
           status?: string;
-          source?: string;
         };
 
-        // Publish to strategic layer for meta-review if it was a goal-engine job
-        if (payload.source === 'goal-engine' && payload.status === 'done') {
-          nats.publish('layer.cognitive.result', sc.encode(JSON.stringify({
-            jobId: payload.jobId,
-            status: payload.status,
-            source: payload.source,
-            ts: new Date().toISOString(),
-          })));
+        // Publish to strategic layer for meta-review if it was a goal-engine job.
+        // JobResult has no 'source' field, so we look up the goal action by jobId.
+        if (payload.status === 'done' && payload.jobId) {
+          getGoalActionByJobId(payload.jobId).then((action) => {
+            if (action) {
+              nats.publish('layer.cognitive.result', sc.encode(JSON.stringify({
+                jobId: payload.jobId,
+                status: 'done',
+                source: 'goal-engine',
+                ts: new Date().toISOString(),
+              })));
+            }
+          }).catch(() => { /* non-critical */ });
         }
       } catch { /* non-critical */ }
     }

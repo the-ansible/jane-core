@@ -44,7 +44,7 @@ export async function startHierarchicalControl(nats: NatsConnection): Promise<vo
   startAutonomicLayer(nats);
   startReflexiveLayer(nats);
   startCognitiveLayer(nats);
-  startStrategicLayer(nats);
+  await startStrategicLayer(nats);
 
   initialized = true;
 

@@ -16,6 +16,8 @@
  * PATCH /api/goals/:id            — update a goal
  * DELETE /api/goals/:id           — abandon a goal (sets status=abandoned)
  *
+ * POST /api/executor/invoke       — synchronous adapter call (no job tracking)
+ *
  * GET  /api/layers                — status of all 4 hierarchical layers
  * GET  /api/layers/:name          — status of a specific layer
  * GET  /api/layers/events         — recent cross-layer events
@@ -32,6 +34,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listJobs, getJob, killJob, createJob } from '../jobs/registry.js';
 import { killJobProcess, getRunningJobCount, getRunningJobIds, spawnAgent } from '../jobs/spawner.js';
+import { invokeAdapter } from '../executor/index.js';
 import type { JobRequest } from '../jobs/types.js';
 import {
   listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles,
@@ -564,6 +567,52 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     try {
       const history = await getIngestionHistory(c.req.param('sessionId'));
       return c.json({ sessionId: c.req.param('sessionId'), history });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Executor: synchronous adapter invoke
+  //
+  // POST /api/executor/invoke — call an adapter inline (no job tracking)
+  // -------------------------------------------------------------------------
+
+  app.post('/api/executor/invoke', async (c) => {
+    try {
+      const body = await c.req.json() as {
+        runtime?: string;
+        model?: string;
+        prompt?: string;
+        maxTokens?: number;
+        temperature?: number;
+        reasoningEffort?: string;
+      };
+
+      if (!body.runtime || !body.model || !body.prompt) {
+        return c.json({ error: 'runtime, model, and prompt are required' }, 400);
+      }
+
+      const validRuntimes = ['mercury', 'ollama', 'synthetic', 'claude-code'];
+      if (!validRuntimes.includes(body.runtime)) {
+        return c.json({ error: `runtime must be one of: ${validRuntimes.join(', ')}` }, 400);
+      }
+
+      const result = await invokeAdapter({
+        runtime: body.runtime as any,
+        model: body.model,
+        prompt: body.prompt,
+        maxTokens: body.maxTokens,
+        temperature: body.temperature,
+        reasoningEffort: body.reasoningEffort as any,
+      });
+
+      return c.json({
+        success: result.success,
+        resultText: result.resultText,
+        durationMs: result.durationMs,
+        error: result.error,
+      }, result.success ? 200 : 502);
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }

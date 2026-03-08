@@ -19,36 +19,69 @@
 
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
-import { listActiveGoals, listExecutingGoalIds, touchGoalEvaluated, createGoalAction, updateGoalAction, updateGoal, createCycle, completeCycle, failCycle, listCycles, recoverStaleGoalActions, failExecutingGoalActionByJobId, listRecentDoneActions } from './registry.js';
-import { generateCandidates, scoreCandidates } from './ollama.js';
-import { createJob, getRunningJobs, markJobFailed } from '../jobs/registry.js';
-import { spawnAgent } from '../jobs/spawner.js';
+import { listActiveGoals, listExecutingGoalIds, touchGoalEvaluated, createGoalAction, updateGoalAction, updateGoal, getGoal, getGoalAction, createCycle, completeCycle, failCycle, listCycles, recoverStaleGoalActions, failExecutingGoalActionByJobId, listRecentDoneActionsPerGoal, listCompletedActionsForGoal, countReviewedUnachievedActions, listGoalActions, listRecentCompletedActionsGlobal } from './registry.js';
+import { generateCandidates, scoreCandidates } from './candidates.js';
+import { buildReviewPrompt, parseReviewVerdict } from './reviewer.js';
+import { getRunningJobs, markJobFailed } from '../jobs/registry.js';
+import { launchAgent } from '../executor/index.js';
 import type { CandidateAction } from './types.js';
 import type { JobResult } from '../jobs/types.js';
 import { recordGoalCycleMemory } from '../memory/recorder.js';
 import { getGoalContextMemories } from '../memory/retriever.js';
+import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
+
+/** Max reviewed attempts before a goal is abandoned. */
+const MAX_REVIEWED_ATTEMPTS = 3;
 
 // 1 hour default
 const DEFAULT_CYCLE_INTERVAL_MS = 1 * 60 * 60 * 1000;
+const SCHEDULER_KEY = 'goal-engine';
 
 const sc = StringCodec();
 
 let cycleTimer: ReturnType<typeof setInterval> | null = null;
 let isCycleRunning = false;
+let cycleIntervalMs = DEFAULT_CYCLE_INTERVAL_MS;
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 export function startGoalEngine(nats: NatsConnection): void {
-  const intervalMs = parseInt(process.env.GOAL_CYCLE_INTERVAL_MS ?? '', 10)
+  cycleIntervalMs = parseInt(process.env.GOAL_CYCLE_INTERVAL_MS ?? '', 10)
     || DEFAULT_CYCLE_INTERVAL_MS;
 
-  // Recover any goal actions stuck in 'executing' from a previous server run
+  // Recover goal actions stuck in transitional states from a previous server run
   recoverStaleGoalActions()
-    .then((count) => {
-      if (count > 0) log('warn', 'Recovered stale executing goal actions at startup', { count });
-      else log('info', 'No stale goal actions to recover');
+    .then((recovery) => {
+      const total = recovery.needsReview.length + recovery.needsRestart.length + recovery.needsReviewerRespawn.length;
+      if (total === 0) {
+        log('info', 'No stale goal actions to recover');
+        return;
+      }
+      log('warn', 'Recovering stale goal actions at startup', {
+        needsReview: recovery.needsReview.length,
+        needsRestart: recovery.needsRestart.length,
+        needsReviewerRespawn: recovery.needsReviewerRespawn.length,
+      });
+
+      // Spawn reviewers for actions whose execution jobs finished
+      for (const { actionId, goalId } of recovery.needsReview) {
+        spawnReviewer(nats, actionId, goalId).catch((err) =>
+          log('error', 'Failed to spawn reviewer during recovery', { actionId, error: String(err) }));
+      }
+
+      // Restart orphaned executing jobs with augmented prompt
+      for (const { actionId, goalId, jobId } of recovery.needsRestart) {
+        restartOrphanedJob(nats, actionId, goalId, jobId).catch((err) =>
+          log('error', 'Failed to restart orphaned job during recovery', { actionId, error: String(err) }));
+      }
+
+      // Re-spawn reviewers for actions stuck in reviewing
+      for (const { actionId, goalId } of recovery.needsReviewerRespawn) {
+        spawnReviewer(nats, actionId, goalId).catch((err) =>
+          log('error', 'Failed to re-spawn reviewer during recovery', { actionId, error: String(err) }));
+      }
     })
     .catch((err) => log('error', 'Failed to recover stale goal actions', { error: String(err) }));
 
@@ -71,12 +104,47 @@ export function startGoalEngine(nats: NatsConnection): void {
     }
   })();
 
-  // Scheduled cycle
+  // Set up regular interval immediately, then async-check persisted state for catch-up
   cycleTimer = setInterval(() => {
     runGoalCycle(nats).catch((err) => log('error', 'Scheduled cycle error', { error: String(err) }));
-  }, intervalMs);
+  }, cycleIntervalMs);
 
-  log('info', 'Goal engine started', { intervalMs });
+  // Check if we're overdue or can fire sooner than the full interval
+  recoverSchedule(nats, cycleIntervalMs);
+
+  log('info', 'Goal engine started', { intervalMs: cycleIntervalMs });
+}
+
+/**
+ * Checks persisted schedule state and catches up if needed.
+ * - Overdue: fires an immediate catch-up run (interval already set for future runs)
+ * - Not yet due but sooner than intervalMs: reschedules the interval to fire at the right time
+ */
+function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
+  getSchedulerState(SCHEDULER_KEY)
+    .then((state) => {
+      if (!state?.nextRunAt) return; // No prior state — interval is already correct
+
+      const remaining = new Date(state.nextRunAt as string).getTime() - Date.now();
+
+      if (remaining <= 0) {
+        // Overdue — run immediately; the interval will handle subsequent runs
+        log('info', 'Goal engine overdue — running catch-up cycle', { overdueMs: -remaining });
+        runGoalCycle(nats).catch((err) => log('error', 'Catch-up cycle error', { error: String(err) }));
+      } else if (remaining < intervalMs) {
+        // Due sooner than the interval — reschedule to fire at the right time
+        clearInterval(cycleTimer!);
+        log('info', 'Goal engine rescheduling to match persisted schedule', { remainingMs: remaining });
+        cycleTimer = setTimeout(() => {
+          runGoalCycle(nats).catch((err) => log('error', 'Scheduled cycle error', { error: String(err) }));
+          cycleTimer = setInterval(() => {
+            runGoalCycle(nats).catch((err) => log('error', 'Scheduled cycle error', { error: String(err) }));
+          }, intervalMs);
+        }, remaining) as unknown as ReturnType<typeof setInterval>;
+      }
+      // remaining >= intervalMs: interval already fires at the right time — nothing to do
+    })
+    .catch(() => {}); // Non-critical — if DB unavailable, proceed with normal schedule
 }
 
 export function stopGoalEngine(): void {
@@ -106,6 +174,14 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
   }
 
   isCycleRunning = true;
+
+  // Persist schedule state so we can catch up after a restart
+  const runAt = Date.now();
+  setSchedulerState(SCHEDULER_KEY, {
+    lastRunAt: new Date(runAt).toISOString(),
+    nextRunAt: new Date(runAt + cycleIntervalMs).toISOString(),
+  }).catch(() => {});
+
   const cycleId = await createCycle();
   log('info', 'Goal cycle started', { cycleId });
 
@@ -128,7 +204,7 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     }
 
     // 2. Gather context
-    const context = await buildContext();
+    const context = await buildContext(goals.map((g) => g.id));
 
     // 3. Generate candidates via Ollama
     const candidates = await generateCandidates(goals, context);
@@ -169,24 +245,23 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     // Mark all assessed goals as evaluated
     for (const g of goals) await touchGoalEvaluated(g.id);
 
-    // 7. Create and spawn brain job to execute the action
+    // 7. Launch executor agent for the action
     const executionPrompt = buildExecutionPrompt(best, goals.find((g) => g.id === best.goalId)?.description ?? '');
 
-    const jobId = await createJob({
-      jobType: 'task',
+    const launchResult = await launchAgent({
+      role: 'executor',
       prompt: executionPrompt,
-      contextJson: { goalId: best.goalId, actionId, cycleId, source: 'goal-engine' },
+      runtime: { tool: 'claude-code', model: 'sonnet' },
+      jobType: 'task',
+      context: [context],
     });
 
+    const jobId = launchResult.jobId;
     await updateGoalAction(actionId, { status: 'executing', jobId });
 
-    // Subscribe BEFORE spawning so we don't miss an early result publication
+    // Subscribe to result (launchAgent dispatches async, so subscribe is still before completion)
     subscribeJobResult(nats, jobId, actionId, best.goalId).catch((err) => {
       log('error', 'Error in job result subscription', { jobId, actionId, error: String(err) });
-    });
-
-    spawnAgent({ jobId, request: { type: 'task', prompt: executionPrompt, context: { goalId: best.goalId, actionId, cycleId } }, nats }).catch((err) => {
-      log('error', 'Failed to spawn goal action job', { jobId, error: String(err) });
     });
 
     // 8. Complete cycle record
@@ -228,12 +303,14 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
 // Internals
 // ---------------------------------------------------------------------------
 
-async function buildContext(): Promise<string> {
+async function buildContext(goalIds: string[] = []): Promise<string> {
   try {
-    const [recent, memoryContext, recentDone] = await Promise.all([
+    const now = Date.now();
+    const [recent, memoryContext, recentDonePerGoal, globalRecentActions] = await Promise.all([
       listCycles(3),
       getGoalContextMemories().catch(() => '(memory unavailable)'),
-      listRecentDoneActions(6).catch(() => []),
+      listRecentDoneActionsPerGoal(goalIds, 5).catch(() => ({})),
+      listRecentCompletedActionsGlobal(18).catch(() => []),
     ]);
 
     const cycleContext = recent
@@ -241,15 +318,37 @@ async function buildContext(): Promise<string> {
       .map((c) => `- ${new Date(c.started_at).toISOString().slice(0, 10)}: ${c.cycle_notes}`)
       .join('\n') || 'No recent cycle history';
 
-    const recentDoneContext = recentDone.length > 0
-      ? recentDone.map((a) => `- [${a.status}] ${a.goalTitle}: ${a.description.slice(0, 120)}`).join('\n')
+    // Format per-goal history so each goal's recent attempts are visible
+    const hasAnyHistory = Object.values(recentDonePerGoal).some((actions) => actions.length > 0);
+    const recentDoneContext = hasAnyHistory
+      ? Object.entries(recentDonePerGoal)
+          .filter(([, actions]) => actions.length > 0)
+          .map(([goalId, actions]) => {
+            const lines = actions.map((a) => {
+              const review = a.review_text ? ` | Review: ${a.review_text.slice(0, 150)}` : '';
+              return `  - [${a.status}] ${a.description.slice(0, 120)}${review}`;
+            }).join('\n');
+            return `Goal ${goalId}:\n${lines}`;
+          })
+          .join('\n')
       : 'None';
+
+    // Format global recent actions with hours-ago timestamps for the 24h dedup rule
+    const globalRecentContext = globalRecentActions.length > 0
+      ? globalRecentActions.map((a) => {
+          const ageMs = now - new Date(a.completedAt).getTime();
+          const ageHours = (ageMs / (1000 * 60 * 60)).toFixed(1);
+          const outcome = a.outcomeText ? ` | Outcome: ${a.outcomeText.slice(0, 120)}` : '';
+          return `  - [${ageHours}h ago] Goal "${a.goalTitle}": ${a.description.slice(0, 140)}${outcome}`;
+        }).join('\n')
+      : '  (none yet)';
 
     return [
       `Current time: ${new Date().toISOString()}`,
       `System: Jane's brain server (Node.js/TypeScript, PM2-managed)`,
       `Recent cycle activity:\n${cycleContext}`,
-      `Recently completed/failed actions (do not repeat these):\n${recentDoneContext}`,
+      `RECENT COMPLETED WORK — DO NOT RE-PROPOSE actions completed within the last 24 hours:\n${globalRecentContext}`,
+      `Recently completed/failed actions per goal (do not repeat these — assign score 1 if duplicate):\n${recentDoneContext}`,
       `Relevant memories:\n${memoryContext}`,
     ].join('\n\n');
   } catch {
@@ -293,9 +392,9 @@ When complete, summarize what you accomplished and what changed.`;
 }
 
 /**
- * Subscribe to the result of a specific job and update the linked goal action.
- * Uses max:1 so the subscription auto-closes after receiving one message.
- * Provides a reliable feedback loop back to the goal system without polling.
+ * Subscribe to the result of a specific execution job.
+ * On completion, transitions the action to 'reviewing' and spawns a reviewer agent.
+ * The brain handles all state transitions — the executor never sets its own state.
  */
 async function subscribeJobResult(
   nats: NatsConnection,
@@ -308,30 +407,220 @@ async function subscribeJobResult(
   for await (const msg of sub) {
     try {
       const result: JobResult = JSON.parse(sc.decode(msg.data));
+      const outcomeText = result.status === 'done'
+        ? (result.result ?? '').slice(0, 2000)
+        : (result.error ?? 'unknown error').slice(0, 2000);
 
-      if (result.status === 'done') {
-        await updateGoalAction(actionId, {
-          status: 'done',
-          outcomeText: (result.result ?? '').slice(0, 1000),
-        });
+      // Store the executor's output and transition to reviewing
+      await updateGoalAction(actionId, {
+        outcomeText,
+      });
 
-        const progressNote = `[${new Date().toISOString().slice(0, 16)}] Job completed. ${(result.result ?? '').slice(0, 300)}`;
-        await updateGoal(goalId, { progressNotes: progressNote });
+      const progressNote = `[${new Date().toISOString().slice(0, 16)}] Job ${result.status}. ${outcomeText.slice(0, 300)}`;
+      await updateGoal(goalId, { progressNotes: progressNote });
 
-        log('info', 'Goal action completed — job result received via NATS', { jobId, actionId, goalId });
-      } else {
-        const errorNote = result.error ?? 'unknown error';
-        await updateGoalAction(actionId, {
-          status: 'failed',
-          outcomeText: errorNote.slice(0, 1000),
-        });
+      log('info', 'Execution complete, spawning reviewer', { jobId, actionId, goalId, execStatus: result.status });
 
-        log('warn', 'Goal action failed — job result received via NATS', { jobId, actionId, goalId, error: errorNote.slice(0, 200) });
-      }
+      // Spawn the reviewer regardless of done/failed — the reviewer evaluates the outcome
+      await spawnReviewer(nats, actionId, goalId);
     } catch (err) {
       log('error', 'Error processing job result from NATS', { jobId, actionId, goalId, error: String(err) });
     }
   }
+}
+
+/**
+ * Spawn a reviewer agent to evaluate whether the completed action achieved its goal.
+ * The reviewer publishes its verdict via NATS; subscribeReviewResult handles the response.
+ */
+async function spawnReviewer(
+  nats: NatsConnection,
+  actionId: string,
+  goalId: string,
+): Promise<void> {
+  const goal = await getGoal(goalId);
+  if (!goal) {
+    log('error', 'Cannot spawn reviewer — goal not found', { actionId, goalId });
+    await updateGoalAction(actionId, { status: 'failed', reviewText: 'Review skipped: goal not found' });
+    return;
+  }
+
+  const currentAction = await getGoalAction(actionId);
+  if (!currentAction) {
+    log('error', 'Cannot spawn reviewer — action not found', { actionId, goalId });
+    return;
+  }
+
+  // Prior completed actions (exclude the current one)
+  const allActions = await listCompletedActionsForGoal(goalId);
+  const priorActions = allActions.filter((a) => a.id !== actionId);
+
+  const reviewPrompt = buildReviewPrompt(goal, currentAction, priorActions);
+
+  const reviewResult = await launchAgent({
+    role: 'reviewer',
+    prompt: reviewPrompt,
+    runtime: { tool: 'claude-code', model: 'sonnet' },
+    jobType: 'review',
+  });
+
+  const reviewJobId = reviewResult.jobId;
+  await updateGoalAction(actionId, { status: 'reviewing', reviewJobId });
+
+  // Subscribe to the reviewer's result (launchAgent dispatches async)
+  subscribeReviewResult(nats, reviewJobId, actionId, goalId).catch((err) => {
+    log('error', 'Error in review result subscription', { reviewJobId, actionId, error: String(err) });
+  });
+
+  log('info', 'Reviewer spawned', { reviewJobId, actionId, goalId });
+}
+
+/**
+ * Subscribe to the reviewer's result and drive the final state transition.
+ * The reviewer reports its assessment; the brain decides the action's fate.
+ */
+async function subscribeReviewResult(
+  nats: NatsConnection,
+  reviewJobId: string,
+  actionId: string,
+  goalId: string,
+): Promise<void> {
+  const sub = nats.subscribe(`agent.results.${reviewJobId}`, { max: 1 });
+
+  for await (const msg of sub) {
+    try {
+      const result: JobResult = JSON.parse(sc.decode(msg.data));
+
+      if (result.status !== 'done' || !result.result) {
+        // Reviewer process failed — re-spawn it, don't give up
+        log('warn', 'Reviewer job failed, re-spawning', { reviewJobId, actionId, goalId, error: result.error?.slice(0, 200) });
+        await spawnReviewer(nats, actionId, goalId);
+        return;
+      }
+
+      const verdict = parseReviewVerdict(result.result);
+      const reviewText = `${verdict.assessment}${verdict.recommendation ? `\nRecommendation: ${verdict.recommendation}` : ''}`;
+
+      const goal = await getGoal(goalId);
+      const isAsymptotic = goal?.level === 'asymptotic';
+
+      if (verdict.achieved && !isAsymptotic) {
+        // Goal achieved — mark action done and goal achieved
+        await updateGoalAction(actionId, { status: 'done', reviewText: reviewText.slice(0, 2000) });
+        await updateGoal(goalId, { status: 'achieved' });
+        log('info', 'Goal achieved via review', { actionId, goalId, goalTitle: goal?.title });
+
+        // Notify Chris
+        notifyChris(nats, `Goal achieved: ${goal?.title ?? goalId}\n\n${verdict.assessment.slice(0, 500)}`);
+      } else {
+        // Not achieved — mark action done with review context
+        await updateGoalAction(actionId, { status: 'done', reviewText: reviewText.slice(0, 2000) });
+
+        // Check abandonment threshold
+        const reviewedCount = await countReviewedUnachievedActions(goalId);
+        if (!isAsymptotic && reviewedCount >= MAX_REVIEWED_ATTEMPTS) {
+          await updateGoal(goalId, { status: 'abandoned' });
+          log('warn', 'Goal abandoned after max review attempts', { goalId, goalTitle: goal?.title, reviewedCount });
+          notifyChris(nats, `Goal abandoned after ${reviewedCount} attempts: ${goal?.title ?? goalId}\n\nLast review: ${verdict.assessment.slice(0, 500)}`);
+        } else {
+          log('info', 'Action reviewed — goal not yet achieved', { actionId, goalId, reviewedCount });
+        }
+      }
+    } catch (err) {
+      log('error', 'Error processing review result', { reviewJobId, actionId, goalId, error: String(err) });
+    }
+  }
+}
+
+/**
+ * Send a notification to Chris via NATS outbound subject.
+ * Publishes a CommunicationEvent to `communication.outbound.jane` — picked up by
+ * the stimulation server's composer for voice-consistent delivery to Slack.
+ */
+function notifyChris(nats: NatsConnection, message: string): void {
+  try {
+    const event = {
+      v: 2,
+      id: crypto.randomUUID(),
+      sessionId: 'brain-server',
+      channelType: 'realtime',
+      direction: 'outbound',
+      contentType: 'markdown',
+      content: message,
+      sender: { id: 'jane-brain', displayName: 'Jane (Brain)', type: 'agent' },
+      metadata: {},
+      timestamp: new Date().toISOString(),
+    };
+    nats.publish('communication.outbound.jane', sc.encode(JSON.stringify(event)));
+  } catch (err) {
+    log('warn', 'Failed to notify Chris via NATS', { error: String(err) });
+  }
+}
+
+/**
+ * Restart an orphaned executing job with an augmented prompt that tells the agent
+ * to evaluate the current state of the work and continue if needed.
+ */
+async function restartOrphanedJob(
+  nats: NatsConnection,
+  actionId: string,
+  goalId: string,
+  oldJobId: string,
+): Promise<void> {
+  const goal = await getGoal(goalId);
+  if (!goal) {
+    log('error', 'Cannot restart orphaned job — goal not found', { actionId, goalId });
+    return;
+  }
+
+  const action = await getGoalAction(actionId);
+  if (!action) {
+    log('error', 'Cannot restart orphaned job — action not found', { actionId, goalId });
+    return;
+  }
+
+  // Mark the old job as failed
+  await markJobFailed(oldJobId, 'Orphaned job — process died, restarting with context').catch(() => {});
+
+  const restartPrompt = `You are Jane, an AI assistant working autonomously to advance your goals.
+
+## IMPORTANT: This is a RESTARTED task
+This task was previously started but the process died before completing. Evaluate the current state of the work described below. If it's already complete, summarize what was accomplished. If it's partially done, continue from where it left off. If it hasn't started, begin from scratch.
+
+## Goal
+${goal.title}: ${goal.description}
+
+## Action to Take
+${action.description}
+
+## Rationale
+${action.rationale ?? 'none provided'}
+
+## Instructions
+Evaluate the current state, then execute or continue as needed. Use the tools available to you:
+- Read and write files in /agent/
+- Run bash commands for system tasks
+- Update documentation and status files
+- Make concrete progress — don't just plan, do
+
+When complete, summarize what you accomplished and what changed.`;
+
+  const restartResult = await launchAgent({
+    role: 'executor',
+    prompt: restartPrompt,
+    runtime: { tool: 'claude-code', model: 'sonnet' },
+    jobType: 'task',
+  });
+
+  const newJobId = restartResult.jobId;
+  await updateGoalAction(actionId, { jobId: newJobId });
+
+  // Subscribe to result (launchAgent dispatches async)
+  subscribeJobResult(nats, newJobId, actionId, goalId).catch((err) => {
+    log('error', 'Error in restarted job result subscription', { newJobId, actionId, error: String(err) });
+  });
+
+  log('info', 'Orphaned job restarted with augmented prompt', { oldJobId, newJobId, actionId, goalId });
 }
 
 /**

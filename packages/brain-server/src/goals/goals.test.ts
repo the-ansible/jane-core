@@ -13,6 +13,7 @@ import {
   initGoalRegistry,
   createGoal,
   getGoal,
+  getGoalAction,
   listGoals,
   listActiveGoals,
   updateGoal,
@@ -21,6 +22,9 @@ import {
   updateGoalAction,
   listGoalActions,
   getGoalActionByJobId,
+  listCompletedActionsForGoal,
+  countReviewedUnachievedActions,
+  getGoalActionByReviewJobId,
   createCycle,
   completeCycle,
   failCycle,
@@ -303,7 +307,7 @@ describe('Goal Registry — Cycles', () => {
     const cycleId = await createCycle();
 
     const goalId = await createGoal({
-      title: 'Cycle Goal',
+      title: `Cycle Goal ${Date.now()}`,
       description: 'For cycle test',
       level: 'operational',
     });
@@ -505,5 +509,139 @@ describe('Goals HTTP API', () => {
   it('POST /api/goals/cycles/trigger returns 503 when NATS not connected', async () => {
     const res = await app.request('/api/goals/cycles/trigger', { method: 'POST' });
     expect(res.status).toBe(503); // deps.nats is null
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review State Machine
+// ---------------------------------------------------------------------------
+
+describe('Goal Action Review State Machine', () => {
+  it('supports the reviewing status', async () => {
+    const goalId = await createGoal({
+      title: 'Review Status Goal',
+      description: 'Test reviewing status',
+      level: 'tactical',
+    });
+    testGoalIds.push(goalId);
+
+    const actionId = await createGoalAction({
+      goalId,
+      description: 'Action to review',
+      status: 'selected',
+    });
+
+    await updateGoalAction(actionId, { status: 'reviewing' });
+    const action = await getGoalAction(actionId);
+    expect(action).not.toBeNull();
+    expect(action!.status).toBe('reviewing');
+  });
+
+  it('stores review_text and review_job_id', async () => {
+    const goalId = await createGoal({
+      title: 'Review Fields Goal',
+      description: 'Test review fields',
+      level: 'tactical',
+    });
+    testGoalIds.push(goalId);
+
+    const reviewJobId = await createJob({ jobType: 'review', prompt: 'review job', contextJson: {} });
+    const actionId = await createGoalAction({
+      goalId,
+      description: 'Action with review',
+    });
+
+    await updateGoalAction(actionId, {
+      status: 'reviewing',
+      reviewJobId,
+      reviewText: 'Goal partially achieved. Still needs storage-audit.sh update.',
+    });
+
+    const action = await getGoalAction(actionId);
+    expect(action!.review_text).toBe('Goal partially achieved. Still needs storage-audit.sh update.');
+    expect(action!.review_job_id).toBe(reviewJobId);
+  });
+
+  it('getGoalAction retrieves by action ID', async () => {
+    const goalId = await createGoal({
+      title: 'Get Action Goal',
+      description: 'x',
+      level: 'operational',
+    });
+    testGoalIds.push(goalId);
+
+    const actionId = await createGoalAction({ goalId, description: 'find me' });
+    const action = await getGoalAction(actionId);
+    expect(action).not.toBeNull();
+    expect(action!.description).toBe('find me');
+  });
+
+  it('getGoalAction returns null for unknown ID', async () => {
+    const action = await getGoalAction('00000000-0000-0000-0000-ffffffffffff');
+    expect(action).toBeNull();
+  });
+
+  it('listCompletedActionsForGoal returns done and failed actions', async () => {
+    const goalId = await createGoal({
+      title: 'Completed Actions Goal',
+      description: 'x',
+      level: 'tactical',
+    });
+    testGoalIds.push(goalId);
+
+    const a1 = await createGoalAction({ goalId, description: 'done action', status: 'done' });
+    const a2 = await createGoalAction({ goalId, description: 'failed action', status: 'failed' });
+    await createGoalAction({ goalId, description: 'rejected action', status: 'rejected' });
+    await createGoalAction({ goalId, description: 'executing action', status: 'executing' });
+
+    const completed = await listCompletedActionsForGoal(goalId);
+    const ids = completed.map((a) => a.id);
+    expect(ids).toContain(a1);
+    expect(ids).toContain(a2);
+    expect(completed).toHaveLength(2);
+  });
+
+  it('countReviewedUnachievedActions counts actions with review_text', async () => {
+    const goalId = await createGoal({
+      title: 'Reviewed Count Goal',
+      description: 'x',
+      level: 'tactical',
+    });
+    testGoalIds.push(goalId);
+
+    // Two reviewed actions (have review_text)
+    const a1 = await createGoalAction({ goalId, description: 'reviewed 1', status: 'done' });
+    await updateGoalAction(a1, { reviewText: 'Not achieved yet' });
+
+    const a2 = await createGoalAction({ goalId, description: 'reviewed 2', status: 'failed' });
+    await updateGoalAction(a2, { reviewText: 'Failed due to error' });
+
+    // One without review_text (not yet reviewed)
+    await createGoalAction({ goalId, description: 'unreviewed', status: 'done' });
+
+    const count = await countReviewedUnachievedActions(goalId);
+    expect(count).toBe(2);
+  });
+
+  it('getGoalActionByReviewJobId finds action by review job', async () => {
+    const goalId = await createGoal({
+      title: 'Review Job Lookup Goal',
+      description: 'x',
+      level: 'operational',
+    });
+    testGoalIds.push(goalId);
+
+    const reviewJobId = await createJob({ jobType: 'review', prompt: 'review', contextJson: {} });
+    const actionId = await createGoalAction({ goalId, description: 'with review job' });
+    await updateGoalAction(actionId, { reviewJobId });
+
+    const found = await getGoalActionByReviewJobId(reviewJobId);
+    expect(found).not.toBeNull();
+    expect(found!.id).toBe(actionId);
+  });
+
+  it('getGoalActionByReviewJobId returns null for unknown job', async () => {
+    const found = await getGoalActionByReviewJobId('00000000-0000-0000-0000-ffffffffffff');
+    expect(found).toBeNull();
   });
 });

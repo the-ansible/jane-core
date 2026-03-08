@@ -52,6 +52,14 @@ export async function initLayerRegistry(): Promise<void> {
   await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_directives_status ON brain.layer_directives (status)`);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_directives_target ON brain.layer_directives (target_layer)`);
 
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS brain.scheduler_state (
+      key        TEXT PRIMARY KEY,
+      value      JSONB NOT NULL DEFAULT '{}',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
   log('info', 'Layer registry initialized');
 }
 
@@ -168,6 +176,27 @@ export async function listDirectives(targetLayer?: LayerName, status?: Directive
     createdAt: r.created_at,
     appliedAt: r.applied_at,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler state
+// ---------------------------------------------------------------------------
+
+export async function getSchedulerState(key: string): Promise<Record<string, unknown> | null> {
+  const { rows } = await getPool().query<{ value: Record<string, unknown> }>(
+    `SELECT value FROM brain.scheduler_state WHERE key = $1`,
+    [key]
+  );
+  return rows[0]?.value ?? null;
+}
+
+export async function setSchedulerState(key: string, value: Record<string, unknown>): Promise<void> {
+  await getPool().query(
+    `INSERT INTO brain.scheduler_state (key, value, updated_at)
+     VALUES ($1, $2, now())
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`,
+    [key, JSON.stringify(value)]
+  );
 }
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {

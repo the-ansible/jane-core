@@ -4,7 +4,7 @@
 
 export type GoalLevel = 'asymptotic' | 'strategic' | 'tactical' | 'operational';
 export type GoalStatus = 'active' | 'paused' | 'achieved' | 'abandoned';
-export type ActionStatus = 'proposed' | 'selected' | 'executing' | 'done' | 'failed' | 'rejected';
+export type ActionStatus = 'proposed' | 'selected' | 'executing' | 'reviewing' | 'done' | 'failed' | 'rejected';
 export type CycleStatus = 'running' | 'done' | 'failed';
 
 export interface Goal {
@@ -33,6 +33,8 @@ export interface GoalAction {
   score: number | null;       // 0-10 from Ollama scoring
   job_id: string | null;      // brain.agent_jobs FK if executed
   outcome_text: string | null;
+  review_text: string | null;
+  review_job_id: string | null;
   created_at: Date;
   updated_at: Date;
 }

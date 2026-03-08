@@ -16,7 +16,7 @@
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { MonitorResult, LayerStatus } from './types.js';
-import { recordLayerEvent } from './registry.js';
+import { recordLayerEvent, getSchedulerState, setSchedulerState } from './registry.js';
 import pg from 'pg';
 
 const sc = StringCodec();
@@ -30,6 +30,7 @@ let lastActivity: Date | null = null;
 let lastResults: MonitorResult[] = [];
 
 const MONITOR_INTERVAL_MS = 60_000; // 1 minute
+const SCHEDULER_KEY = 'autonomic-monitor';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -42,7 +43,34 @@ export function startAutonomicLayer(nats: NatsConnection): void {
   runAllMonitors(nats);
   monitorTimer = setInterval(() => runAllMonitors(nats), MONITOR_INTERVAL_MS);
 
+  // Async: check persisted state — for 60s intervals the server is nearly always
+  // overdue after a restart, so this mainly ensures we persist nextRunAt going forward.
+  recoverSchedule(nats, MONITOR_INTERVAL_MS);
+
   log('info', 'Autonomic layer started', { intervalMs: MONITOR_INTERVAL_MS });
+}
+
+function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
+  getSchedulerState(SCHEDULER_KEY)
+    .then((state) => {
+      if (!state?.nextRunAt) return; // No prior state — interval is already correct
+
+      const remaining = new Date(state.nextRunAt as string).getTime() - Date.now();
+
+      if (remaining <= 0) {
+        // Overdue — already ran immediately above; nothing extra to do
+        log('info', 'Autonomic monitor was overdue — already ran on startup', { overdueMs: -remaining });
+      } else if (remaining < intervalMs) {
+        // Due sooner than the full interval — reschedule
+        clearInterval(monitorTimer!);
+        log('info', 'Autonomic monitor rescheduling to match persisted schedule', { remainingMs: remaining });
+        monitorTimer = setTimeout(() => {
+          runAllMonitors(nats).catch(() => {});
+          monitorTimer = setInterval(() => runAllMonitors(nats), intervalMs);
+        }, remaining) as unknown as ReturnType<typeof setInterval>;
+      }
+    })
+    .catch(() => {}); // Non-critical
 }
 
 export function stopAutonomicLayer(): void {
@@ -74,6 +102,11 @@ export function getLastMonitorResults(): MonitorResult[] {
 // ---------------------------------------------------------------------------
 
 async function runAllMonitors(nats: NatsConnection): Promise<void> {
+  setSchedulerState(SCHEDULER_KEY, {
+    lastRunAt: new Date().toISOString(),
+    nextRunAt: new Date(Date.now() + MONITOR_INTERVAL_MS).toISOString(),
+  }).catch(() => {});
+
   const results = await Promise.all([
     checkHttpEndpoint('brain-server', 'http://localhost:3103/health'),
     checkHttpEndpoint('stimulation-server', 'http://localhost:3102/health'),

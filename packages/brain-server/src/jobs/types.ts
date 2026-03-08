@@ -2,7 +2,7 @@
  * Shared types for the Brain Server job system.
  */
 
-export type JobType = 'task' | 'research' | 'maintenance' | 'reflection';
+export type JobType = 'task' | 'research' | 'maintenance' | 'reflection' | 'review';
 export type JobStatus =
   | 'queued'
   | 'running'
@@ -17,6 +17,7 @@ export interface AgentJob {
   status: JobStatus;
   prompt: string;
   context_json: Record<string, unknown>;
+  session_id: string | null;
   pid: number | null;
   worktree_path: string | null;
   scratch_dir: string | null;
@@ -46,6 +47,12 @@ export interface JobRequest {
   workdir?: string;
   /** Project path for worktree isolation (if set, creates a git worktree) */
   projectPath?: string;
+  /** Session this job belongs to (executor integration) */
+  sessionId?: string;
+  /** Role for the agent (executor integration) */
+  role?: string;
+  /** Runtime config override (executor integration) */
+  runtime?: { tool: string; model: string; [key: string]: unknown };
 }
 
 /** Published on completion to the replySubject */

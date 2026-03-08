@@ -1,13 +1,15 @@
 /**
- * Claude launcher helpers for the Goal Engine.
+ * Candidate generation and scoring for the Goal Engine.
  *
- * - Candidate generation: given goals + context, produce actionable next steps
+ * - Generation: given goals + context, produce actionable next steps
  * - Scoring: rate each candidate against the full goal set
  *
- * Uses the shared claude-launcher instead of Ollama.
+ * Primary: Claude CLI via claude-launcher (subprocess).
+ * Fallback: Mercury API (instant reasoning) when CLI subprocess fails.
  */
 
 import { launchClaude } from '@jane-core/claude-launcher';
+import { readFileSync } from 'node:fs';
 import type { Goal, CandidateAction } from './types.js';
 
 const CLAUDE_MODEL = process.env.GOAL_CLAUDE_MODEL || 'claude-sonnet-4-6';
@@ -40,11 +42,15 @@ ${goalSummary}
 ## Current Context
 ${context}
 
+## CRITICAL RULE — Do Not Re-Propose Recent Work
+The context above contains a "RECENT COMPLETED WORK" section listing actions completed in the last 24 hours with timestamps (e.g. "2.3h ago"). You MUST NOT propose any action that is substantially similar to work completed within the last 24 hours. Duplicating recent work wastes resources and money. If you are tempted to propose something that resembles a recent completed action, choose a different next step instead.
+
 ## Instructions
 Generate 5-8 concrete actions. Each action should:
 - Be completable in a single work session (minutes to hours)
 - Directly advance one or more of the listed goals
 - Be specific enough that an AI agent can execute it without further clarification
+- NOT duplicate any action listed in the "RECENT COMPLETED WORK" section above (last 24 hours)
 - NOT duplicate work already described in the "Recent progress" notes above
 
 Respond ONLY with a JSON array, no markdown, no explanation:
@@ -148,19 +154,79 @@ Respond ONLY with a JSON array of scores in order, no markdown:
 // ---------------------------------------------------------------------------
 
 async function claudeGenerate(prompt: string): Promise<string> {
-  const result = await launchClaude({
-    prompt,
-    model: CLAUDE_MODEL,
-    outputFormat: 'json',
-    maxTurns: 1,
-    timeout: LAUNCH_TIMEOUT_MS,
+  // Primary: Claude CLI subprocess
+  try {
+    const result = await launchClaude({
+      prompt,
+      model: CLAUDE_MODEL,
+      outputFormat: 'json',
+      maxTurns: 1,
+      timeout: LAUNCH_TIMEOUT_MS,
+    });
+
+    if (result.timedOut) throw new Error('Claude launcher timed out');
+    if (result.exitCode !== 0) throw new Error(`Claude launcher exited with code ${result.exitCode}`);
+    const text = result.resultText ?? result.stdout.trim();
+    if (!text) throw new Error('Claude launcher returned empty response');
+    return text;
+  } catch (primaryErr) {
+    log('warn', 'Claude CLI launcher failed — falling back to Mercury API', { error: String(primaryErr) });
+    return mercuryFallback(prompt);
+  }
+}
+
+/**
+ * Mercury API fallback — used when the Claude CLI subprocess fails.
+ * Fast and reliable, avoids per-token API costs.
+ */
+async function mercuryFallback(prompt: string): Promise<string> {
+  const apiKey = getMercuryApiKey();
+  if (!apiKey) throw new Error('MERCURY_API_KEY not set — cannot fall back to Mercury');
+
+  const response = await fetch('https://api.inceptionlabs.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'mercury-2',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 4096,
+    }),
+    signal: AbortSignal.timeout(30_000),
   });
 
-  if (result.timedOut) throw new Error('Claude launcher timed out');
-  if (result.exitCode !== 0) throw new Error(`Claude launcher exited with code ${result.exitCode}`);
-  const text = result.resultText ?? result.stdout.trim();
-  if (!text) throw new Error('Claude launcher returned empty response');
-  return text;
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Mercury API error ${response.status}: ${text.slice(0, 200)}`);
+  }
+
+  const data = await response.json() as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = data?.choices?.[0]?.message?.content?.trim();
+  if (!content) throw new Error('Mercury returned no content');
+  return content;
+}
+
+function getMercuryApiKey(): string | undefined {
+  if (process.env.MERCURY_API_KEY) return process.env.MERCURY_API_KEY;
+
+  try {
+    const environ = readFileSync('/proc/1/environ');
+    const vars = environ.toString().split('\0');
+    for (const v of vars) {
+      if (v.startsWith('MERCURY_API_KEY=')) {
+        const val = v.slice('MERCURY_API_KEY='.length);
+        if (val) return val;
+      }
+    }
+  } catch {
+    // /proc/1/environ not available
+  }
+
+  return undefined;
 }
 
 function extractJson(text: string): unknown {
