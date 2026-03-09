@@ -2,15 +2,17 @@
  * Goal Registry — PostgreSQL persistence for goals, actions, and cycles.
  *
  * Tables:
- *   brain.goals        — persistent goal hierarchy
- *   brain.goal_actions — candidate actions generated each cycle
- *   brain.goal_cycles  — audit log of each engine run
+ *   ${SCHEMA}.goals        — persistent goal hierarchy
+ *   ${SCHEMA}.goal_actions — candidate actions generated each cycle
+ *   ${SCHEMA}.goal_cycles  — audit log of each engine run
  */
 
 import pg from 'pg';
 import type { Goal, GoalAction, GoalCycle, GoalLevel, GoalStatus, ActionStatus, CycleStatus } from './types.js';
 
 const { Pool } = pg;
+
+const SCHEMA = process.env.BRAIN_SCHEMA ?? 'brain';
 
 let pool: pg.Pool | null = null;
 
@@ -30,7 +32,7 @@ export async function initGoalRegistry(): Promise<void> {
   const p = getPool();
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.goals (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.goals (
       id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       title            TEXT NOT NULL,
       description      TEXT NOT NULL,
@@ -38,7 +40,7 @@ export async function initGoalRegistry(): Promise<void> {
       level            TEXT NOT NULL CHECK (level IN ('asymptotic','strategic','tactical','operational')),
       priority         INTEGER NOT NULL DEFAULT 50 CHECK (priority BETWEEN 1 AND 100),
       status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','achieved','abandoned')),
-      parent_id        UUID REFERENCES brain.goals(id),
+      parent_id        UUID REFERENCES ${SCHEMA}.goals(id),
       success_criteria TEXT,
       progress_notes   TEXT,
       last_evaluated_at TIMESTAMPTZ,
@@ -48,32 +50,32 @@ export async function initGoalRegistry(): Promise<void> {
   `);
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.goal_actions (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.goal_actions (
       id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      goal_id      UUID NOT NULL REFERENCES brain.goals(id),
+      goal_id      UUID NOT NULL REFERENCES ${SCHEMA}.goals(id),
       cycle_id     UUID,
       description  TEXT NOT NULL,
       rationale    TEXT,
       status       TEXT NOT NULL DEFAULT 'proposed'
                    CHECK (status IN ('proposed','selected','executing','reviewing','done','failed','rejected')),
       score        NUMERIC(5,2),
-      job_id       UUID REFERENCES brain.agent_jobs(id),
+      job_id       UUID REFERENCES ${SCHEMA}.agent_jobs(id),
       outcome_text TEXT,
       review_text  TEXT,
-      review_job_id UUID REFERENCES brain.agent_jobs(id),
+      review_job_id UUID REFERENCES ${SCHEMA}.agent_jobs(id),
       created_at   TIMESTAMPTZ DEFAULT now(),
       updated_at   TIMESTAMPTZ DEFAULT now()
     )
   `);
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.goal_cycles (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.goal_cycles (
       id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       status              TEXT NOT NULL DEFAULT 'running'
                           CHECK (status IN ('running','done','failed')),
       goals_assessed      INTEGER NOT NULL DEFAULT 0,
       candidates_generated INTEGER NOT NULL DEFAULT 0,
-      action_selected_id  UUID REFERENCES brain.goal_actions(id),
+      action_selected_id  UUID REFERENCES ${SCHEMA}.goal_actions(id),
       cycle_notes         TEXT,
       started_at          TIMESTAMPTZ DEFAULT now(),
       completed_at        TIMESTAMPTZ
@@ -81,21 +83,21 @@ export async function initGoalRegistry(): Promise<void> {
   `);
 
   // Migrations for existing tables
-  await p.query(`ALTER TABLE brain.goal_actions ADD COLUMN IF NOT EXISTS review_text TEXT`);
-  await p.query(`ALTER TABLE brain.goal_actions ADD COLUMN IF NOT EXISTS review_job_id UUID REFERENCES brain.agent_jobs(id)`);
+  await p.query(`ALTER TABLE ${SCHEMA}.goal_actions ADD COLUMN IF NOT EXISTS review_text TEXT`);
+  await p.query(`ALTER TABLE ${SCHEMA}.goal_actions ADD COLUMN IF NOT EXISTS review_job_id UUID REFERENCES ${SCHEMA}.agent_jobs(id)`);
   // Update check constraint to include 'reviewing' status
   await p.query(`
     DO $$ BEGIN
-      ALTER TABLE brain.goal_actions DROP CONSTRAINT IF EXISTS goal_actions_status_check;
-      ALTER TABLE brain.goal_actions ADD CONSTRAINT goal_actions_status_check
+      ALTER TABLE ${SCHEMA}.goal_actions DROP CONSTRAINT IF EXISTS goal_actions_status_check;
+      ALTER TABLE ${SCHEMA}.goal_actions ADD CONSTRAINT goal_actions_status_check
         CHECK (status IN ('proposed','selected','executing','reviewing','done','failed','rejected'));
     END $$
   `);
 
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_goals_status ON brain.goals (status)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_goals_level  ON brain.goals (level)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_goal_actions_goal ON brain.goal_actions (goal_id)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_goal_cycles_started ON brain.goal_cycles (started_at DESC)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_goals_status ON ${SCHEMA}.goals (status)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_goals_level  ON ${SCHEMA}.goals (level)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_goal_actions_goal ON ${SCHEMA}.goal_actions (goal_id)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_goal_cycles_started ON ${SCHEMA}.goal_cycles (started_at DESC)`);
 
   log('info', 'Goal registry initialized');
 }
@@ -138,7 +140,7 @@ function titleSimilarity(a: string, b: string): number {
  */
 export async function findDuplicateGoal(title: string, threshold = 0.90): Promise<Goal | null> {
   const { rows } = await getPool().query<Goal>(
-    `SELECT * FROM brain.goals WHERE status != 'abandoned' ORDER BY created_at ASC`
+    `SELECT * FROM ${SCHEMA}.goals WHERE status != 'abandoned' ORDER BY created_at ASC`
   );
   for (const goal of rows) {
     const sim = titleSimilarity(goal.title, title);
@@ -169,7 +171,7 @@ export async function createGoal(params: {
   }
 
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO brain.goals (title, description, motivation, level, priority, parent_id, success_criteria)
+    `INSERT INTO ${SCHEMA}.goals (title, description, motivation, level, priority, parent_id, success_criteria)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING id`,
     [
@@ -187,7 +189,7 @@ export async function createGoal(params: {
 
 export async function listActiveGoals(): Promise<Goal[]> {
   const { rows } = await getPool().query<Goal>(
-    `SELECT * FROM brain.goals WHERE status = 'active' ORDER BY priority DESC, created_at ASC`
+    `SELECT * FROM ${SCHEMA}.goals WHERE status = 'active' ORDER BY priority DESC, created_at ASC`
   );
   return rows;
 }
@@ -195,19 +197,19 @@ export async function listActiveGoals(): Promise<Goal[]> {
 export async function listGoals(status?: GoalStatus): Promise<Goal[]> {
   if (status) {
     const { rows } = await getPool().query<Goal>(
-      `SELECT * FROM brain.goals WHERE status = $1 ORDER BY priority DESC, created_at ASC`,
+      `SELECT * FROM ${SCHEMA}.goals WHERE status = $1 ORDER BY priority DESC, created_at ASC`,
       [status]
     );
     return rows;
   }
   const { rows } = await getPool().query<Goal>(
-    `SELECT * FROM brain.goals ORDER BY priority DESC, created_at ASC`
+    `SELECT * FROM ${SCHEMA}.goals ORDER BY priority DESC, created_at ASC`
   );
   return rows;
 }
 
 export async function getGoal(id: string): Promise<Goal | null> {
-  const { rows } = await getPool().query<Goal>(`SELECT * FROM brain.goals WHERE id = $1`, [id]);
+  const { rows } = await getPool().query<Goal>(`SELECT * FROM ${SCHEMA}.goals WHERE id = $1`, [id]);
   return rows[0] ?? null;
 }
 
@@ -238,18 +240,18 @@ export async function updateGoal(id: string, updates: Partial<{
 
   if (sets.length === 1) return; // nothing to update
   vals.push(id);
-  await getPool().query(`UPDATE brain.goals SET ${sets.join(', ')} WHERE id = $${i}`, vals);
+  await getPool().query(`UPDATE ${SCHEMA}.goals SET ${sets.join(', ')} WHERE id = $${i}`, vals);
 }
 
 export async function touchGoalEvaluated(id: string): Promise<void> {
   await getPool().query(
-    `UPDATE brain.goals SET last_evaluated_at = now(), updated_at = now() WHERE id = $1`,
+    `UPDATE ${SCHEMA}.goals SET last_evaluated_at = now(), updated_at = now() WHERE id = $1`,
     [id]
   );
 }
 
 export async function countGoals(): Promise<number> {
-  const { rows } = await getPool().query<{ count: string }>(`SELECT COUNT(*) as count FROM brain.goals`);
+  const { rows } = await getPool().query<{ count: string }>(`SELECT COUNT(*) as count FROM ${SCHEMA}.goals`);
   return parseInt(rows[0].count, 10);
 }
 
@@ -266,7 +268,7 @@ export async function createGoalAction(params: {
   status?: ActionStatus;
 }): Promise<string> {
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO brain.goal_actions (goal_id, cycle_id, description, rationale, score, status)
+    `INSERT INTO ${SCHEMA}.goal_actions (goal_id, cycle_id, description, rationale, score, status)
      VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING id`,
     [
@@ -301,12 +303,12 @@ export async function updateGoalAction(id: string, updates: Partial<{
   if (updates.reviewJobId !== undefined) { sets.push(`review_job_id = $${i++}`); vals.push(updates.reviewJobId); }
 
   vals.push(id);
-  await getPool().query(`UPDATE brain.goal_actions SET ${sets.join(', ')} WHERE id = $${i}`, vals);
+  await getPool().query(`UPDATE ${SCHEMA}.goal_actions SET ${sets.join(', ')} WHERE id = $${i}`, vals);
 }
 
 export async function listGoalActions(goalId: string, limit = 20): Promise<GoalAction[]> {
   const { rows } = await getPool().query<GoalAction>(
-    `SELECT * FROM brain.goal_actions WHERE goal_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    `SELECT * FROM ${SCHEMA}.goal_actions WHERE goal_id = $1 ORDER BY created_at DESC LIMIT $2`,
     [goalId, limit]
   );
   return rows;
@@ -314,7 +316,7 @@ export async function listGoalActions(goalId: string, limit = 20): Promise<GoalA
 
 export async function getGoalAction(id: string): Promise<GoalAction | null> {
   const { rows } = await getPool().query<GoalAction>(
-    `SELECT * FROM brain.goal_actions WHERE id = $1`,
+    `SELECT * FROM ${SCHEMA}.goal_actions WHERE id = $1`,
     [id]
   );
   return rows[0] ?? null;
@@ -324,8 +326,8 @@ export async function getGoalAction(id: string): Promise<GoalAction | null> {
 export async function listRecentDoneActions(limit = 6): Promise<{ description: string; status: string; goalTitle: string }[]> {
   const { rows } = await getPool().query<{ description: string; status: string; goal_title: string }>(
     `SELECT ga.description, ga.status, g.title AS goal_title
-     FROM brain.goal_actions ga
-     JOIN brain.goals g ON g.id = ga.goal_id
+     FROM ${SCHEMA}.goal_actions ga
+     JOIN ${SCHEMA}.goals g ON g.id = ga.goal_id
      WHERE ga.status IN ('done', 'failed')
      ORDER BY ga.updated_at DESC
      LIMIT $1`,
@@ -350,7 +352,7 @@ export async function listRecentDoneActionsPerGoal(
      FROM (
        SELECT ga.goal_id, ga.description, ga.status, ga.review_text,
               ROW_NUMBER() OVER (PARTITION BY ga.goal_id ORDER BY ga.updated_at DESC) AS rn
-       FROM brain.goal_actions ga
+       FROM ${SCHEMA}.goal_actions ga
        WHERE ga.status IN ('done', 'failed')
          AND ga.goal_id = ANY($1)
      ) ranked
@@ -369,7 +371,7 @@ export async function listRecentDoneActionsPerGoal(
 
 export async function getGoalActionByJobId(jobId: string): Promise<GoalAction | null> {
   const { rows } = await getPool().query<GoalAction>(
-    `SELECT * FROM brain.goal_actions WHERE job_id = $1 LIMIT 1`,
+    `SELECT * FROM ${SCHEMA}.goal_actions WHERE job_id = $1 LIMIT 1`,
     [jobId]
   );
   return rows[0] ?? null;
@@ -377,7 +379,7 @@ export async function getGoalActionByJobId(jobId: string): Promise<GoalAction | 
 
 export async function listExecutingGoalIds(): Promise<string[]> {
   const { rows } = await getPool().query<{ goal_id: string }>(
-    `SELECT DISTINCT goal_id FROM brain.goal_actions WHERE status IN ('executing', 'reviewing')`
+    `SELECT DISTINCT goal_id FROM ${SCHEMA}.goal_actions WHERE status IN ('executing', 'reviewing')`
   );
   return rows.map((r) => r.goal_id);
 }
@@ -385,7 +387,7 @@ export async function listExecutingGoalIds(): Promise<string[]> {
 /** Get all completed actions for a goal (for reviewer context). */
 export async function listCompletedActionsForGoal(goalId: string): Promise<GoalAction[]> {
   const { rows } = await getPool().query<GoalAction>(
-    `SELECT * FROM brain.goal_actions
+    `SELECT * FROM ${SCHEMA}.goal_actions
      WHERE goal_id = $1 AND status IN ('done', 'failed')
      ORDER BY created_at ASC`,
     [goalId]
@@ -396,7 +398,7 @@ export async function listCompletedActionsForGoal(goalId: string): Promise<GoalA
 /** Count done actions that have been reviewed (have review_text) but did not achieve the goal. */
 export async function countReviewedUnachievedActions(goalId: string): Promise<number> {
   const { rows } = await getPool().query<{ count: string }>(
-    `SELECT COUNT(*) as count FROM brain.goal_actions
+    `SELECT COUNT(*) as count FROM ${SCHEMA}.goal_actions
      WHERE goal_id = $1 AND status IN ('done', 'failed') AND review_text IS NOT NULL`,
     [goalId]
   );
@@ -406,7 +408,7 @@ export async function countReviewedUnachievedActions(goalId: string): Promise<nu
 /** Find the goal action linked to a review job ID. */
 export async function getGoalActionByReviewJobId(reviewJobId: string): Promise<GoalAction | null> {
   const { rows } = await getPool().query<GoalAction>(
-    `SELECT * FROM brain.goal_actions WHERE review_job_id = $1 LIMIT 1`,
+    `SELECT * FROM ${SCHEMA}.goal_actions WHERE review_job_id = $1 LIMIT 1`,
     [reviewJobId]
   );
   return rows[0] ?? null;
@@ -440,17 +442,17 @@ export async function recoverStaleGoalActions(): Promise<StaleActionRecovery> {
 
   // Case 1: executing actions whose jobs already finished — capture outcome, flag for review
   const r1 = await getPool().query<{ id: string; goal_id: string }>(
-    `UPDATE brain.goal_actions
+    `UPDATE ${SCHEMA}.goal_actions
      SET outcome_text = COALESCE(
-           brain.goal_actions.outcome_text,
+           ${SCHEMA}.goal_actions.outcome_text,
            COALESCE(aj.result_text, 'Recovered at startup: job was ' || aj.status)
          ),
          updated_at = now()
-     FROM brain.agent_jobs aj
-     WHERE brain.goal_actions.job_id = aj.id
-       AND brain.goal_actions.status = 'executing'
+     FROM ${SCHEMA}.agent_jobs aj
+     WHERE ${SCHEMA}.goal_actions.job_id = aj.id
+       AND ${SCHEMA}.goal_actions.status = 'executing'
        AND aj.status IN ('done', 'failed', 'unresponsive')
-     RETURNING brain.goal_actions.id, brain.goal_actions.goal_id`
+     RETURNING ${SCHEMA}.goal_actions.id, ${SCHEMA}.goal_actions.goal_id`
   );
   for (const row of r1.rows) {
     recovery.needsReview.push({ actionId: row.id, goalId: row.goal_id });
@@ -458,10 +460,10 @@ export async function recoverStaleGoalActions(): Promise<StaleActionRecovery> {
 
   // Case 2: executing actions with orphaned running jobs (>30min no activity)
   const r2 = await getPool().query<{ id: string; goal_id: string; job_id: string }>(
-    `SELECT brain.goal_actions.id, brain.goal_actions.goal_id, brain.goal_actions.job_id
-     FROM brain.goal_actions
-     JOIN brain.agent_jobs aj ON brain.goal_actions.job_id = aj.id
-     WHERE brain.goal_actions.status = 'executing'
+    `SELECT ${SCHEMA}.goal_actions.id, ${SCHEMA}.goal_actions.goal_id, ${SCHEMA}.goal_actions.job_id
+     FROM ${SCHEMA}.goal_actions
+     JOIN ${SCHEMA}.agent_jobs aj ON ${SCHEMA}.goal_actions.job_id = aj.id
+     WHERE ${SCHEMA}.goal_actions.status = 'executing'
        AND aj.status = 'running'
        AND COALESCE(aj.last_activity_at, aj.started_at, aj.created_at) < now() - INTERVAL '30 minutes'`
   );
@@ -471,10 +473,10 @@ export async function recoverStaleGoalActions(): Promise<StaleActionRecovery> {
 
   // Case 3: reviewing actions whose review jobs are dead
   const r3 = await getPool().query<{ id: string; goal_id: string }>(
-    `SELECT brain.goal_actions.id, brain.goal_actions.goal_id
-     FROM brain.goal_actions
-     LEFT JOIN brain.agent_jobs aj ON brain.goal_actions.review_job_id = aj.id
-     WHERE brain.goal_actions.status = 'reviewing'
+    `SELECT ${SCHEMA}.goal_actions.id, ${SCHEMA}.goal_actions.goal_id
+     FROM ${SCHEMA}.goal_actions
+     LEFT JOIN ${SCHEMA}.agent_jobs aj ON ${SCHEMA}.goal_actions.review_job_id = aj.id
+     WHERE ${SCHEMA}.goal_actions.status = 'reviewing'
        AND (aj.id IS NULL OR aj.status IN ('done', 'failed', 'unresponsive')
             OR (aj.status = 'running'
                 AND COALESCE(aj.last_activity_at, aj.started_at, aj.created_at) < now() - INTERVAL '30 minutes'))`
@@ -505,8 +507,8 @@ export async function listRecentCompletedActionsGlobal(limit = 18): Promise<{
   }>(
     `SELECT ga.description, g.title AS goal_title, ga.outcome_text,
             COALESCE(ga.updated_at, ga.created_at) AS completed_at
-     FROM brain.goal_actions ga
-     JOIN brain.goals g ON g.id = ga.goal_id
+     FROM ${SCHEMA}.goal_actions ga
+     JOIN ${SCHEMA}.goals g ON g.id = ga.goal_id
      WHERE ga.status IN ('done', 'failed')
      ORDER BY ga.updated_at DESC
      LIMIT $1`,
@@ -536,7 +538,7 @@ export async function recoverStaleGoalActionsLegacyCount(): Promise<number> {
  */
 export async function failExecutingGoalActionByJobId(jobId: string, reason: string): Promise<boolean> {
   const result = await getPool().query(
-    `UPDATE brain.goal_actions
+    `UPDATE ${SCHEMA}.goal_actions
      SET status = 'failed',
          outcome_text = $1,
          updated_at = now()
@@ -552,14 +554,14 @@ export async function failExecutingGoalActionByJobId(jobId: string, reason: stri
 
 export async function createCycle(): Promise<string> {
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO brain.goal_cycles DEFAULT VALUES RETURNING id`
+    `INSERT INTO ${SCHEMA}.goal_cycles DEFAULT VALUES RETURNING id`
   );
   return rows[0].id;
 }
 
 export async function completeCycle(id: string, goalsAssessed: number, candidatesGenerated: number, actionSelectedId: string | null, notes: string | null): Promise<void> {
   await getPool().query(
-    `UPDATE brain.goal_cycles
+    `UPDATE ${SCHEMA}.goal_cycles
      SET status = 'done', goals_assessed = $1, candidates_generated = $2,
          action_selected_id = $3, cycle_notes = $4, completed_at = now()
      WHERE id = $5`,
@@ -569,7 +571,7 @@ export async function completeCycle(id: string, goalsAssessed: number, candidate
 
 export async function failCycle(id: string, notes: string): Promise<void> {
   await getPool().query(
-    `UPDATE brain.goal_cycles
+    `UPDATE ${SCHEMA}.goal_cycles
      SET status = 'failed', cycle_notes = $1, completed_at = now()
      WHERE id = $2`,
     [notes, id]
@@ -578,7 +580,7 @@ export async function failCycle(id: string, notes: string): Promise<void> {
 
 export async function listCycles(limit = 20): Promise<GoalCycle[]> {
   const { rows } = await getPool().query<GoalCycle>(
-    `SELECT * FROM brain.goal_cycles ORDER BY started_at DESC LIMIT $1`,
+    `SELECT * FROM ${SCHEMA}.goal_cycles ORDER BY started_at DESC LIMIT $1`,
     [limit]
   );
   return rows;
@@ -586,7 +588,7 @@ export async function listCycles(limit = 20): Promise<GoalCycle[]> {
 
 export async function getLatestCycle(): Promise<GoalCycle | null> {
   const { rows } = await getPool().query<GoalCycle>(
-    `SELECT * FROM brain.goal_cycles ORDER BY started_at DESC LIMIT 1`
+    `SELECT * FROM ${SCHEMA}.goal_cycles ORDER BY started_at DESC LIMIT 1`
   );
   return rows[0] ?? null;
 }

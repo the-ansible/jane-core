@@ -1,7 +1,7 @@
 /**
  * Synthetic runtime adapter — hosted open source models (OpenAI-compatible).
  *
- * Use instead of Ollama when a task needs a model larger than ~8GB.
+ * Use for open-source models when a task doesn't need tool use.
  * Pay-per-token but significantly cheaper than Anthropic.
  * No tool use; prompt-only.
  *

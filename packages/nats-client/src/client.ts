@@ -1,5 +1,5 @@
 import { connect, StringCodec, type NatsConnection, type JetStreamClient } from 'nats';
-import { communicationEventSchema } from '@the-ansible/life-system-shared';
+import { communicationEventSchema, uuidv7 } from '@the-ansible/life-system-shared';
 import type { NatsClientOptions, NatsClient, SenderIdentity } from './types.js';
 
 const sc = StringCodec();
@@ -46,8 +46,12 @@ export async function createNatsClient(options: NatsClientOptions): Promise<Nats
     },
 
     async publishEvent(subject: string, event: Record<string, unknown>): Promise<void> {
-      // Inject sender from client options
-      const fullEvent = { ...event, sender: options.sender };
+      // Inject sender and ensure sessionId exists
+      const fullEvent = {
+        ...event,
+        sender: options.sender,
+        sessionId: event.sessionId || uuidv7(),
+      };
 
       // Validate against the CommunicationEvent schema (sender is now required)
       const result = communicationEventSchema.safeParse(fullEvent);

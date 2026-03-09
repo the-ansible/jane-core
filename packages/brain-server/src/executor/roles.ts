@@ -104,7 +104,7 @@ Consider goal alignment, priority weighting, and current system state.
 
 Respond with a JSON array of scored candidates.`,
   defaultModules: ['system-state'],
-  defaultRuntime: { tool: 'ollama', model: 'gemma3:12b' },
+  defaultRuntime: { tool: 'claude-code', model: 'haiku' },
 });
 
 roles.set('analyst', {

@@ -18,6 +18,8 @@
  *
  * POST /api/executor/invoke       — synchronous adapter call (no job tracking)
  *
+ * POST /api/context/assemble      — assemble context for a session+role (no agent spawn)
+ *
  * GET  /api/workspaces            — list active session workspaces
  * GET  /api/workspaces/:sessionId — get workspace info
  * POST /api/workspaces/provision         — create/ensure a session workspace (mid-task self-provisioning)
@@ -39,6 +41,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listJobs, getJob, killJob } from '../jobs/registry.js';
 import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace, getRunningProcessCount, getRunningProcessIds, killProcess, launchAgent } from '../executor/index.js';
+import { assembleContext } from '../executor/context/index.js';
 import type { JobType } from '../jobs/types.js';
 import {
   listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles,
@@ -621,6 +624,52 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         durationMs: result.durationMs,
         error: result.error,
       }, result.success ? 200 : 502);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Context assembly
+  //
+  // POST /api/context/assemble — build context for a session+role without spawning an agent.
+  //   Useful for services that want to inspect or augment context before acting on it,
+  //   and as the bridge for migrating stim-server's own context assembler to call here.
+  // -------------------------------------------------------------------------
+
+  app.post('/api/context/assemble', async (c) => {
+    try {
+      const body = await c.req.json() as {
+        sessionId?: string;
+        role?: string;
+        prompt?: string;
+        modules?: string[];
+      };
+
+      if (!body.role || typeof body.role !== 'string') {
+        return c.json({ error: 'role is required' }, 400);
+      }
+      if (!body.prompt || typeof body.prompt !== 'string') {
+        return c.json({ error: 'prompt is required' }, 400);
+      }
+
+      const result = await assembleContext({
+        sessionId: body.sessionId,
+        role: body.role,
+        prompt: body.prompt,
+        modules: body.modules,
+      });
+
+      return c.json({
+        text: result.text,
+        totalTokens: result.totalTokens,
+        fragments: result.fragments.map(f => ({
+          source: f.source,
+          tokenEstimate: f.tokenEstimate,
+          meta: f.meta,
+        })),
+        meta: result.meta,
+      });
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }

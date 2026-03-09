@@ -7,6 +7,8 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
+
+const schema = process.env.BRAIN_SCHEMA ?? 'brain';
 import {
   initLayerRegistry,
   recordLayerEvent,
@@ -57,10 +59,10 @@ beforeAll(async () => {
 afterAll(async () => {
   // Clean up test records
   if (testEventIds.length > 0) {
-    await pool.query(`DELETE FROM brain.layer_events WHERE id = ANY($1::uuid[])`, [testEventIds]);
+    await pool.query(`DELETE FROM ${schema}.layer_events WHERE id = ANY($1::uuid[])`, [testEventIds]);
   }
   if (testDirectiveIds.length > 0) {
-    await pool.query(`DELETE FROM brain.layer_directives WHERE id = ANY($1::uuid[])`, [testDirectiveIds]);
+    await pool.query(`DELETE FROM ${schema}.layer_directives WHERE id = ANY($1::uuid[])`, [testDirectiveIds]);
   }
   stopHierarchicalControl();
   await pool.end();

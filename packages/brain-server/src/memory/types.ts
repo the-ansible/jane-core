@@ -3,7 +3,7 @@
  *
  * Three memory types:
  *   episodic   — specific events that happened (goal cycles, job completions, conversations)
- *   semantic   — synthesized facts/knowledge distilled from episodes (by Ollama consolidator)
+ *   semantic   — synthesized facts/knowledge distilled from episodes (by LLM consolidator)
  *   procedural — how to do things: patterns, strategies, directives (from layers, lessons learned)
  *
  * Working memories expire automatically (short-lived scratch notes).

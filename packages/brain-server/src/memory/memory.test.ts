@@ -9,6 +9,8 @@
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import pg from 'pg';
+
+const schema = process.env.BRAIN_SCHEMA ?? 'brain';
 import {
   initMemoryRegistry,
   recordMemory,
@@ -52,7 +54,7 @@ afterAll(async () => {
 afterEach(async () => {
   if (testMemoryIds.length > 0) {
     const ids = testMemoryIds.splice(0);
-    await pool.query(`DELETE FROM brain.memories WHERE id = ANY($1)`, [ids]).catch(() => {});
+    await pool.query(`DELETE FROM ${schema}.memories WHERE id = ANY($1)`, [ids]).catch(() => {});
   }
 });
 
@@ -193,7 +195,7 @@ describe('memory registry', () => {
 
 describe('memory patterns', () => {
   afterEach(async () => {
-    await pool.query(`DELETE FROM brain.memory_patterns WHERE description LIKE 'test-pattern-%'`).catch(() => {});
+    await pool.query(`DELETE FROM ${schema}.memory_patterns WHERE description LIKE 'test-pattern-%'`).catch(() => {});
   });
 
   it('records a pattern', async () => {

@@ -9,7 +9,7 @@ import { listSessionIds, readSessionMessages, chunkMessages, formatChunkAsText }
 import { getIngestedSessionIds, recordIngestion } from './ingestion-log.js';
 
 const GRAPHITI_URL = process.env.GRAPHITI_SERVICE_URL || 'http://localhost:3200';
-// Graphiti calls Ollama multiple times per episode.
+// Graphiti calls the LLM multiple times per episode.
 // With qwen3:8b on CPU-bound hardware this can take 5+ minutes per episode.
 const INGEST_TIMEOUT_MS = 600_000; // 10 minutes
 

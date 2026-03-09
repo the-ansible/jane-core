@@ -2,14 +2,16 @@
  * Memory Registry — PostgreSQL persistence for Jane's memory system.
  *
  * Tables:
- *   brain.memories         — episodic, semantic, procedural, working memories
- *   brain.memory_patterns  — learned patterns extracted by the consolidator
+ *   ${SCHEMA}.memories         — episodic, semantic, procedural, working memories
+ *   ${SCHEMA}.memory_patterns  — learned patterns extracted by the consolidator
  */
 
 import pg from 'pg';
 import type { Memory, MemoryPattern, MemoryInput, MemoryType, MemorySource } from './types.js';
 
 const { Pool } = pg;
+
+const SCHEMA = process.env.BRAIN_SCHEMA ?? 'brain';
 
 let pool: pg.Pool | null = null;
 
@@ -29,7 +31,7 @@ export async function initMemoryRegistry(): Promise<void> {
   const p = getPool();
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.memories (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.memories (
       id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       type             TEXT NOT NULL CHECK (type IN ('episodic','semantic','procedural','working')),
       source           TEXT NOT NULL CHECK (source IN ('goal_cycle','job_completion','layer_event','consolidation','manual','reflection')),
@@ -46,7 +48,7 @@ export async function initMemoryRegistry(): Promise<void> {
   `);
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.memory_patterns (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.memory_patterns (
       id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       pattern_type        TEXT NOT NULL,
       description         TEXT NOT NULL,
@@ -58,12 +60,12 @@ export async function initMemoryRegistry(): Promise<void> {
     )
   `);
 
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_type       ON brain.memories (type)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_source     ON brain.memories (source)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_importance ON brain.memories (importance DESC)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_created    ON brain.memories (created_at DESC)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_expires    ON brain.memories (expires_at) WHERE expires_at IS NOT NULL`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_memory_patterns_type ON brain.memory_patterns (pattern_type)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_type       ON ${SCHEMA}.memories (type)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_source     ON ${SCHEMA}.memories (source)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_importance ON ${SCHEMA}.memories (importance DESC)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_created    ON ${SCHEMA}.memories (created_at DESC)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_memories_expires    ON ${SCHEMA}.memories (expires_at) WHERE expires_at IS NOT NULL`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_memory_patterns_type ON ${SCHEMA}.memory_patterns (pattern_type)`);
 
   log('info', 'Memory registry initialized');
 }
@@ -78,7 +80,7 @@ export async function recordMemory(input: MemoryInput): Promise<string> {
     : null;
 
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO brain.memories (type, source, title, content, tags, importance, metadata, expires_at)
+    `INSERT INTO ${SCHEMA}.memories (type, source, title, content, tags, importance, metadata, expires_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id`,
     [
@@ -99,7 +101,7 @@ export async function recordMemory(input: MemoryInput): Promise<string> {
 
 export async function getMemory(id: string): Promise<Memory | null> {
   const { rows } = await getPool().query<Memory>(
-    `UPDATE brain.memories
+    `UPDATE ${SCHEMA}.memories
      SET last_accessed_at = now(), access_count = access_count + 1
      WHERE id = $1
      RETURNING *`,
@@ -145,7 +147,7 @@ export async function listMemories(opts: {
   vals.push(limit);
 
   const { rows } = await getPool().query<Memory>(
-    `SELECT * FROM brain.memories ${where} ORDER BY importance DESC, created_at DESC LIMIT $${i}`,
+    `SELECT * FROM ${SCHEMA}.memories ${where} ORDER BY importance DESC, created_at DESC LIMIT $${i}`,
     vals
   );
   return rows;
@@ -158,7 +160,7 @@ export async function searchMemories(query: string, limit = 20): Promise<Memory[
        to_tsvector('english', title || ' ' || content),
        plainto_tsquery('english', $1)
      ) AS rank
-     FROM brain.memories
+     FROM ${SCHEMA}.memories
      WHERE (expires_at IS NULL OR expires_at > now())
        AND to_tsvector('english', title || ' ' || content) @@ plainto_tsquery('english', $1)
      ORDER BY rank DESC, importance DESC
@@ -170,14 +172,14 @@ export async function searchMemories(query: string, limit = 20): Promise<Memory[
 
 export async function updateMemoryImportance(id: string, importance: number): Promise<void> {
   await getPool().query(
-    `UPDATE brain.memories SET importance = $1 WHERE id = $2`,
+    `UPDATE ${SCHEMA}.memories SET importance = $1 WHERE id = $2`,
     [Math.max(0, Math.min(1, importance)), id]
   );
 }
 
 export async function deleteMemory(id: string): Promise<boolean> {
   const { rowCount } = await getPool().query(
-    `DELETE FROM brain.memories WHERE id = $1`,
+    `DELETE FROM ${SCHEMA}.memories WHERE id = $1`,
     [id]
   );
   return (rowCount ?? 0) > 0;
@@ -185,7 +187,7 @@ export async function deleteMemory(id: string): Promise<boolean> {
 
 export async function purgeExpiredMemories(): Promise<number> {
   const { rowCount } = await getPool().query(
-    `DELETE FROM brain.memories WHERE expires_at IS NOT NULL AND expires_at <= now()`
+    `DELETE FROM ${SCHEMA}.memories WHERE expires_at IS NOT NULL AND expires_at <= now()`
   );
   const count = rowCount ?? 0;
   if (count > 0) log('info', 'Purged expired memories', { count });
@@ -194,7 +196,7 @@ export async function purgeExpiredMemories(): Promise<number> {
 
 export async function countMemories(): Promise<number> {
   const { rows } = await getPool().query<{ count: string }>(
-    `SELECT COUNT(*) AS count FROM brain.memories WHERE expires_at IS NULL OR expires_at > now()`
+    `SELECT COUNT(*) AS count FROM ${SCHEMA}.memories WHERE expires_at IS NULL OR expires_at > now()`
   );
   return parseInt(rows[0].count, 10);
 }
@@ -211,7 +213,7 @@ export async function recordPattern(params: {
 }): Promise<string> {
   // Upsert by description (avoid duplicates)
   const existing = await getPool().query<{ id: string; evidence_count: number }>(
-    `SELECT id, evidence_count FROM brain.memory_patterns WHERE description = $1 LIMIT 1`,
+    `SELECT id, evidence_count FROM ${SCHEMA}.memory_patterns WHERE description = $1 LIMIT 1`,
     [params.description]
   );
 
@@ -219,7 +221,7 @@ export async function recordPattern(params: {
     const { id, evidence_count } = existing.rows[0];
     const newConfidence = Math.min(1, (params.confidence + existing.rows[0].evidence_count * 0.1) / (1 + 0.1));
     await getPool().query(
-      `UPDATE brain.memory_patterns
+      `UPDATE ${SCHEMA}.memory_patterns
        SET evidence_count = $1, confidence = $2, last_reinforced_at = now(),
            example_memory_ids = COALESCE(
              (
@@ -239,7 +241,7 @@ export async function recordPattern(params: {
   }
 
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO brain.memory_patterns (pattern_type, description, confidence, example_memory_ids)
+    `INSERT INTO ${SCHEMA}.memory_patterns (pattern_type, description, confidence, example_memory_ids)
      VALUES ($1, $2, $3, $4)
      RETURNING id`,
     [
@@ -268,7 +270,7 @@ export async function listPatterns(opts: {
   vals.push(Math.min(opts.limit ?? 50, 200));
 
   const { rows } = await getPool().query<MemoryPattern>(
-    `SELECT * FROM brain.memory_patterns ${where} ORDER BY confidence DESC, evidence_count DESC LIMIT $${i}`,
+    `SELECT * FROM ${SCHEMA}.memory_patterns ${where} ORDER BY confidence DESC, evidence_count DESC LIMIT $${i}`,
     vals
   );
   return rows;
@@ -288,7 +290,7 @@ export async function applyImportanceDecay(opts: {
   const decay = opts.decayFactor ?? 0.1;
 
   const { rowCount } = await getPool().query(
-    `UPDATE brain.memories
+    `UPDATE ${SCHEMA}.memories
      SET importance = GREATEST(0, importance - $1)
      WHERE created_at < now() - interval '${olderThan} days'
        AND access_count <= $2

@@ -253,5 +253,5 @@ function extractJson(text: string): unknown {
 }
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {
-  console.log(JSON.stringify({ level, msg, component: 'goal-ollama', ts: new Date().toISOString(), ...extra }));
+  console.log(JSON.stringify({ level, msg, component: 'goal-candidates', ts: new Date().toISOString(), ...extra }));
 }

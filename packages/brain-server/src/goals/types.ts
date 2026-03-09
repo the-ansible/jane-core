@@ -30,7 +30,7 @@ export interface GoalAction {
   description: string;
   rationale: string | null;
   status: ActionStatus;
-  score: number | null;       // 0-10 from Ollama scoring
+  score: number | null;       // 0-10 from LLM scoring
   job_id: string | null;      // brain.agent_jobs FK if executed
   outcome_text: string | null;
   review_text: string | null;
@@ -50,7 +50,7 @@ export interface GoalCycle {
   completed_at: Date | null;
 }
 
-/** A candidate action from Ollama generation — not yet persisted */
+/** A candidate action from LLM generation — not yet persisted */
 export interface CandidateAction {
   goalId: string;
   goalTitle: string;

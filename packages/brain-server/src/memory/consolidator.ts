@@ -2,7 +2,7 @@
  * Memory Consolidator — periodic synthesis of episodic memories into
  * semantic knowledge and learned patterns.
  *
- * Runs every 12 hours (configurable). Uses Ollama to:
+ * Runs every 12 hours (configurable). Uses LLM to:
  *   1. Group related episodic memories
  *   2. Extract patterns (what keeps happening, what works, what fails)
  *   3. Synthesize semantic memories (distilled facts/knowledge)
@@ -147,7 +147,7 @@ export async function runConsolidation(): Promise<ConsolidationResult> {
 }
 
 // ---------------------------------------------------------------------------
-// Ollama-based synthesis
+// LLM-based synthesis
 // ---------------------------------------------------------------------------
 
 async function synthesizeMemories(memories: Memory[]): Promise<{ semanticCount: number; patternCount: number }> {

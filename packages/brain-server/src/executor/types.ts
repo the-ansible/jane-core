@@ -42,12 +42,22 @@ export interface RuntimeConfig {
   model: string;
   /** Max agentic turns for runtimes that support it (claude-code) */
   maxTurns?: number;
+  /** Max tokens to generate (default varies by adapter) */
+  maxTokens?: number;
   /** Temperature for runtimes that support it */
   temperature?: number;
   /** Whether the agent gets tool use (file edit, bash, etc.) */
   toolAccess?: boolean;
-  /** Mercury-specific: reasoning effort level */
+  /** Reasoning effort level: instant, low, medium, high (Mercury) */
   reasoningEffort?: 'instant' | 'low' | 'medium' | 'high';
+  /** Whether to return a summary of the model's reasoning (Mercury, default true) */
+  reasoningSummary?: boolean;
+  /** Whether to delay response until reasoning summary is ready (Mercury) */
+  reasoningSummaryWait?: boolean;
+  /** Up to 4 stop sequences (Mercury, OpenAI-compatible adapters) */
+  stop?: string[];
+  /** Tool definitions for models that support function calling (Mercury) */
+  tools?: Record<string, unknown>[];
 }
 
 export type RuntimeTool = 'claude-code' | 'mercury' | 'ollama' | 'synthetic';

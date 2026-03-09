@@ -112,8 +112,8 @@ function subscribeGoalCycle(nats: NatsConnection): void {
           what: `Goal cycle ${payload.cycleId} ${outcome}. ${action}`,
           where: 'brain-server / goal-engine component',
           when: payload.ts,
-          why: 'Scheduled 4-hour proactive action loop: assess active goals → generate candidates via Ollama → score → select best action → spawn brain job',
-          how: `Ollama gemma3:12b for candidate generation and scoring. ${payload.actionId ? `Selected action ID: ${payload.actionId}` : 'No action spawned.'}`,
+          why: 'Scheduled proactive action loop: assess active goals, generate candidates via LLM, score, select best action, spawn brain job',
+          how: `LLM-based candidate generation and scoring. ${payload.actionId ? `Selected action ID: ${payload.actionId}` : 'No action spawned.'}`,
         });
 
         await ingestSystemEpisode({
@@ -296,7 +296,7 @@ function subscribeSessionCompacted(nats: NatsConnection): void {
           where: 'stimulation-server / session store + Graphiti knowledge graph',
           when: payload.ts,
           why: 'Session exceeded 40 messages — compaction preserves memory by summarizing old messages and indexing them in the knowledge graph before discarding',
-          how: `Ollama gemma3:12b for summarization. Graphiti episode ingestion via FalkorDB. Episode ID: ${payload.graphitiEpisodeId ?? 'none'}`,
+          how: `LLM-based summarization. Graphiti episode ingestion via FalkorDB. Episode ID: ${payload.graphitiEpisodeId ?? 'none'}`,
         });
 
         await ingestSystemEpisode({
@@ -400,7 +400,7 @@ function getLayerPurpose(layer: string): string {
 function getLayerMethod(layer: string, payload: Record<string, unknown>): string {
   const methods: Record<string, string> = {
     'reflexive-layer': 'Rule-based fast triage. May escalate to cognitive layer.',
-    'cognitive-layer': 'Ollama LLM reasoning on alert context.',
+    'cognitive-layer': 'LLM reasoning on alert context.',
     'strategic-layer': 'Claude Opus meta-cognition every 24h. Evaluates system patterns and updates directives.',
   };
   const base = methods[layer] ?? 'Automated processing';

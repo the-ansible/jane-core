@@ -6,8 +6,8 @@
  * Each cycle:
  *   1. Load all active goals
  *   2. Build context (recent job results, system status)
- *   3. Ask Ollama to generate candidate actions
- *   4. Ask Ollama to score candidates against the full goal set
+ *   3. Generate candidate actions via LLM
+ *   4. Score candidates against the full goal set via LLM
  *   5. Select the highest-scoring action
  *   6. Spawn a brain job to execute it
  *   7. Log the cycle
@@ -206,12 +206,12 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     // 2. Gather context
     const context = await buildContext(goals.map((g) => g.id));
 
-    // 3. Generate candidates via Ollama
+    // 3. Generate candidates via LLM
     const candidates = await generateCandidates(goals, context);
     log('info', 'Candidates generated', { cycleId, count: candidates.length });
 
     if (candidates.length === 0) {
-      // Still mark goals as evaluated even when Ollama is unavailable
+      // Still mark goals as evaluated even when LLM is unavailable
       for (const g of goals) await touchGoalEvaluated(g.id);
       await completeCycle(cycleId, goals.length, 0, null, 'No candidates generated — Claude returned empty array or no matching goal titles');
       publishCycleStatus(nats, cycleId, 'done', 'No candidates generated', null);

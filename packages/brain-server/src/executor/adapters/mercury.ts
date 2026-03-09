@@ -1,9 +1,13 @@
 /**
  * Mercury runtime adapter — Inception's Mercury API (OpenAI-compatible).
  *
- * Fast (~100-300ms with instant reasoning), pay-per-token.
- * Use sparingly when speed matters and context is light.
- * Currently used for classification and voice composition.
+ * Supports multiple reasoning levels via `reasoningEffort`:
+ *   - instant: ~100-300ms, minimal reasoning (voice composition, quick replies)
+ *   - low/medium: balanced speed and depth
+ *   - high: deep reasoning, slower but more capable
+ *
+ * Also supports: reasoning summaries, stop sequences, tool calling,
+ * and configurable max tokens (1-50,000).
  */
 
 import type { RuntimeAdapter, AdapterExecuteParams, AdapterResult } from '../types.js';
@@ -35,12 +39,25 @@ const mercuryAdapter: RuntimeAdapter = {
     if (runtime.reasoningEffort) {
       extraBody.reasoning_effort = runtime.reasoningEffort;
     }
+    if (runtime.reasoningSummary !== undefined) {
+      extraBody.reasoning_summary = runtime.reasoningSummary;
+    }
+    if (runtime.reasoningSummaryWait !== undefined) {
+      extraBody.reasoning_summary_wait = runtime.reasoningSummaryWait;
+    }
+    if (runtime.stop) {
+      extraBody.stop = runtime.stop;
+    }
+    if (runtime.tools) {
+      extraBody.tools = runtime.tools;
+    }
 
     const result = await callOpenAICompatible({
       baseUrl: MERCURY_BASE_URL,
       apiKey,
       model: runtime.model || 'mercury-2',
       prompt,
+      maxTokens: runtime.maxTokens,
       temperature: runtime.temperature,
       timeoutMs: MERCURY_TIMEOUT_MS,
       extraBody,

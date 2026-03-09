@@ -9,6 +9,8 @@
 
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import pg from 'pg';
+
+const schema = process.env.BRAIN_SCHEMA ?? 'brain';
 import {
   initGoalRegistry,
   createGoal,
@@ -64,8 +66,8 @@ afterEach(async () => {
   if (testGoalIds.length > 0) {
     // Delete in reverse order to handle parent_id constraints
     for (const id of [...testGoalIds].reverse()) {
-      await pool.query(`DELETE FROM brain.goal_actions WHERE goal_id = $1`, [id]).catch(() => {});
-      await pool.query(`DELETE FROM brain.goals WHERE id = $1`, [id]).catch(() => {});
+      await pool.query(`DELETE FROM ${schema}.goal_actions WHERE goal_id = $1`, [id]).catch(() => {});
+      await pool.query(`DELETE FROM ${schema}.goals WHERE id = $1`, [id]).catch(() => {});
     }
     testGoalIds.length = 0;
   }
@@ -332,13 +334,13 @@ describe('Goal Registry — Cycles', () => {
 
   it('fails a cycle', async () => {
     const cycleId = await createCycle();
-    await failCycle(cycleId, 'Ollama timed out');
+    await failCycle(cycleId, 'LLM timed out');
 
     const cycles = await listCycles(50);
     const ours = cycles.find((c) => c.id === cycleId);
 
     expect(ours!.status).toBe('failed');
-    expect(ours!.cycle_notes).toBe('Ollama timed out');
+    expect(ours!.cycle_notes).toBe('LLM timed out');
     expect(ours!.completed_at).not.toBeNull();
   });
 

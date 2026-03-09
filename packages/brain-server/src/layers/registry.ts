@@ -2,14 +2,16 @@
  * Layer Registry — DB persistence for cross-layer events and directives.
  *
  * Tables:
- *   brain.layer_events    — all cross-layer events (alerts, heartbeats, results, etc.)
- *   brain.layer_directives — strategic directives to lower layers
+ *   ${SCHEMA}.layer_events    — all cross-layer events (alerts, heartbeats, results, etc.)
+ *   ${SCHEMA}.layer_directives — strategic directives to lower layers
  */
 
 import pg from 'pg';
 import type { LayerEvent, LayerEventType, LayerName, LayerDirective, DirectiveStatus } from './types.js';
 
 const { Pool } = pg;
+
+const SCHEMA = process.env.BRAIN_SCHEMA ?? 'brain';
 
 let pool: pg.Pool | null = null;
 
@@ -25,7 +27,7 @@ export async function initLayerRegistry(): Promise<void> {
   const p = getPool();
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.layer_events (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.layer_events (
       id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       layer       TEXT NOT NULL,
       event_type  TEXT NOT NULL,
@@ -34,12 +36,12 @@ export async function initLayerRegistry(): Promise<void> {
       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_events_layer ON brain.layer_events (layer)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_events_created ON brain.layer_events (created_at DESC)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_events_type ON brain.layer_events (event_type)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_events_layer ON ${SCHEMA}.layer_events (layer)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_events_created ON ${SCHEMA}.layer_events (created_at DESC)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_events_type ON ${SCHEMA}.layer_events (event_type)`);
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.layer_directives (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.layer_directives (
       id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       target_layer TEXT NOT NULL,
       directive    TEXT NOT NULL,
@@ -49,11 +51,11 @@ export async function initLayerRegistry(): Promise<void> {
       applied_at   TIMESTAMPTZ
     )
   `);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_directives_status ON brain.layer_directives (status)`);
-  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_directives_target ON brain.layer_directives (target_layer)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_directives_status ON ${SCHEMA}.layer_directives (status)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_layer_directives_target ON ${SCHEMA}.layer_directives (target_layer)`);
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS brain.scheduler_state (
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.scheduler_state (
       key        TEXT PRIMARY KEY,
       value      JSONB NOT NULL DEFAULT '{}',
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -74,7 +76,7 @@ export async function recordLayerEvent(params: {
   payload?: Record<string, unknown>;
 }): Promise<string> {
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO brain.layer_events (layer, event_type, severity, payload)
+    `INSERT INTO ${SCHEMA}.layer_events (layer, event_type, severity, payload)
      VALUES ($1, $2, $3, $4)
      RETURNING id`,
     [params.layer, params.eventType, params.severity ?? 'info', JSON.stringify(params.payload ?? {})]
@@ -105,7 +107,7 @@ export async function listLayerEvents(opts: {
     payload: Record<string, unknown>; created_at: Date;
   }>(
     `SELECT id, layer, event_type, severity, payload, created_at
-     FROM brain.layer_events
+     FROM ${SCHEMA}.layer_events
      ${where}
      ORDER BY created_at DESC LIMIT $${idx}`,
     values
@@ -131,7 +133,7 @@ export async function createDirective(params: {
   params?: Record<string, unknown>;
 }): Promise<string> {
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO brain.layer_directives (target_layer, directive, params)
+    `INSERT INTO ${SCHEMA}.layer_directives (target_layer, directive, params)
      VALUES ($1, $2, $3)
      RETURNING id`,
     [params.targetLayer, params.directive, JSON.stringify(params.params ?? {})]
@@ -141,7 +143,7 @@ export async function createDirective(params: {
 
 export async function applyDirective(id: string): Promise<void> {
   await getPool().query(
-    `UPDATE brain.layer_directives SET status = 'applied', applied_at = now() WHERE id = $1`,
+    `UPDATE ${SCHEMA}.layer_directives SET status = 'applied', applied_at = now() WHERE id = $1`,
     [id]
   );
 }
@@ -161,7 +163,7 @@ export async function listDirectives(targetLayer?: LayerName, status?: Directive
     status: string; created_at: Date; applied_at: Date | null;
   }>(
     `SELECT id, target_layer, directive, params, status, created_at, applied_at
-     FROM brain.layer_directives
+     FROM ${SCHEMA}.layer_directives
      ${where}
      ORDER BY created_at DESC LIMIT 100`,
     values
@@ -184,7 +186,7 @@ export async function listDirectives(targetLayer?: LayerName, status?: Directive
 
 export async function getSchedulerState(key: string): Promise<Record<string, unknown> | null> {
   const { rows } = await getPool().query<{ value: Record<string, unknown> }>(
-    `SELECT value FROM brain.scheduler_state WHERE key = $1`,
+    `SELECT value FROM ${SCHEMA}.scheduler_state WHERE key = $1`,
     [key]
   );
   return rows[0]?.value ?? null;
@@ -192,7 +194,7 @@ export async function getSchedulerState(key: string): Promise<Record<string, unk
 
 export async function setSchedulerState(key: string, value: Record<string, unknown>): Promise<void> {
   await getPool().query(
-    `INSERT INTO brain.scheduler_state (key, value, updated_at)
+    `INSERT INTO ${SCHEMA}.scheduler_state (key, value, updated_at)
      VALUES ($1, $2, now())
      ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`,
     [key, JSON.stringify(value)]
