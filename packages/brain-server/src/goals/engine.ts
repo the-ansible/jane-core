@@ -29,6 +29,7 @@ import type { JobResult } from '../jobs/types.js';
 import { recordGoalCycleMemory } from '../memory/recorder.js';
 import { getGoalContextMemories } from '../memory/retriever.js';
 import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
+import { writeGoalActionSnapshot } from '../executor/goal-snapshots.js';
 
 /** Max reviewed attempts before a goal is abandoned. */
 const MAX_REVIEWED_ATTEMPTS = 3;
@@ -535,7 +536,7 @@ async function subscribeReviewResult(
       const verdict = parseReviewVerdict(result.result);
       const reviewText = `${verdict.assessment}${verdict.recommendation ? `\nRecommendation: ${verdict.recommendation}` : ''}`;
 
-      const goal = await getGoal(goalId);
+      const [goal, currentAction] = await Promise.all([getGoal(goalId), getGoalAction(actionId)]);
       const isAsymptotic = goal?.level === 'asymptotic';
 
       if (verdict.achieved && !isAsymptotic) {
@@ -559,6 +560,21 @@ async function subscribeReviewResult(
         } else {
           log('info', 'Action reviewed — goal not yet achieved', { actionId, goalId, reviewedCount });
         }
+      }
+
+      // Write a context.summaries snapshot for the goal session.
+      // This allows the parent-session module to surface this action's outcome
+      // to any sub-agents spawned as children of the goal's session.
+      if (currentAction) {
+        writeGoalActionSnapshot({
+          goalSessionId: goalId,  // goal UUID is the goal session ID
+          description: currentAction.description,
+          outcomeText: currentAction.outcome_text,
+          reviewText: reviewText.slice(0, 800),
+          startedAt: currentAction.created_at,
+          completedAt: new Date(),
+          status: 'done',
+        }).catch((err) => log('warn', 'Failed to write goal action snapshot', { actionId, goalId, error: String(err) }));
       }
     } catch (err) {
       log('error', 'Error processing review result', { reviewJobId, actionId, goalId, error: String(err) });
