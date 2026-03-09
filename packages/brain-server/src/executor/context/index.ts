@@ -21,6 +21,7 @@ import systemStateModule from './modules/system-state.js';
 import memoryModule from './modules/memory.js';
 import parentSessionModule from './modules/parent-session.js';
 import goalHistoryModule from './modules/goal-history.js';
+import vaultSearchModule from './modules/vault-search.js';
 
 const MODULE_REGISTRY = new Map<string, ContextModule>([
   ['conversation', conversationModule],
@@ -29,6 +30,7 @@ const MODULE_REGISTRY = new Map<string, ContextModule>([
   ['memory', memoryModule],
   ['parent-session', parentSessionModule],
   ['goal-history', goalHistoryModule],
+  ['vault-search', vaultSearchModule],
 ]);
 
 /**

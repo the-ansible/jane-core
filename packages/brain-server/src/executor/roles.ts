@@ -185,7 +185,7 @@ Produce:
 - Risk assessment
 
 Focus on clarity and simplicity. Don't over-engineer.`,
-  defaultModules: ['memory', 'system-state'],
+  defaultModules: ['memory', 'system-state', 'vault-search'],
   defaultRuntime: { tool: 'claude-code', model: 'opus' },
 });
 
@@ -212,7 +212,7 @@ If you need a workspace and don't have one, provision it:
 
 Work in the returned workspace path. Commit to the worktree branch.
 Environment variables available: JOB_ID, SESSION_ID, NATS_URL.`,
-  defaultModules: ['memory'],
+  defaultModules: ['memory', 'vault-search'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 
