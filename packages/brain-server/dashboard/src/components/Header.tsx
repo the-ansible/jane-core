@@ -1,5 +1,7 @@
 import type { BrainMetrics } from '@/types';
 
+export type DashboardTab = 'autonomy' | 'communication';
+
 interface HeaderProps {
   metrics: BrainMetrics | null;
   natsConnected: boolean;
@@ -7,9 +9,11 @@ interface HeaderProps {
   cycleRunning: boolean;
   onTriggerCycle: () => void;
   triggering: boolean;
+  activeTab: DashboardTab;
+  onTabChange: (tab: DashboardTab) => void;
 }
 
-export function Header({ metrics, natsConnected, sseConnected, cycleRunning, onTriggerCycle, triggering }: HeaderProps) {
+export function Header({ metrics, natsConnected, sseConnected, cycleRunning, onTriggerCycle, triggering, activeTab, onTabChange }: HeaderProps) {
   const uptimeMs = metrics?.uptimeMs ?? 0;
   const h = Math.floor(uptimeMs / 3600000);
   const m = Math.floor((uptimeMs % 3600000) / 60000);
@@ -17,8 +21,26 @@ export function Header({ metrics, natsConnected, sseConnected, cycleRunning, onT
   const uptime = `${h}h ${m}m ${s}s`;
 
   return (
-    <header className="flex items-center justify-between border-b border-border bg-card px-6 py-3">
-      <h1 className="text-lg font-semibold text-card-foreground">Brain Server</h1>
+    <header className="border-b border-border bg-card px-6 py-3">
+      <div className="flex items-center justify-between">
+      <div className="flex items-center gap-6">
+        <h1 className="text-lg font-semibold text-card-foreground">Brain Server</h1>
+        <nav className="flex gap-1">
+          {(['autonomy', 'communication'] as const).map((tab) => (
+            <button
+              key={tab}
+              onClick={() => onTabChange(tab)}
+              className={`rounded-md px-3 py-1 text-xs font-medium capitalize transition-colors ${
+                activeTab === tab
+                  ? 'bg-primary/15 text-primary'
+                  : 'text-muted-foreground hover:text-card-foreground hover:bg-muted/50'
+              }`}
+            >
+              {tab}
+            </button>
+          ))}
+        </nav>
+      </div>
 
       <div className="flex items-center gap-4 text-sm text-muted-foreground">
         <span className="font-mono">{uptime}</span>
@@ -59,6 +81,7 @@ export function Header({ metrics, natsConnected, sseConnected, cycleRunning, onT
         >
           {cycleRunning ? '⟳ Cycle Running' : triggering ? 'Triggering…' : 'Trigger Cycle'}
         </button>
+      </div>
       </div>
     </header>
   );

@@ -58,6 +58,7 @@ import type { LayerName } from '../layers/types.js';
 import {
   listMemories, getMemory, deleteMemory, countMemories, searchMemories, listPatterns,
 } from '../memory/registry.js';
+import { createCommRoutes } from '../communication/routes.js';
 import { recordManualMemory } from '../memory/recorder.js';
 import { getRelevantMemories, formatMemoriesForContext } from '../memory/retriever.js';
 import { runConsolidation, isConsolidating, getLastConsolidationResult } from '../memory/consolidator.js';
@@ -804,6 +805,31 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         await new Promise((resolve) => setTimeout(resolve, 30_000));
       }
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Communication module routes
+  // -------------------------------------------------------------------------
+
+  const commRoutes = createCommRoutes(deps);
+  app.route('/api/communication', commRoutes);
+
+  // Backward-compatible aliases for callers still using stimulation server URLs.
+  // Forward to the communication sub-app using its local paths.
+  app.post('/api/compose-and-send', async (c) => {
+    const url = new URL(c.req.url);
+    url.pathname = '/compose-and-send';
+    return commRoutes.fetch(new Request(url, c.req.raw));
+  });
+  app.post('/api/send', async (c) => {
+    const url = new URL(c.req.url);
+    url.pathname = '/send';
+    return commRoutes.fetch(new Request(url, c.req.raw));
+  });
+  app.post('/api/interactive/capture', async (c) => {
+    const url = new URL(c.req.url);
+    url.pathname = '/interactive/capture';
+    return commRoutes.fetch(new Request(url, c.req.raw));
   });
 
   // -------------------------------------------------------------------------

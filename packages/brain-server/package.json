@@ -14,6 +14,7 @@
     "@hono/node-server": "^1.19.9",
     "@jane-core/claude-launcher": "file:../../../../packages/claude-launcher",
     "@jane-core/nats-client": "workspace:*",
+    "@the-ansible/life-system-shared": "file:../../../../packages/life-system-shared",
     "hono": "^4.0.0",
     "nats": "^2.29.0",
     "pg": "^8.18.0"

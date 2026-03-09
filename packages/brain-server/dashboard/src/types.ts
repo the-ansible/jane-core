@@ -124,3 +124,118 @@ export interface ConsolidationState {
     error?: string;
   } | null;
 }
+
+// ---------------------------------------------------------------------------
+// Communication types
+// ---------------------------------------------------------------------------
+
+export type PipelineRunStatus = 'running' | 'success' | 'failure';
+export type PipelineStage = 'routing' | 'safety_check' | 'context_assembly' | 'agent' | 'composer' | 'publish';
+
+export interface StageRecord {
+  stage: PipelineStage;
+  status: PipelineRunStatus;
+  startedAt: string;
+  completedAt?: string;
+  durationMs?: number;
+  error?: string;
+  detail?: string;
+}
+
+export interface PipelineRun {
+  runId: string;
+  sessionId: string;
+  channelType: string;
+  senderName: string;
+  contentPreview: string;
+  status: PipelineRunStatus;
+  currentStage: PipelineStage | null;
+  stages: StageRecord[];
+  startedAt: string;
+  completedAt?: string;
+  totalMs?: number;
+  error?: string;
+  routeAction?: string;
+  routingProvenance?: {
+    action: string;
+    reason: string;
+    targetRole?: string;
+    targetId?: string;
+    latencyMs: number;
+  };
+  agentOutput?: string;
+  composerOutput?: string;
+}
+
+export interface CommMetrics {
+  received: number;
+  validated: number;
+  routed: number;
+  pipelineProcessed: number;
+  errors: number;
+  deduplicated: number;
+  validationErrors: number;
+  safety?: {
+    paused: boolean;
+    rateLimits: Record<string, {
+      current: number;
+      limit: number;
+      windowMs: number;
+      alertOnly?: boolean;
+    }>;
+    circuitBreakers: Record<string, {
+      state: string;
+    }>;
+    memory?: {
+      rssBytes: number;
+      underPressure: boolean;
+    };
+  } | null;
+  pipeline?: {
+    responseRate: number;
+    latency: {
+      agent: { p50: number; p95: number; p99: number };
+      composer: { p50: number; p95: number; p99: number };
+      total: { p50: number; p95: number; p99: number };
+    };
+    recentErrors: string[];
+  } | null;
+  outboundQueue?: {
+    size: number;
+    oldestAgeMs: number | null;
+  } | null;
+  sessions?: {
+    active: number;
+    totalMessages: number;
+  };
+  pipelineRuns?: {
+    activeCount: number;
+  };
+}
+
+export interface CommEvent {
+  event: {
+    id: string;
+    channelType: string;
+    direction: string;
+    sessionId: string;
+    content: string;
+    sender?: { id: string; displayName?: string; type?: string };
+    timestamp: string;
+  };
+  subject: string;
+  receivedAt: string;
+  routing?: {
+    action: string;
+    reason: string;
+    targetRole?: string;
+    targetId?: string;
+  };
+}
+
+export interface CommSession {
+  sessionId: string;
+  messageCount: number;
+  diskMessageCount: number;
+  lastActivity: string | null;
+}

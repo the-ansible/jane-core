@@ -6,7 +6,7 @@
  * and persisted to brain.layer_events for the reflexive layer to triage.
  *
  * Monitors:
- *   - HTTP endpoints (brain :3103, stimulation :3102, canvas :3001, kanban :3000)
+ *   - HTTP endpoints (brain :3103, canvas :3001, kanban :3000)
  *   - PostgreSQL connectivity + schema presence
  *   - NATS connectivity
  *   - Process memory (current Node process)
@@ -109,7 +109,6 @@ async function runAllMonitors(nats: NatsConnection): Promise<void> {
 
   const results = await Promise.all([
     checkHttpEndpoint('brain-server', 'http://localhost:3103/health'),
-    checkHttpEndpoint('stimulation-server', 'http://localhost:3102/health'),
     checkHttpEndpoint('canvas-api', 'http://localhost:3001/health'),
     checkHttpEndpoint('kanban-api', 'http://localhost:3000/health'),
     checkPostgres(),

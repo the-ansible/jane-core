@@ -44,7 +44,7 @@ PM2_PROCS=(
   "kanban-api"
   "canvas-api"
   "canvas-web"
-  "stimulation-server"
+  "brain-server"
   "event-drainer"
   "good-morning-scheduler"
 )
@@ -82,7 +82,6 @@ echo -e "\n${BOLD}── HTTP Health Endpoints ───────────
 SERVICES=(
   "Kanban API|http://localhost:3000/api/boards"
   "Canvas API|http://localhost:3001/health"
-  "Stimulation Server|http://localhost:3102/health"
   "Brain Server|http://localhost:3103/health"
 )
 

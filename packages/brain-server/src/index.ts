@@ -26,6 +26,7 @@ import { startConsolidator } from './memory/consolidator.js';
 import { initIngestionLog } from './memory/ingestion-log.js';
 import { startGraphitiIngestor } from './graphiti/ingestor.js';
 import { initExecutor, initContextSchema, initWorkspaceSchema, startWorkspaceCleanup } from './executor/index.js';
+import { initCommunication, startCommunication, stopCommunication } from './communication/index.js';
 
 const PORT = parseInt(process.env.PORT || '3103', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
@@ -51,6 +52,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     await initWorkspaceSchema();
     startWorkspaceCleanup();
     startConsolidator();
+    await initCommunication();
   } catch (err) {
     log('error', 'Failed to initialize DB schemas', { error: String(err) });
   }
@@ -63,7 +65,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
       url: NATS_URL,
       name: 'brain-server',
       sender: { id: 'jane-brain', displayName: 'Jane (Brain)', type: 'agent' },
-      useJetStream: false,
+      useJetStream: true,
     });
     deps.nats = natsClient.nc;
     initExecutor(deps.nats);
@@ -72,6 +74,14 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     startGoalEngine(deps.nats);
     await startHierarchicalControl(deps.nats);
     startGraphitiIngestor(deps.nats);
+
+    // Start the communication module (JetStream consumer + outbound retry)
+    if (natsClient.js) {
+      await startCommunication(deps.nats, natsClient.js);
+    } else {
+      log('warn', 'JetStream unavailable — communication module not started');
+    }
+
     log('info', 'Brain server fully initialized', { port: PORT, natsUrl: NATS_URL });
 
     // Announce that outbound communication is now routed through NATS directly
