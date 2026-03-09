@@ -108,6 +108,87 @@ export async function getSession(sessionId: string): Promise<{
   };
 }
 
+export interface SessionInfo {
+  id: string;
+  parentId: string | null;
+  status: string;
+  createdAt: string;
+  lastActiveAt: string;
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * List sessions, optionally filtered by status.
+ * Returns newest first, capped at 100.
+ */
+export async function listSessions(opts?: {
+  status?: string;
+  parentId?: string | null;
+  limit?: number;
+}): Promise<SessionInfo[]> {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (opts?.status) {
+    params.push(opts.status);
+    conditions.push(`status = $${params.length}`);
+  }
+  if (opts?.parentId !== undefined) {
+    if (opts.parentId === null) {
+      conditions.push('parent_id IS NULL');
+    } else {
+      params.push(opts.parentId);
+      conditions.push(`parent_id = $${params.length}`);
+    }
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const limit = opts?.limit ?? 100;
+  params.push(limit);
+
+  const { rows } = await getPool().query<{
+    id: string;
+    parent_id: string | null;
+    status: string;
+    created_at: string;
+    last_active_at: string;
+    metadata: Record<string, unknown>;
+  }>(
+    `SELECT id, parent_id, status, created_at, last_active_at, metadata
+     FROM ${SCHEMA}.sessions
+     ${where}
+     ORDER BY last_active_at DESC
+     LIMIT $${params.length}`,
+    params,
+  );
+
+  return rows.map(r => ({
+    id: r.id,
+    parentId: r.parent_id,
+    status: r.status,
+    createdAt: r.created_at,
+    lastActiveAt: r.last_active_at,
+    metadata: r.metadata,
+  }));
+}
+
+/**
+ * List child sessions for a given parent.
+ */
+export async function listChildSessions(parentSessionId: string): Promise<SessionInfo[]> {
+  return listSessions({ parentId: parentSessionId });
+}
+
+/**
+ * Close a session (mark status = 'closed').
+ */
+export async function closeSession(sessionId: string): Promise<void> {
+  await getPool().query(
+    `UPDATE ${SCHEMA}.sessions SET status = 'closed', last_active_at = now() WHERE id = $1`,
+    [sessionId],
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

@@ -24,6 +24,9 @@ import {
   registerSession,
   getParentSessionId,
   getSession,
+  listSessions,
+  listChildSessions,
+  closeSession,
   _resetPool,
 } from '../sessions.js';
 
@@ -150,6 +153,95 @@ describe('getSession', () => {
     expect(result!.parentId).toBe('sess-parent');
     expect(result!.status).toBe('active');
     expect(result!.metadata).toEqual({ source: 'test' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listSessions
+// ---------------------------------------------------------------------------
+
+describe('listSessions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetPool();
+  });
+
+  it('queries without filters by default', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    await listSessions();
+    const sql = mockQuery.mock.calls[0][0] as string;
+    expect(sql).toContain('FROM');
+    expect(sql).toContain('sessions');
+    expect(sql).not.toContain('WHERE');
+  });
+
+  it('filters by status', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    await listSessions({ status: 'active' });
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('status =');
+    expect(params).toContain('active');
+  });
+
+  it('filters to root sessions when parentId is null', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    await listSessions({ parentId: null });
+    const sql = mockQuery.mock.calls[0][0] as string;
+    expect(sql).toContain('parent_id IS NULL');
+  });
+
+  it('returns mapped session objects', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        id: 'sess-1',
+        parent_id: null,
+        status: 'active',
+        created_at: '2026-03-09T00:00:00Z',
+        last_active_at: '2026-03-09T01:00:00Z',
+        metadata: {},
+      }],
+    });
+    const results = await listSessions();
+    expect(results).toHaveLength(1);
+    expect(results[0].id).toBe('sess-1');
+    expect(results[0].parentId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listChildSessions
+// ---------------------------------------------------------------------------
+
+describe('listChildSessions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetPool();
+  });
+
+  it('queries by parent_id', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+    await listChildSessions('parent-uuid');
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('parent_id =');
+    expect(params).toContain('parent-uuid');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// closeSession
+// ---------------------------------------------------------------------------
+
+describe('closeSession', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetPool();
+  });
+
+  it('updates status to closed', async () => {
+    await closeSession('sess-xyz');
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("status = 'closed'");
+    expect(params[0]).toBe('sess-xyz');
   });
 });
 
