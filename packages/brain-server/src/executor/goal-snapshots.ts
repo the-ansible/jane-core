@@ -13,6 +13,7 @@
  */
 
 import pg from 'pg';
+import { compactGoalSessionIfNeeded } from './goal-compaction.js';
 
 const { Pool } = pg;
 
@@ -108,6 +109,14 @@ export async function writeGoalActionSnapshot(params: GoalActionSnapshotParams):
     msgIdx,
     status: params.status,
     summaryLength: summary.length,
+  });
+
+  // Trigger compaction if the session has grown too large (fire-and-forget)
+  compactGoalSessionIfNeeded(params.goalSessionId).catch((err) => {
+    log('warn', 'Goal compaction check failed', {
+      goalSessionId: params.goalSessionId.slice(0, 8),
+      error: String(err),
+    });
   });
 }
 

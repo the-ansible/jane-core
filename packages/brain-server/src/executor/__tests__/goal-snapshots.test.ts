@@ -22,6 +22,11 @@ vi.mock('pg', () => ({
 
 vi.stubEnv('JANE_DATABASE_URL', 'postgres://test:test@localhost/test');
 
+// Mock the compaction module so it doesn't interfere with snapshot tests
+vi.mock('../goal-compaction.js', () => ({
+  compactGoalSessionIfNeeded: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { writeGoalActionSnapshot, _resetPool } from '../goal-snapshots.js';
 
 const GOAL_ID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
