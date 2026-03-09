@@ -40,7 +40,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listJobs, getJob, killJob } from '../jobs/registry.js';
-import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace, getRunningProcessCount, getRunningProcessIds, killProcess, launchAgent } from '../executor/index.js';
+import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace, getRunningProcessCount, getRunningProcessIds, killProcess, launchAgent, registerSession, listSessions, listChildSessions, getSession, closeSession } from '../executor/index.js';
 import { assembleContext } from '../executor/context/index.js';
 import type { JobType } from '../jobs/types.js';
 import {
@@ -695,11 +695,15 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       const body = await c.req.json() as {
         sessionId?: string;
         worktrees?: string[];
+        parentSessionId?: string;
       };
 
       if (!body.sessionId) {
         return c.json({ error: 'sessionId is required' }, 400);
       }
+
+      // Register session (with optional parent) for context inheritance
+      await registerSession(body.sessionId, body.parentSessionId).catch(() => {});
 
       // Validate worktree paths exist and are git repos
       const validWorktrees = (body.worktrees ?? []).filter(p => {
@@ -723,6 +727,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
           path: wt.path,
           branch: wt.branch,
         })),
+        parentSessionId: body.parentSessionId,
       }, 201);
     } catch (err) {
       return c.json({ error: String(err) }, 500);
@@ -743,6 +748,56 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     try {
       await cleanupWorkspace(c.req.param('sessionId'));
       return c.json({ status: 'cleaned' });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Sessions API — session hierarchy and lifecycle
+  // -------------------------------------------------------------------------
+
+  // GET /api/sessions — list sessions (filter: ?status=active&root=true)
+  app.get('/api/sessions', async (c) => {
+    try {
+      const status = c.req.query('status');
+      const root = c.req.query('root') === 'true';
+      const sessions = await listSessions({
+        status: status || undefined,
+        parentId: root ? null : undefined,
+      });
+      return c.json({ sessions });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // GET /api/sessions/:sessionId — get session info
+  app.get('/api/sessions/:sessionId', async (c) => {
+    try {
+      const session = await getSession(c.req.param('sessionId'));
+      if (!session) return c.json({ error: 'Session not found' }, 404);
+      return c.json(session);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // GET /api/sessions/:sessionId/children — list child sessions
+  app.get('/api/sessions/:sessionId/children', async (c) => {
+    try {
+      const children = await listChildSessions(c.req.param('sessionId'));
+      return c.json({ children });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // POST /api/sessions/:sessionId/close — mark session as closed
+  app.post('/api/sessions/:sessionId/close', async (c) => {
+    try {
+      await closeSession(c.req.param('sessionId'));
+      return c.json({ status: 'closed' });
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }

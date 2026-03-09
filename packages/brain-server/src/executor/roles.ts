@@ -40,7 +40,7 @@ Environment variables available to you: JOB_ID (this job's unique ID), SESSION_I
 Do not modify files directly under /agent/projects/ or /agent/apps/ for code changes. Use workspace worktrees instead. Reading those directories for reference is fine.
 
 When you finish, provide a clear summary of what you accomplished, what files were changed, and any issues encountered.`,
-  defaultModules: ['memory', 'system-state'],
+  defaultModules: ['memory', 'system-state', 'goal-history'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 
@@ -74,7 +74,7 @@ Respond with a JSON object:
 }
 
 Be authentic to Jane's voice. Read the conversation context carefully.`,
-  defaultModules: ['conversation', 'semantic-facts', 'memory'],
+  defaultModules: ['conversation', 'semantic-facts', 'memory', 'parent-session'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 

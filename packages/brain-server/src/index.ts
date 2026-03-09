@@ -25,7 +25,7 @@ import { initMemoryRegistry } from './memory/registry.js';
 import { startConsolidator } from './memory/consolidator.js';
 import { initIngestionLog } from './memory/ingestion-log.js';
 import { startGraphitiIngestor } from './graphiti/ingestor.js';
-import { initExecutor, initContextSchema, initWorkspaceSchema, startWorkspaceCleanup } from './executor/index.js';
+import { initExecutor, initContextSchema, initWorkspaceSchema, initSessionsSchema, startWorkspaceCleanup } from './executor/index.js';
 import { initCommunication, startCommunication, stopCommunication } from './communication/index.js';
 
 const PORT = parseInt(process.env.PORT || '3103', 10);
@@ -50,6 +50,7 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     await initIngestionLog();
     await initContextSchema();
     await initWorkspaceSchema();
+    await initSessionsSchema();
     startWorkspaceCleanup();
     startConsolidator();
     await initCommunication();
