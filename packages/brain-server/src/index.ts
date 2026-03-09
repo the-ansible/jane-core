@@ -25,7 +25,7 @@ import { initMemoryRegistry } from './memory/registry.js';
 import { startConsolidator } from './memory/consolidator.js';
 import { initIngestionLog } from './memory/ingestion-log.js';
 import { startGraphitiIngestor } from './graphiti/ingestor.js';
-import { initExecutor, initContextSchema } from './executor/index.js';
+import { initExecutor, initContextSchema, initWorkspaceSchema, startWorkspaceCleanup } from './executor/index.js';
 
 const PORT = parseInt(process.env.PORT || '3103', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
@@ -48,6 +48,8 @@ serve({ fetch: app.fetch, port: PORT }, (info) => {
     await initMemoryRegistry();
     await initIngestionLog();
     await initContextSchema();
+    await initWorkspaceSchema();
+    startWorkspaceCleanup();
     startConsolidator();
   } catch (err) {
     log('error', 'Failed to initialize DB schemas', { error: String(err) });

@@ -27,6 +27,8 @@ import { createJob, markJobRunning, markJobDone, markJobFailed, updateHeartbeat 
 import { createWorktree, removeWorktree, createScratchDir, cleanupScratchDir } from '../jobs/worktree.js';
 import { getRole, buildRolePrompt } from './roles.js';
 import { assembleContext } from './context/index.js';
+import { ensureWorkspace, touchWorkspaceActivity } from './workspace.js';
+import type { WorkspaceInfo } from './workspace.js';
 
 // Adapters
 import claudeCodeAdapter from './adapters/claude-code.js';
@@ -146,8 +148,28 @@ export async function launchAgent(params: LaunchParams): Promise<LaunchResult> {
   let workdir = params.workdir ?? '/agent';
   let worktreePath: string | undefined;
   let scratchDir: string | undefined;
+  let sessionWorkspace: WorkspaceInfo | undefined;
 
-  if (params.projectPath) {
+  // Session workspace (persistent, shared across jobs in the session)
+  if (params.workspace && params.sessionId) {
+    try {
+      sessionWorkspace = await ensureWorkspace(params.sessionId, {
+        worktrees: params.worktrees,
+      });
+      workdir = sessionWorkspace.path;
+      log('info', 'Using session workspace', {
+        jobId,
+        sessionId: params.sessionId,
+        workspacePath: sessionWorkspace.path,
+        worktreeCount: sessionWorkspace.worktrees.length,
+      });
+    } catch (err) {
+      log('warn', 'Session workspace creation failed, falling back to /agent', {
+        jobId, error: String(err),
+      });
+    }
+  } else if (params.projectPath) {
+    // Legacy per-job worktree (ephemeral)
     try {
       worktreePath = await createWorktree(jobId, params.projectPath);
       workdir = worktreePath;
@@ -176,6 +198,7 @@ export async function launchAgent(params: LaunchParams): Promise<LaunchResult> {
     workdir,
     worktreePath,
     scratchDir,
+    sessionWorkspace,
     projectPath: params.projectPath,
     replySubject: params.replySubject,
     clientId: params.clientId,
@@ -199,6 +222,7 @@ async function dispatchAndPublish(params: {
   workdir: string;
   worktreePath?: string;
   scratchDir?: string;
+  sessionWorkspace?: WorkspaceInfo;
   projectPath?: string;
   replySubject?: string;
   clientId?: string;
@@ -233,12 +257,19 @@ async function dispatchAndPublish(params: {
     };
   }
 
-  // Cleanup isolation artifacts
-  if (params.worktreePath && params.projectPath) {
-    await removeWorktree(jobId, params.projectPath).catch(() => {});
+  // Cleanup isolation artifacts (skip for session workspaces — they persist)
+  if (!params.sessionWorkspace) {
+    if (params.worktreePath && params.projectPath) {
+      await removeWorktree(jobId, params.projectPath).catch(() => {});
+    }
+    if (params.scratchDir) {
+      cleanupScratchDir(jobId);
+    }
   }
-  if (params.scratchDir) {
-    cleanupScratchDir(jobId);
+
+  // Touch session workspace activity
+  if (params.sessionWorkspace) {
+    await touchWorkspaceActivity(params.sessionWorkspace.sessionId).catch(() => {});
   }
 
   // Update job status
@@ -363,6 +394,17 @@ export async function invokeAdapter(params: InvokeParams): Promise<AdapterResult
 export { getRole, registerRole, listRoles } from './roles.js';
 export { initContextSchema } from './context/index.js';
 export { getRunningProcessCount, getRunningProcessIds, killProcess, getLastActivity } from './adapters/claude-code.js';
+export {
+  initWorkspaceSchema,
+  ensureWorkspace,
+  getWorkspace,
+  listWorkspaces,
+  cleanupWorkspace,
+  cleanupStaleWorkspaces,
+  startWorkspaceCleanup,
+  stopWorkspaceCleanup,
+} from './workspace.js';
+export type { WorkspaceInfo, WorktreeInfo } from './workspace.js';
 export type { LaunchParams, LaunchResult, RuntimeConfig, RuntimeTool, AdapterResult } from './types.js';
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {

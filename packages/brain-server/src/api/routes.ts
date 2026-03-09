@@ -18,6 +18,10 @@
  *
  * POST /api/executor/invoke       — synchronous adapter call (no job tracking)
  *
+ * GET  /api/workspaces            — list active session workspaces
+ * GET  /api/workspaces/:sessionId — get workspace info
+ * POST /api/workspaces/:sessionId/cleanup — manually clean up a workspace
+ *
  * GET  /api/layers                — status of all 4 hierarchical layers
  * GET  /api/layers/:name          — status of a specific layer
  * GET  /api/layers/events         — recent cross-layer events
@@ -34,7 +38,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listJobs, getJob, killJob, createJob } from '../jobs/registry.js';
 import { killJobProcess, getRunningJobCount, getRunningJobIds, spawnAgent } from '../jobs/spawner.js';
-import { invokeAdapter } from '../executor/index.js';
+import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace } from '../executor/index.js';
 import type { JobRequest } from '../jobs/types.js';
 import {
   listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles,
@@ -613,6 +617,38 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         durationMs: result.durationMs,
         error: result.error,
       }, result.success ? 200 : 502);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Workspace routes
+  // -------------------------------------------------------------------------
+
+  app.get('/api/workspaces', async (c) => {
+    try {
+      const workspaces = await listWorkspaces();
+      return c.json({ workspaces });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/api/workspaces/:sessionId', async (c) => {
+    try {
+      const workspace = await getWorkspace(c.req.param('sessionId'));
+      if (!workspace) return c.json({ error: 'Workspace not found' }, 404);
+      return c.json(workspace);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/api/workspaces/:sessionId/cleanup', async (c) => {
+    try {
+      await cleanupWorkspace(c.req.param('sessionId'));
+      return c.json({ status: 'cleaned' });
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }
