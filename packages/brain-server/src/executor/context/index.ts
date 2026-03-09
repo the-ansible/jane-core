@@ -20,6 +20,7 @@ import semanticFactsModule from './modules/semantic-facts.js';
 import systemStateModule from './modules/system-state.js';
 import memoryModule from './modules/memory.js';
 import parentSessionModule from './modules/parent-session.js';
+import goalHistoryModule from './modules/goal-history.js';
 
 const MODULE_REGISTRY = new Map<string, ContextModule>([
   ['conversation', conversationModule],
@@ -27,6 +28,7 @@ const MODULE_REGISTRY = new Map<string, ContextModule>([
   ['system-state', systemStateModule],
   ['memory', memoryModule],
   ['parent-session', parentSessionModule],
+  ['goal-history', goalHistoryModule],
 ]);
 
 /**

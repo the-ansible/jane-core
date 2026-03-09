@@ -23,7 +23,7 @@ import { listActiveGoals, listExecutingGoalIds, touchGoalEvaluated, createGoalAc
 import { generateCandidates, scoreCandidates } from './candidates.js';
 import { buildReviewPrompt, parseReviewVerdict } from './reviewer.js';
 import { getRunningJobs, markJobFailed } from '../jobs/registry.js';
-import { launchAgent } from '../executor/index.js';
+import { launchAgent, registerSession } from '../executor/index.js';
 import type { CandidateAction } from './types.js';
 import type { JobResult } from '../jobs/types.js';
 import { recordGoalCycleMemory } from '../memory/recorder.js';
@@ -248,16 +248,24 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     // 7. Launch executor agent for the action
     const executionPrompt = buildExecutionPrompt(best, goals.find((g) => g.id === best.goalId)?.description ?? '');
 
+    // Establish goal session hierarchy: goal has a persistent session; each action
+    // gets a child session. The goal-history context module uses this to provide
+    // the action agent with prior attempt history.
+    const goalSessionId = best.goalId; // Use goal UUID as its stable session ID
+    const actionSessionId = crypto.randomUUID();
+    await registerSession(goalSessionId, undefined, { type: 'goal', goalId: goalSessionId }).catch(() => {});
+    await registerSession(actionSessionId, goalSessionId, { type: 'goal-action', goalId: goalSessionId, cycleId }).catch(() => {});
+
     const launchResult = await launchAgent({
       role: 'executor',
       prompt: executionPrompt,
       runtime: { tool: 'claude-code', model: 'sonnet' },
       jobType: 'task',
       context: [context],
+      sessionId: actionSessionId,
       // Session workspace for actions that need code isolation
       ...(best.needsWorkspace ? {
         workspace: true,
-        sessionId: cycleId, // Use cycle ID as session scope
         worktrees: best.projectPaths,
       } : {}),
     });
@@ -631,11 +639,17 @@ Evaluate the current state, then execute or continue as needed. Use the tools av
 
 When complete, summarize what you accomplished and what changed.`;
 
+  // Register a new child session for the restart, inheriting from the goal's session
+  const restartSessionId = crypto.randomUUID();
+  await registerSession(goalId, undefined, { type: 'goal', goalId }).catch(() => {});
+  await registerSession(restartSessionId, goalId, { type: 'goal-action-restart', goalId }).catch(() => {});
+
   const restartResult = await launchAgent({
     role: 'executor',
     prompt: restartPrompt,
     runtime: { tool: 'claude-code', model: 'sonnet' },
     jobType: 'task',
+    sessionId: restartSessionId,
   });
 
   const newJobId = restartResult.jobId;
