@@ -412,6 +412,7 @@ export {
   stopWorkspaceCleanup,
 } from './workspace.js';
 export type { WorkspaceInfo, WorktreeInfo } from './workspace.js';
+export { initSessionsSchema, registerSession, getParentSessionId, getSession } from './sessions.js';
 export type { LaunchParams, LaunchResult, RuntimeConfig, RuntimeTool, AdapterResult } from './types.js';
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {

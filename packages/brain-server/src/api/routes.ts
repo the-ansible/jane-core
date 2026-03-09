@@ -40,7 +40,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listJobs, getJob, killJob } from '../jobs/registry.js';
-import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace, getRunningProcessCount, getRunningProcessIds, killProcess, launchAgent } from '../executor/index.js';
+import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace, getRunningProcessCount, getRunningProcessIds, killProcess, launchAgent, registerSession } from '../executor/index.js';
 import { assembleContext } from '../executor/context/index.js';
 import type { JobType } from '../jobs/types.js';
 import {
@@ -695,11 +695,15 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       const body = await c.req.json() as {
         sessionId?: string;
         worktrees?: string[];
+        parentSessionId?: string;
       };
 
       if (!body.sessionId) {
         return c.json({ error: 'sessionId is required' }, 400);
       }
+
+      // Register session (with optional parent) for context inheritance
+      await registerSession(body.sessionId, body.parentSessionId).catch(() => {});
 
       // Validate worktree paths exist and are git repos
       const validWorktrees = (body.worktrees ?? []).filter(p => {
@@ -723,6 +727,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
           path: wt.path,
           branch: wt.branch,
         })),
+        parentSessionId: body.parentSessionId,
       }, 201);
     } catch (err) {
       return c.json({ error: String(err) }, 500);

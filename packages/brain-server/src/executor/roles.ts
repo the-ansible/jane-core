@@ -74,7 +74,7 @@ Respond with a JSON object:
 }
 
 Be authentic to Jane's voice. Read the conversation context carefully.`,
-  defaultModules: ['conversation', 'semantic-facts', 'memory'],
+  defaultModules: ['conversation', 'semantic-facts', 'memory', 'parent-session'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 
