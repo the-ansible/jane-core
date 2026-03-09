@@ -37,10 +37,9 @@ import { streamSSE } from 'hono/streaming';
 import { serveStatic } from '@hono/node-server/serve-static';
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
-import { listJobs, getJob, killJob, createJob } from '../jobs/registry.js';
-import { killJobProcess, getRunningJobCount, getRunningJobIds, spawnAgent } from '../jobs/spawner.js';
-import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace } from '../executor/index.js';
-import type { JobRequest } from '../jobs/types.js';
+import { listJobs, getJob, killJob } from '../jobs/registry.js';
+import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace, getRunningProcessCount, getRunningProcessIds, killProcess, launchAgent } from '../executor/index.js';
+import type { JobType } from '../jobs/types.js';
 import {
   listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles,
 } from '../goals/registry.js';
@@ -85,8 +84,8 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
 
   app.get('/metrics', (c) => {
     return c.json({
-      runningJobs: getRunningJobCount(),
-      runningJobIds: getRunningJobIds(),
+      runningJobs: getRunningProcessCount(),
+      runningJobIds: getRunningProcessIds(),
       uptimeMs: Date.now() - startTime,
       ts: new Date().toISOString(),
     });
@@ -116,40 +115,44 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     if (!deps.nats) return c.json({ error: 'NATS not connected — try again in a moment' }, 503);
 
     try {
-      const body = await c.req.json() as Partial<JobRequest>;
+      const body = await c.req.json() as {
+        prompt?: string;
+        type?: JobType;
+        role?: string;
+        runtime?: { tool: string; model: string };
+        context?: Record<string, unknown>;
+        replySubject?: string;
+        workdir?: string;
+        projectPath?: string;
+        clientId?: string;
+        sessionId?: string;
+        workspace?: boolean;
+        worktrees?: string[];
+      };
 
       if (!body.prompt || typeof body.prompt !== 'string') {
         return c.json({ error: 'prompt is required' }, 400);
       }
 
-      const request: JobRequest = {
-        type: body.type ?? 'task',
+      const result = await launchAgent({
+        role: body.role ?? 'executor',
         prompt: body.prompt,
-        context: body.context,
+        runtime: {
+          tool: (body.runtime?.tool as any) ?? 'claude-code',
+          model: (body.runtime?.model as string) ?? 'sonnet',
+        },
+        jobType: body.type ?? 'task',
+        sessionId: body.sessionId,
         replySubject: body.replySubject,
+        clientId: body.clientId,
         workdir: body.workdir,
         projectPath: body.projectPath,
-        clientId: body.clientId,
-      };
-
-      const jobId = await createJob({
-        jobType: request.type,
-        prompt: request.prompt,
-        contextJson: request.context ?? {},
-        natsReplySubject: request.replySubject,
+        workspace: body.workspace,
+        worktrees: body.worktrees,
+        context: body.context ? [JSON.stringify(body.context)] : undefined,
       });
 
-      spawnAgent({ jobId, request, nats: deps.nats }).catch((err) => {
-        console.log(JSON.stringify({
-          level: 'error',
-          msg: 'Failed to spawn agent from HTTP',
-          jobId,
-          error: String(err),
-          ts: new Date().toISOString(),
-        }));
-      });
-
-      return c.json({ jobId, status: 'queued' }, 201);
+      return c.json({ jobId: result.jobId, sessionId: result.sessionId, status: 'queued' }, 201);
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }
@@ -165,7 +168,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         return c.json({ error: `Job is not running (status: ${job.status})` }, 400);
       }
 
-      const killed = killJobProcess(jobId);
+      const killed = killProcess(jobId);
       const { pid } = await killJob(jobId);
 
       if (!killed && pid) {
@@ -714,8 +717,8 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
             cycles: cyclesResult,
             cycleRunning: isCycleActive(),
             metrics: {
-              runningJobs: getRunningJobCount(),
-              runningJobIds: getRunningJobIds(),
+              runningJobs: getRunningProcessCount(),
+              runningJobIds: getRunningProcessIds(),
               uptimeMs: Date.now() - startTime,
               ts: new Date().toISOString(),
             },

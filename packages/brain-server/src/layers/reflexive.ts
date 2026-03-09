@@ -17,8 +17,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { LayerStatus } from './types.js';
 import { recordLayerEvent } from './registry.js';
-import { createJob } from '../jobs/registry.js';
-import { spawnAgent } from '../jobs/spawner.js';
+import { launchAgent } from '../executor/index.js';
 
 const sc = StringCodec();
 
@@ -246,24 +245,21 @@ async function escalateToCognitive(
     ts: new Date().toISOString(),
   });
 
-  // Spawn a cognitive job to investigate
+  // Launch an investigator agent to handle the escalation
   try {
     const prompt = buildEscalationPrompt(reason, context);
-    const jobId = await createJob({
-      jobType: 'task',
+
+    const result = await launchAgent({
+      role: 'investigator',
       prompt,
-      contextJson: { source: 'reflexive-escalation', ...context },
+      runtime: { tool: 'claude-code', model: 'sonnet' },
+      jobType: 'task',
+      context: [JSON.stringify({ source: 'reflexive-escalation', ...context })],
     });
 
-    spawnAgent({
-      jobId,
-      request: { type: 'task', prompt, context: { source: 'reflexive-escalation', ...context } },
-      nats,
-    }).catch((err) => log('error', 'Failed to spawn escalation job', { error: String(err) }));
-
-    log('info', 'Escalated to cognitive layer', { reason, jobId });
+    log('info', 'Escalated to cognitive layer', { reason, jobId: result.jobId });
   } catch (err) {
-    log('error', 'Failed to create escalation job', { error: String(err) });
+    log('error', 'Failed to launch escalation agent', { error: String(err) });
   }
 }
 

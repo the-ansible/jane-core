@@ -11,7 +11,7 @@
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { getRunningJobs, markJobUnresponsive } from './registry.js';
-import { getLastActivity } from './spawner.js';
+import { getLastActivity } from '../executor/index.js';
 import { failExecutingGoalActionByJobId } from '../goals/registry.js';
 import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
 import type { JobAlert } from './types.js';

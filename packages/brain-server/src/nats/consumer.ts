@@ -7,8 +7,6 @@
 
 import type { NatsConnection, Subscription } from 'nats';
 import { StringCodec } from 'nats';
-import { createJob } from '../jobs/registry.js';
-import { spawnAgent } from '../jobs/spawner.js';
 import { launchAgent } from '../executor/index.js';
 import type { JobRequest } from '../jobs/types.js';
 import type { RuntimeTool } from '../executor/types.js';
@@ -79,45 +77,27 @@ export function startConsumer(nats: NatsConnection): void {
         // Fall back to msg.reply (NATS request/reply inbox) if no explicit replySubject
         const replySubject = request.replySubject ?? msg.reply;
 
-        // Route through executor if role or runtime specified, otherwise legacy path
-        if (request.role || request.runtime) {
-          const runtimeTool = (request.runtime?.tool as RuntimeTool) ?? 'claude-code';
-          const runtimeModel = (request.runtime?.model as string) ?? 'sonnet';
+        const runtimeTool = (request.runtime?.tool as RuntimeTool) ?? 'claude-code';
+        const runtimeModel = (request.runtime?.model as string) ?? 'sonnet';
 
-          launchAgent({
-            sessionId: request.sessionId,
-            role: request.role ?? 'executor',
-            prompt: request.prompt,
-            runtime: { tool: runtimeTool, model: runtimeModel },
-            jobType,
-            replySubject,
-            clientId: request.clientId,
-            workdir: request.workdir,
-            projectPath: request.projectPath,
-            context: request.context ? [JSON.stringify(request.context)] : undefined,
-            workspace: request.workspace,
-            worktrees: request.worktrees,
-          }).then(result => {
-            log('info', 'Job launched via executor', { jobId: result.jobId, role: request.role, runtime: runtimeTool });
-          }).catch(err => {
-            log('error', 'Failed to launch via executor', { error: String(err) });
-          });
-        } else {
-          // Legacy path: direct spawn without executor
-          const requestWithReply: JobRequest = { ...request, replySubject };
-          const jobId = await createJob({
-            jobType,
-            prompt: request.prompt,
-            contextJson: request.context ?? {},
-            natsReplySubject: replySubject,
-          });
-
-          log('info', 'Job queued (legacy)', { jobId, type: jobType, replySubject });
-
-          spawnAgent({ jobId, request: requestWithReply, nats }).catch((err) => {
-            log('error', 'Failed to spawn agent', { jobId, error: String(err) });
-          });
-        }
+        launchAgent({
+          sessionId: request.sessionId,
+          role: request.role ?? 'executor',
+          prompt: request.prompt,
+          runtime: { tool: runtimeTool, model: runtimeModel },
+          jobType,
+          replySubject,
+          clientId: request.clientId,
+          workdir: request.workdir,
+          projectPath: request.projectPath,
+          context: request.context ? [JSON.stringify(request.context)] : undefined,
+          workspace: request.workspace,
+          worktrees: request.worktrees,
+        }).then(result => {
+          log('info', 'Job launched', { jobId: result.jobId, role: request.role ?? 'executor', runtime: runtimeTool });
+        }).catch(err => {
+          log('error', 'Failed to launch agent', { error: String(err) });
+        });
       } catch (err) {
         log('error', 'Error processing job request', { error: String(err) });
       }
