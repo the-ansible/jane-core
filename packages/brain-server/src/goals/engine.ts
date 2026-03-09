@@ -254,6 +254,12 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
       runtime: { tool: 'claude-code', model: 'sonnet' },
       jobType: 'task',
       context: [context],
+      // Session workspace for actions that need code isolation
+      ...(best.needsWorkspace ? {
+        workspace: true,
+        sessionId: cycleId, // Use cycle ID as session scope
+        worktrees: best.projectPaths,
+      } : {}),
     });
 
     const jobId = launchResult.jobId;
@@ -370,6 +376,23 @@ async function persistRejectedCandidates(candidates: CandidateAction[], cycleId:
 }
 
 function buildExecutionPrompt(action: CandidateAction, goalDescription: string): string {
+  const workspaceInstructions = action.needsWorkspace
+    ? `\n## Workspace
+You are running in a session workspace. Your working directory is an isolated workspace with:
+- Symlinked project config (.claude, CLAUDE.md, INNER_VOICE.md, etc.)
+${action.projectPaths?.length ? `- Git worktrees for: ${action.projectPaths.map(p => p.split('/').pop()).join(', ')}` : '- No git worktrees (request one if needed)'}
+
+Work within your workspace. Commit changes to the worktree branch when done.
+Do NOT modify files directly under /agent/projects/ or /agent/apps/.`
+    : `\n## Workspace
+You are running in /agent (shared workspace). If this action requires code changes or file isolation, you can provision a workspace mid-task:
+
+  curl -s -X POST http://localhost:3103/api/workspaces/provision \\
+    -H 'Content-Type: application/json' \\
+    -d '{"sessionId":"<your-job-id>","worktrees":["/agent/projects/jane-core"]}'
+
+This creates /agent/sessions/<sessionId>/ with git worktrees. Then cd into it and work there.`;
+
   return `You are Jane, an AI assistant working autonomously to advance your goals.
 
 ## Goal
@@ -380,16 +403,18 @@ ${action.description}
 
 ## Rationale
 ${action.rationale}
+${workspaceInstructions}
 
 ## Instructions
 Execute this action now. Use the tools available to you:
-- Read and write files in /agent/
+- Read and write files
 - Run bash commands for system tasks
 - Update documentation and status files
-- Make concrete progress — don't just plan, do
+- Make concrete progress, don't just plan, do
 
 When complete, summarize what you accomplished and what changed.`;
 }
+
 
 /**
  * Subscribe to the result of a specific execution job.

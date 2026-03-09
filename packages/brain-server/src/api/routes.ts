@@ -20,6 +20,7 @@
  *
  * GET  /api/workspaces            — list active session workspaces
  * GET  /api/workspaces/:sessionId — get workspace info
+ * POST /api/workspaces/provision         — create/ensure a session workspace (mid-task self-provisioning)
  * POST /api/workspaces/:sessionId/cleanup — manually clean up a workspace
  *
  * GET  /api/layers                — status of all 4 hierarchical layers
@@ -38,7 +39,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listJobs, getJob, killJob, createJob } from '../jobs/registry.js';
 import { killJobProcess, getRunningJobCount, getRunningJobIds, spawnAgent } from '../jobs/spawner.js';
-import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace } from '../executor/index.js';
+import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWorkspace } from '../executor/index.js';
 import type { JobRequest } from '../jobs/types.js';
 import {
   listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles,
@@ -630,6 +631,46 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     try {
       const workspaces = await listWorkspaces();
       return c.json({ workspaces });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // POST /api/workspaces/provision — self-provision a workspace mid-task
+  app.post('/api/workspaces/provision', async (c) => {
+    try {
+      const body = await c.req.json() as {
+        sessionId?: string;
+        worktrees?: string[];
+      };
+
+      if (!body.sessionId) {
+        return c.json({ error: 'sessionId is required' }, 400);
+      }
+
+      // Validate worktree paths exist and are git repos
+      const validWorktrees = (body.worktrees ?? []).filter(p => {
+        try {
+          const { existsSync } = require('node:fs');
+          return existsSync(p) && existsSync(`${p}/.git`);
+        } catch {
+          return false;
+        }
+      });
+
+      const workspace = await ensureWorkspace(body.sessionId, {
+        worktrees: validWorktrees.length > 0 ? validWorktrees : undefined,
+      });
+
+      return c.json({
+        sessionId: workspace.sessionId,
+        path: workspace.path,
+        worktrees: workspace.worktrees.map(wt => ({
+          name: wt.name,
+          path: wt.path,
+          branch: wt.branch,
+        })),
+      }, 201);
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }

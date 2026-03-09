@@ -53,6 +53,10 @@ export interface JobRequest {
   role?: string;
   /** Runtime config override (executor integration) */
   runtime?: { tool: string; model: string; [key: string]: unknown };
+  /** Request a persistent session workspace */
+  workspace?: boolean;
+  /** Git repos to checkout as worktrees in the workspace */
+  worktrees?: string[];
 }
 
 /** Published on completion to the replySubject */

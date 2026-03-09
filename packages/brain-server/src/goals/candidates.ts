@@ -58,9 +58,13 @@ Respond ONLY with a JSON array, no markdown, no explanation:
   {
     "goalTitle": "exact title of the primary goal this advances",
     "description": "specific action to take",
-    "rationale": "why this action advances the goal"
+    "rationale": "why this action advances the goal",
+    "needsWorkspace": false,
+    "projectPaths": []
   }
-]`;
+]
+
+Set "needsWorkspace": true if this action involves code changes, file edits to source projects, or any work that should happen in an isolated git worktree. Set "projectPaths" to the project directories needing worktrees (e.g. ["/agent/projects/jane-core"]). For research, analysis, documentation-only, or system admin tasks, set both to false/[].`;
 
   try {
     const raw = await claudeGenerate(prompt);
@@ -79,6 +83,8 @@ Respond ONLY with a JSON array, no markdown, no explanation:
         goalTitle: goal.title,
         description: String(item.description),
         rationale: String(item.rationale ?? ''),
+        needsWorkspace: item.needsWorkspace === true,
+        projectPaths: Array.isArray(item.projectPaths) ? item.projectPaths.filter((p: unknown) => typeof p === 'string') : [],
       }];
     });
   } catch (err) {

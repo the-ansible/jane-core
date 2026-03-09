@@ -95,6 +95,8 @@ export function startConsumer(nats: NatsConnection): void {
             workdir: request.workdir,
             projectPath: request.projectPath,
             context: request.context ? [JSON.stringify(request.context)] : undefined,
+            workspace: request.workspace,
+            worktrees: request.worktrees,
           }).then(result => {
             log('info', 'Job launched via executor', { jobId: result.jobId, role: request.role, runtime: runtimeTool });
           }).catch(err => {

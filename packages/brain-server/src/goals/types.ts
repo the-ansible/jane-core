@@ -57,4 +57,8 @@ export interface CandidateAction {
   description: string;
   rationale: string;
   score?: number;
+  /** Whether this action requires an isolated session workspace (code changes, file edits) */
+  needsWorkspace?: boolean;
+  /** Project paths to checkout as git worktrees in the workspace */
+  projectPaths?: string[];
 }
