@@ -30,10 +30,12 @@ If you are running in /agent (shared root) and your task requires code changes o
 
   curl -s -X POST http://localhost:3103/api/workspaces/provision \\
     -H 'Content-Type: application/json' \\
-    -d '{"sessionId":"<use-your-JOB_ID-env-var>","worktrees":["/agent/projects/jane-core"]}'
+    -d '{"sessionId":"'$SESSION_ID'","worktrees":["/agent/projects/jane-core"]}'
 
 This returns {"path":"/agent/sessions/<id>/","worktrees":[{"name":"jane-core","path":"...","branch":"..."}]}.
 Then work inside that workspace directory.
+
+Environment variables available to you: JOB_ID (this job's unique ID), SESSION_ID (session scope for workspace sharing), NATS_URL.
 
 Do not modify files directly under /agent/projects/ or /agent/apps/ for code changes. Use workspace worktrees instead. Reading those directories for reference is fine.
 
@@ -173,9 +175,10 @@ If you need a workspace and don't have one, provision it:
 
   curl -s -X POST http://localhost:3103/api/workspaces/provision \\
     -H 'Content-Type: application/json' \\
-    -d '{"sessionId":"<use-your-JOB_ID-env-var>","worktrees":["/agent/projects/jane-core"]}'
+    -d '{"sessionId":"'$SESSION_ID'","worktrees":["/agent/projects/jane-core"]}'
 
-Work in the returned workspace path. Commit to the worktree branch.`,
+Work in the returned workspace path. Commit to the worktree branch.
+Environment variables available: JOB_ID, SESSION_ID, NATS_URL.`,
   defaultModules: ['memory'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });

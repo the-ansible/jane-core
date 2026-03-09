@@ -195,6 +195,7 @@ export async function launchAgent(params: LaunchParams): Promise<LaunchResult> {
     prompt,
     runtime,
     jobId,
+    sessionId: params.sessionId,
     workdir,
     worktreePath,
     scratchDir,
@@ -219,6 +220,7 @@ async function dispatchAndPublish(params: {
   prompt: string;
   runtime: LaunchParams['runtime'];
   jobId: string;
+  sessionId?: string;
   workdir: string;
   worktreePath?: string;
   scratchDir?: string;
@@ -233,15 +235,20 @@ async function dispatchAndPublish(params: {
   let result: AdapterResult;
 
   try {
+    const env: Record<string, string> = {
+      JOB_ID: jobId,
+      NATS_URL: process.env.NATS_URL || 'nats://life-system-nats:4222',
+    };
+    if (params.sessionId) {
+      env.SESSION_ID = params.sessionId;
+    }
+
     result = await adapter.execute({
       prompt,
       runtime,
       jobId,
       workdir,
-      env: {
-        JOB_ID: jobId,
-        NATS_URL: process.env.NATS_URL || 'nats://life-system-nats:4222',
-      },
+      env,
       onActivity: () => {
         updateHeartbeat(jobId).catch(() => {});
       },

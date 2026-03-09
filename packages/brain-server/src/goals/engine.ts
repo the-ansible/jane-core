@@ -389,9 +389,10 @@ You are running in /agent (shared workspace). If this action requires code chang
 
   curl -s -X POST http://localhost:3103/api/workspaces/provision \\
     -H 'Content-Type: application/json' \\
-    -d '{"sessionId":"<your-job-id>","worktrees":["/agent/projects/jane-core"]}'
+    -d '{"sessionId":"'$SESSION_ID'","worktrees":["/agent/projects/jane-core"]}'
 
-This creates /agent/sessions/<sessionId>/ with git worktrees. Then cd into it and work there.`;
+This creates /agent/sessions/$SESSION_ID/ with git worktrees. Then cd into it and work there.
+Your SESSION_ID and JOB_ID are available as environment variables.`;
 
   return `You are Jane, an AI assistant working autonomously to advance your goals.
 

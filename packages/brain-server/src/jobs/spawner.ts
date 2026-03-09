@@ -94,6 +94,7 @@ export async function spawnAgent(params: {
     JOB_ID: jobId,
     NATS_URL: process.env.NATS_URL || 'nats://life-system-nats:4222',
   };
+  if (request.sessionId) additionalEnv.SESSION_ID = request.sessionId;
   if (scratchDir) additionalEnv.SCRATCH_DIR = scratchDir;
 
   const startedAt = Date.now();
