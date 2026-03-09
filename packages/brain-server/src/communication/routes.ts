@@ -225,7 +225,7 @@ export function createCommRoutes(deps: CommRouteDeps): Hono {
     const interactiveSessionId = `interactive-${sessionId}`;
 
     if (hookEvent === 'UserPromptSubmit') {
-      const prompt = body.user_prompt as string;
+      const prompt = (body.prompt ?? body.user_prompt) as string;
       if (!prompt) return c.json({ skipped: true, reason: 'empty prompt' });
 
       const now = new Date().toISOString();
