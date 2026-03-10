@@ -22,6 +22,7 @@ import { StringCodec } from 'nats';
 import { listActiveGoals, listExecutingGoalIds, touchGoalEvaluated, createGoalAction, updateGoalAction, updateGoal, getGoal, getGoalAction, createCycle, completeCycle, failCycle, listCycles, recoverStaleGoalActions, failExecutingGoalActionByJobId, listRecentDoneActionsPerGoal, listCompletedActionsForGoal, countReviewedUnachievedActions, listGoalActions, listRecentCompletedActionsGlobal } from './registry.js';
 import { generateCandidates, scoreCandidates, selectBestCandidate } from './candidates.js';
 import { buildReviewPrompt, parseReviewVerdict } from './reviewer.js';
+import { emitScoringMetrics } from './metrics.js';
 import { getRunningJobs, markJobFailed } from '../jobs/registry.js';
 import { launchAgent, registerSession } from '../executor/index.js';
 import type { CandidateAction } from './types.js';
@@ -225,6 +226,10 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
 
     // 5. Select best — picks highest-scoring candidate, breaks ties by goal priority
     const best = selectBestCandidate(scored, goals);
+
+    // Emit per-candidate scoring metrics to the NDJSON log for analysis
+    emitScoringMetrics(cycleId, scored, best);
+
     if (!best) {
       for (const g of goals) await touchGoalEvaluated(g.id);
       await completeCycle(cycleId, goals.length, candidates.length, null, 'No candidates after scoring');
