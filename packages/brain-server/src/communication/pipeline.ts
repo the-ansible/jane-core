@@ -31,6 +31,8 @@ import { assembleContext } from './context/assembler.js';
 import { updateAssemblyOutcome } from './context/db.js';
 import { compactAndIngest, searchMemory } from './graphiti.js';
 import { detectHallucinations } from './hallucination-detector.js';
+import { analyzeClarification } from './clarifier.js';
+import { formatWithConfidenceBadges } from './response-formatter.js';
 
 const sc = StringCodec();
 
@@ -246,17 +248,20 @@ async function handleAgentResponse(
   completeStage(runId, 'composer', `${composerMs}ms`);
   setRunOutputs(runId, { composerOutput: composedMessage });
 
-  // 5.5 Hallucination detection (fire-and-forget, non-blocking)
-  // Runs in background — annotates composedMessage if low-confidence claims found.
+  // 5.5 Hallucination detection + response formatting (non-blocking, 8s budget)
+  // Detects factual claims, verifies them, then formats the message with
+  // per-claim confidence badges (✅ verified / ⚠️ uncertain / 🚨 low confidence).
   let finalMessage = composedMessage;
   try {
-    const { annotatedMessage } = await Promise.race([
+    const nullDetector = { report: { messageId: event.id, timestamp: new Date().toISOString(), claimsFound: 0, claimsVerified: 0, overallConfidence: 100, flagged: false, results: [] }, annotatedMessage: composedMessage };
+    const { report } = await Promise.race([
       detectHallucinations(composedMessage, event.id),
-      new Promise<{ annotatedMessage: string }>((resolve) =>
-        setTimeout(() => resolve({ annotatedMessage: composedMessage }), 8_000)
+      new Promise<typeof nullDetector>((resolve) =>
+        setTimeout(() => resolve(nullDetector), 8_000)
       ),
     ]);
-    finalMessage = annotatedMessage;
+    // Apply the formatting layer: per-claim badges + verification section
+    finalMessage = formatWithConfidenceBadges(composedMessage, report);
   } catch {
     // Non-blocking: any error falls back to original message
     finalMessage = composedMessage;
