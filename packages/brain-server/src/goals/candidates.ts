@@ -3,14 +3,15 @@
  *
  * - Generation: given goals + context, produce actionable next steps
  * - Scoring: rate each candidate against the full goal set
- *
- * Primary: Claude CLI via claude-launcher (subprocess).
- * Fallback: Mercury API (instant reasoning) when CLI subprocess fails.
+ * - Selection: pick the highest-scoring candidate; break ties by goal priority
  */
 
 import { invokeAdapter } from '../executor/index.js';
 import type { Goal, CandidateAction, ScoreBreakdown } from './types.js';
 import { computeCompositeScore } from './types.js';
+
+// Candidates within this score band are considered tied; goal priority breaks the tie.
+const TIE_THRESHOLD = 0.5;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -171,6 +172,38 @@ Respond ONLY with a JSON array, one object per candidate, in the same order:
     log('warn', 'Candidate scoring failed', { error: String(err) });
     return applyDefaultScores(candidates);
   }
+}
+
+/**
+ * Select the best candidate from a scored, sorted array.
+ *
+ * Candidates within TIE_THRESHOLD score points of the leader are considered
+ * tied. Within a tie group, the candidate targeting the highest-priority goal
+ * wins. Falls back to the raw sort order when priorities are equal.
+ *
+ * @param scored - Candidates sorted descending by composite score (output of scoreCandidates)
+ * @param goals  - Active goals (used to resolve goal priorities for tiebreaking)
+ */
+export function selectBestCandidate(
+  scored: CandidateAction[],
+  goals: Goal[],
+): CandidateAction | null {
+  if (scored.length === 0) return null;
+
+  const best = scored[0];
+  const bestScore = best.score ?? 0;
+
+  // Collect all candidates tied with the best
+  const tied = scored.filter((c) => bestScore - (c.score ?? 0) <= TIE_THRESHOLD);
+  if (tied.length === 1) return tied[0];
+
+  // Break ties by goal priority (higher = more important)
+  const priorityMap = new Map(goals.map((g) => [g.id, g.priority]));
+  return tied.reduce((winner, c) => {
+    const wPriority = priorityMap.get(winner.goalId) ?? 50;
+    const cPriority = priorityMap.get(c.goalId) ?? 50;
+    return cPriority > wPriority ? c : winner;
+  }, tied[0]);
 }
 
 function clamp(n: number): number {
