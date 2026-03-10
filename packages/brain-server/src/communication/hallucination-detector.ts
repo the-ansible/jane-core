@@ -24,6 +24,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readCalibration } from './retraining-pipeline.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -84,8 +85,21 @@ const OLLAMA_TIMEOUT_MS = 15_000;
 const WOLFRAM_TIMEOUT_MS = 10_000;
 const WIKIPEDIA_TIMEOUT_MS = 8_000;
 
-/** Flag the message if overall confidence falls below this threshold */
-const CONFIDENCE_FLAG_THRESHOLD = 60;
+/** Flag the message if overall confidence falls below this threshold (baseline — may be overridden by calibration). */
+const DEFAULT_CONFIDENCE_FLAG_THRESHOLD = 60;
+
+/** Get the active confidence flag threshold, preferring calibrated value if available. */
+function getConfidenceFlagThreshold(): number {
+  try {
+    const cal = readCalibration();
+    if (cal?.thresholds?.lowConfidenceThreshold !== undefined) {
+      return cal.thresholds.lowConfidenceThreshold;
+    }
+  } catch {
+    // Fall through to default
+  }
+  return DEFAULT_CONFIDENCE_FLAG_THRESHOLD;
+}
 
 /** Maximum claims to verify per message (avoid excessive API calls) */
 const MAX_CLAIMS_TO_VERIFY = 5;
@@ -295,15 +309,38 @@ Where confidence is how confident you are the claim is accurate (100 = definitel
 // Ollama self-check verification
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a few-shot correction section from calibration data.
+ * Returns an empty string if no calibration or no correction examples exist.
+ * Injects at most 3 examples to keep prompts short.
+ */
+function buildFewShotSection(): string {
+  try {
+    const cal = readCalibration();
+    if (!cal?.correctionExamples?.length) return '';
+    const examples = cal.correctionExamples.slice(0, 3);
+    const lines = examples.map(
+      (ex, i) =>
+        `Example ${i + 1}: Claim was "${ex.claim}" — this was INCORRECT. The correct answer is: "${ex.correction}". Confidence should have been low.`,
+    );
+    return `\nKnown past corrections (use these to calibrate your confidence):\n${lines.join('\n')}\n`;
+  } catch {
+    return '';
+  }
+}
+
 async function verifyWithOllamaSelfCheck(
   claim: string,
   category: FactualClaim['category'],
 ): Promise<ClaimVerificationResult> {
+  // Inject few-shot examples from calibration to improve accuracy
+  const fewShotSection = buildFewShotSection();
+
   const prompt = `Fact-check the following claim. Return ONLY a JSON object with:
 {"confidence": <0-100>, "note": "<brief explanation>"}
 
 Where confidence is how confident you are the claim is accurate (100 = definitely correct, 0 = definitely wrong, 50 = uncertain/can't verify).
-
+${fewShotSection}
 Claim: "${claim}"`;
 
   try {
@@ -525,24 +562,52 @@ export async function detectHallucinations(
       return nullResult();
     }
 
-    log('info', 'Claims extracted, verifying', { messageId, count: claims.length });
+    // 2b. Short-circuit known-good claims from calibration cache
+    const calibration = (() => {
+      try { return readCalibration(); } catch { return null; }
+    })();
+    const confirmedSet = new Set<string>(calibration?.confirmedCorrectClaims ?? []);
 
-    // 3. Verify all claims in parallel (each claim runs primary + Wikipedia internally)
-    const results = await Promise.all(claims.map(verifyClaim));
+    const claimsToVerify = claims.filter(c => !confirmedSet.has(c.text));
+    const skippedCached: ClaimVerificationResult[] = claims
+      .filter(c => confirmedSet.has(c.text))
+      .map(c => ({
+        claim: c.text,
+        category: c.category,
+        confidence: 95, // Known-good from user feedback
+        source: 'skipped' as const,
+        note: 'Confirmed correct by prior user feedback',
+      }));
 
-    // 4. Aggregate confidence — a claim counts as verified if primary ran OR Wikipedia found content
-    const verified = results.filter(r => r.source !== 'skipped' || (r.wikipedia?.found ?? false));
-    const overallConfidence = verified.length > 0
-      ? Math.round(verified.reduce((sum, r) => sum + r.confidence, 0) / verified.length)
+    if (skippedCached.length > 0) {
+      log('info', 'Claims skipped via confirmed-correct cache', {
+        messageId,
+        skipped: skippedCached.length,
+        toVerify: claimsToVerify.length,
+      });
+    }
+
+    log('info', 'Claims extracted, verifying', { messageId, count: claimsToVerify.length });
+
+    // 3. Verify remaining claims in parallel
+    const verified_results = await Promise.all(claimsToVerify.map(verifyClaim));
+    const results = [...skippedCached, ...verified_results];
+
+    // 4. Aggregate confidence
+    const verified = results.filter(r => r.source !== 'skipped' || r.note?.includes('user feedback'));
+    const allResults = results;
+    const overallConfidence = allResults.length > 0
+      ? Math.round(allResults.reduce((sum, r) => sum + r.confidence, 0) / allResults.length)
       : 100;
 
-    const flagged = overallConfidence < CONFIDENCE_FLAG_THRESHOLD;
+    const confidenceFlagThreshold = getConfidenceFlagThreshold();
+    const flagged = overallConfidence < confidenceFlagThreshold;
 
     const report: HallucinationReport = {
       messageId,
       timestamp,
       claimsFound: claims.length,
-      claimsVerified: verified.length,
+      claimsVerified: verified_results.length,
       overallConfidence,
       flagged,
       results,

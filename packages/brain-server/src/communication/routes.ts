@@ -32,6 +32,11 @@ import {
   getFeedbackSummary,
   type UserVerdict,
 } from './feedback-collector.js';
+import {
+  runRetrainingPipeline,
+  getRetrainingStatus,
+  readCalibration,
+} from './retraining-pipeline.js';
 
 const sc = StringCodec();
 
@@ -592,6 +597,38 @@ export function createCommRoutes(deps: CommRouteDeps): Hono {
     const messageId = c.req.param('messageId');
     const entries = getFeedbackForMessage(messageId);
     return c.json({ messageId, entries, count: entries.length });
+  });
+
+  // --- Retraining pipeline ---
+
+  /**
+   * GET /api/communication/retraining/status
+   * Returns the scheduler status and last run result.
+   */
+  app.get('/retraining/status', (c) => {
+    return c.json(getRetrainingStatus());
+  });
+
+  /**
+   * GET /api/communication/retraining/calibration
+   * Returns the current hallucination-calibration.json contents.
+   */
+  app.get('/retraining/calibration', (c) => {
+    const cal = readCalibration();
+    if (!cal) {
+      return c.json({ error: 'No calibration file found — run the pipeline first' }, 404);
+    }
+    return c.json(cal);
+  });
+
+  /**
+   * POST /api/communication/retraining/run
+   * Manually trigger a retraining pipeline run immediately.
+   */
+  app.post('/retraining/run', async (c) => {
+    const result = await runRetrainingPipeline();
+    const status = result.error ? 500 : 200;
+    return c.json(result, status as 200 | 500);
   });
 
   // --- SSE stream ---

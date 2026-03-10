@@ -18,6 +18,7 @@ import { initCommContextSchema } from './context/db.js';
 import { initPipelineRunsStore } from './pipeline-runs.js';
 import { startRetryLoop, stopRetryLoop } from './outbound.js';
 import { startConsumer, setConsumerSafetyGate, setConsumerNats } from './consumer.js';
+import { startRetrainingScheduler, stopRetrainingScheduler } from './retraining-pipeline.js';
 
 let safety: SafetyGate | null = null;
 
@@ -63,6 +64,9 @@ export async function startCommunication(
   // Start outbound retry loop
   startRetryLoop(nats);
 
+  // Start daily retraining scheduler
+  startRetrainingScheduler();
+
   // Start JetStream consumer (infinite loop, runs in background)
   startConsumer(js).catch((err) => {
     console.log(JSON.stringify({
@@ -88,6 +92,7 @@ export async function startCommunication(
  * Stop the communication module (graceful shutdown).
  */
 export function stopCommunication(): void {
+  stopRetrainingScheduler();
   stopRetryLoop();
   console.log(JSON.stringify({
     level: 'info',
