@@ -26,6 +26,12 @@ import {
   getActiveRuns, getRecentRuns, getRun, onRunUpdate, cleanupOrphanedRuns,
 } from './pipeline-runs.js';
 import { getCommSafetyGate } from './index.js';
+import {
+  recordFeedback,
+  getFeedbackForMessage,
+  getFeedbackSummary,
+  type UserVerdict,
+} from './feedback-collector.js';
 
 const sc = StringCodec();
 
@@ -495,6 +501,97 @@ export function createCommRoutes(deps: CommRouteDeps): Hono {
     return c.json({
       safety: gate?.status() ?? null,
     });
+  });
+
+  // --- Confidence feedback ---
+
+  /**
+   * POST /api/communication/feedback
+   *
+   * Submit user feedback on a confidence-flagged claim.
+   *
+   * Body:
+   *   messageId         — ID from the HallucinationReport
+   *   claim             — The exact claim text that was flagged
+   *   assignedConfidence — Numeric score the system assigned (0–100)
+   *   verdict           — 'confirmed' | 'corrected' | 'disputed'
+   *   correction?       — Corrected text / explanation (required when verdict ≠ confirmed)
+   *   note?             — Free-form user note
+   *   sessionId?        — Conversation session for context
+   *   source?           — Originating client (e.g. 'slack', 'dashboard')
+   */
+  app.post('/feedback', async (c) => {
+    let body: {
+      messageId?: string;
+      claim?: string;
+      assignedConfidence?: number;
+      verdict?: string;
+      correction?: string;
+      note?: string;
+      sessionId?: string;
+      source?: string;
+    };
+
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!body.messageId || typeof body.messageId !== 'string') {
+      return c.json({ error: 'messageId is required' }, 400);
+    }
+    if (!body.claim || typeof body.claim !== 'string') {
+      return c.json({ error: 'claim is required' }, 400);
+    }
+    if (typeof body.assignedConfidence !== 'number' || body.assignedConfidence < 0 || body.assignedConfidence > 100) {
+      return c.json({ error: 'assignedConfidence must be a number between 0 and 100' }, 400);
+    }
+
+    const validVerdicts: UserVerdict[] = ['confirmed', 'corrected', 'disputed'];
+    if (!body.verdict || !validVerdicts.includes(body.verdict as UserVerdict)) {
+      return c.json({ error: `verdict must be one of: ${validVerdicts.join(', ')}` }, 400);
+    }
+
+    const verdict = body.verdict as UserVerdict;
+    if ((verdict === 'corrected' || verdict === 'disputed') && !body.correction) {
+      return c.json({ error: 'correction is required when verdict is "corrected" or "disputed"' }, 400);
+    }
+
+    const entry = recordFeedback({
+      messageId: body.messageId,
+      sessionId: body.sessionId,
+      claim: body.claim,
+      assignedConfidence: body.assignedConfidence,
+      verdict,
+      correction: body.correction,
+      note: body.note,
+      source: body.source ?? 'api',
+    });
+
+    return c.json({ recorded: true, feedbackId: entry.feedbackId, badge: entry.assignedBadge }, 201);
+  });
+
+  /**
+   * GET /api/communication/feedback/summary
+   *
+   * Returns aggregated accuracy stats across all feedback entries.
+   * Useful for evaluating how well the hallucination detector is calibrated.
+   */
+  app.get('/feedback/summary', (c) => {
+    const summary = getFeedbackSummary();
+    return c.json(summary);
+  });
+
+  /**
+   * GET /api/communication/feedback/:messageId
+   *
+   * Returns all feedback entries for a specific message.
+   */
+  app.get('/feedback/:messageId', (c) => {
+    const messageId = c.req.param('messageId');
+    const entries = getFeedbackForMessage(messageId);
+    return c.json({ messageId, entries, count: entries.length });
   });
 
   // --- SSE stream ---
