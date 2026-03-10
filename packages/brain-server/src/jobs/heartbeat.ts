@@ -46,20 +46,20 @@ function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
       if (remaining <= 0) {
         // Overdue — run an immediate catch-up check; interval handles subsequent runs
         log('info', 'Heartbeat monitor overdue — running catch-up check', { overdueMs: -remaining });
-        checkRunningJobs(nats).catch(() => {});
+        checkRunningJobs(nats).catch((err) => log('warn', 'Catch-up heartbeat check failed', { error: String(err) }));
       } else if (remaining < intervalMs) {
         // Due sooner than full interval — reschedule
         clearInterval(intervalHandle!);
         log('info', 'Heartbeat monitor rescheduling to match persisted schedule', { remainingMs: remaining });
         intervalHandle = setTimeout(() => {
-          checkRunningJobs(nats).catch(() => {});
+          checkRunningJobs(nats).catch((err) => log('warn', 'Rescheduled heartbeat check failed', { error: String(err) }));
           intervalHandle = setInterval(async () => {
             await checkRunningJobs(nats);
           }, intervalMs);
         }, remaining) as unknown as NodeJS.Timeout;
       }
     })
-    .catch(() => {}); // Non-critical
+    .catch((err) => log('warn', 'Failed to recover heartbeat schedule from DB', { error: String(err) }));
 }
 
 export function stopHeartbeatMonitor(): void {
@@ -74,7 +74,7 @@ async function checkRunningJobs(nats: NatsConnection): Promise<void> {
   setSchedulerState(SCHEDULER_KEY, {
     lastRunAt: new Date().toISOString(),
     nextRunAt: new Date(Date.now() + POLL_INTERVAL_MS).toISOString(),
-  }).catch(() => {});
+  }).catch((err) => log('warn', 'Failed to persist heartbeat scheduler state', { error: String(err) }));
 
   let jobs: Awaited<ReturnType<typeof getRunningJobs>>;
   try {
@@ -106,7 +106,7 @@ async function checkRunningJobs(nats: NatsConnection): Promise<void> {
       });
 
       // Mark in DB
-      await markJobUnresponsive(job.id).catch(() => {});
+      await markJobUnresponsive(job.id).catch((err) => log('warn', 'Failed to mark job unresponsive in DB', { jobId: job.id, error: String(err) }));
 
       // Fail any linked goal_action so the goal cycle can proceed
       failExecutingGoalActionByJobId(
@@ -114,7 +114,7 @@ async function checkRunningJobs(nats: NatsConnection): Promise<void> {
         `Job marked unresponsive after ${Math.round(silentMs / 60000)} minutes without activity. PID ${job.pid ?? 'unknown'}.`
       ).then((updated) => {
         if (updated) log('info', 'Cleared stale executing goal_action for unresponsive job', { jobId: job.id });
-      }).catch(() => {});
+      }).catch((err) => log('warn', 'Failed to clear stale goal_action', { jobId: job.id, error: String(err) }));
 
       // Publish alert
       const alert: JobAlert = {

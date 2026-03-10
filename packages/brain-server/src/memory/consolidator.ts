@@ -192,7 +192,7 @@ Extract 0-3 patterns and 0-3 semantic memories. Only include genuinely useful, n
             patternType: p.type,
             description: p.description,
             confidence: Math.max(0.1, Math.min(1, p.confidence ?? 0.5)),
-          }).catch(() => {});
+          }).catch((err) => log('warn', 'Failed to record pattern', { type: p.type, error: String(err) }));
           patternCount++;
         }
       }
@@ -208,7 +208,7 @@ Extract 0-3 patterns and 0-3 semantic memories. Only include genuinely useful, n
             content: sm.content,
             tags: Array.isArray(sm.tags) ? sm.tags : [],
             importance: Math.max(0.3, Math.min(1, sm.importance ?? 0.6)),
-          }).catch(() => {});
+          }).catch((err) => log('warn', 'Failed to record semantic memory', { title: sm.title, error: String(err) }));
           semanticCount++;
         }
       }
@@ -228,7 +228,7 @@ Extract 0-3 patterns and 0-3 semantic memories. Only include genuinely useful, n
 function scheduleNext(): void {
   setSchedulerState(SCHEDULER_KEY, {
     nextRunAt: new Date(Date.now() + CONSOLIDATION_INTERVAL_MS).toISOString(),
-  }).catch(() => {});
+  }).catch((err) => log('warn', 'Failed to persist consolidator scheduler state', { error: String(err) }));
 
   consolidationTimer = setTimeout(async () => {
     try {

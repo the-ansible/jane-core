@@ -703,7 +703,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       }
 
       // Register session (with optional parent) for context inheritance
-      await registerSession(body.sessionId, body.parentSessionId).catch(() => {});
+      await registerSession(body.sessionId, body.parentSessionId).catch((err) => log('warn', 'Failed to register session', { sessionId: body.sessionId, error: String(err) }));
 
       // Validate worktree paths exist and are git repos
       const validWorktrees = (body.worktrees ?? []).filter(p => {
@@ -842,12 +842,12 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
 
       // Heartbeat to keep connection alive
       const heartbeatInterval = setInterval(() => {
-        stream.writeSSE({ event: 'heartbeat', data: '', id: String(++eventId) }).catch(() => {});
+        stream.writeSSE({ event: 'heartbeat', data: '', id: String(++eventId) }).catch((err) => log('debug', 'SSE heartbeat write failed', { error: String(err) }));
       }, 15_000);
 
       // Periodic snapshot
       const snapshotInterval = setInterval(() => {
-        pushSnapshot().catch(() => {});
+        pushSnapshot().catch((err) => log('debug', 'SSE snapshot push failed', { error: String(err) }));
       }, 10_000);
 
       stream.onAbort(() => {

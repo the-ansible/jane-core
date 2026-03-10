@@ -65,12 +65,12 @@ function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
         clearInterval(monitorTimer!);
         log('info', 'Autonomic monitor rescheduling to match persisted schedule', { remainingMs: remaining });
         monitorTimer = setTimeout(() => {
-          runAllMonitors(nats).catch(() => {});
+          runAllMonitors(nats).catch((err) => log('warn', 'Rescheduled monitor run failed', { error: String(err) }));
           monitorTimer = setInterval(() => runAllMonitors(nats), intervalMs);
         }, remaining) as unknown as ReturnType<typeof setInterval>;
       }
     })
-    .catch(() => {}); // Non-critical
+    .catch((err) => log('warn', 'Failed to recover autonomic schedule from DB', { error: String(err) }));
 }
 
 export function stopAutonomicLayer(): void {
@@ -105,7 +105,7 @@ async function runAllMonitors(nats: NatsConnection): Promise<void> {
   setSchedulerState(SCHEDULER_KEY, {
     lastRunAt: new Date().toISOString(),
     nextRunAt: new Date(Date.now() + MONITOR_INTERVAL_MS).toISOString(),
-  }).catch(() => {});
+  }).catch((err) => log('warn', 'Failed to persist autonomic scheduler state', { error: String(err) }));
 
   const results = await Promise.all([
     checkHttpEndpoint('brain-server', 'http://localhost:3103/health'),
@@ -149,7 +149,7 @@ async function runAllMonitors(nats: NatsConnection): Promise<void> {
       eventType: 'alert',
       severity,
       payload: { monitor: r.name, message: r.message, data: r.data ?? {} },
-    }).catch(() => {});
+    }).catch((err) => log('warn', 'Failed to record autonomic layer event', { monitor: r.name, error: String(err) }));
   }
 
   if (critical.length > 0) {
@@ -222,7 +222,7 @@ async function checkPostgres(): Promise<MonitorResult> {
       durationMs: Date.now() - start,
     };
   } finally {
-    await pool.end().catch(() => {});
+    await pool.end().catch((err) => log('warn', 'Failed to close DB pool', { error: String(err) }));
   }
 }
 

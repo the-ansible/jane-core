@@ -208,7 +208,7 @@ async function handleAgentResponse(
     const agentError = 'Agent returned no intent';
     failStage(runId, 'agent', agentError);
     completeRun(runId, 'failure', { routeAction: routing.action, error: agentError });
-    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, false).catch(() => {});
+    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, false).catch((err) => pipelineLog('warn', 'Failed to update assembly outcome', { error: String(err) }));
     recordPipelineOutcome({
       action: routing.action, responded: false, agentMs, totalMs: Date.now() - pipelineStart,
       error: agentError,
@@ -232,7 +232,7 @@ async function handleAgentResponse(
     const composerError = 'Composer returned no message';
     failStage(runId, 'composer', composerError);
     completeRun(runId, 'failure', { routeAction: routing.action, error: composerError });
-    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, false).catch(() => {});
+    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, false).catch((err) => pipelineLog('warn', 'Failed to update assembly outcome', { error: String(err) }));
     recordPipelineOutcome({
       action: routing.action, responded: false, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
       error: composerError,
@@ -285,7 +285,7 @@ async function handleAgentResponse(
         (jobRequest) => {
           nats.publish('agent.jobs.request', sc.encode(JSON.stringify(jobRequest)));
         }
-      ).catch(() => {});
+      ).catch((err) => pipelineLog('warn', 'Failed to dispatch task extraction', { error: String(err) }));
     }
   }
 
@@ -359,7 +359,7 @@ async function handleAgentResponse(
       ts: new Date().toISOString(),
     }));
 
-    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, true).catch(() => {});
+    await updateAssemblyOutcome(agentContext.meta.assemblyLogId, true).catch((err) => pipelineLog('warn', 'Failed to update assembly outcome', { error: String(err) }));
     completeStage(runId, 'publish', responseEvent.id);
     completeRun(runId, 'success', { routeAction: routing.action });
 

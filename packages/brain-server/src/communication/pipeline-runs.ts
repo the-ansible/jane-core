@@ -57,7 +57,7 @@ const listeners = new Set<RunListener>();
 
 function notify(run: PipelineRun): void {
   for (const listener of listeners) {
-    try { listener(run); } catch { /* ignore */ }
+    try { listener(run); } catch (err) { console.log(JSON.stringify({ level: 'warn', msg: 'Pipeline run listener error', component: 'comm.pipeline-runs', error: String(err), ts: new Date().toISOString() })); }
   }
 }
 

@@ -228,7 +228,7 @@ export async function issueDirective(
     ts: new Date().toISOString(),
   });
 
-  recordDirectiveMemory({ directiveId, targetLayer: params.targetLayer, directive: params.directive, params: params.directiveParams }).catch(() => {});
+  recordDirectiveMemory({ directiveId, targetLayer: params.targetLayer, directive: params.directive, params: params.directiveParams }).catch((err) => log('warn', 'Failed to record directive memory', { directiveId, error: String(err) }));
   log('info', 'Strategic directive issued', { directiveId, targetLayer: params.targetLayer, directive: params.directive });
   return directiveId;
 }

@@ -233,7 +233,7 @@ export async function cleanupWorkspace(sessionId: string): Promise<void> {
       }
       await runGit(['worktree', 'remove', '--force', wt.path], wt.projectPath);
       // Also delete the branch
-      await runGit(['branch', '-D', wt.branch], wt.projectPath).catch(() => {});
+      await runGit(['branch', '-D', wt.branch], wt.projectPath).catch((err) => log('warn', 'Failed to delete worktree branch (may already be gone)', { branch: wt.branch, error: String(err) }));
       log('info', 'Removed session worktree', { sessionId, name: wt.name });
     } catch (err) {
       log('warn', 'Failed to remove session worktree', {

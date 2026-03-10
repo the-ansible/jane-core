@@ -41,7 +41,7 @@ export function pushEvent(event: CommunicationEvent, subject: string, routing?: 
     buffer.shift();
   }
   for (const listener of listeners) {
-    try { listener(stored); } catch { /* ignore listener errors */ }
+    try { listener(stored); } catch (err) { console.log(JSON.stringify({ level: 'warn', msg: 'Event listener error', component: 'comm.events', error: String(err), ts: new Date().toISOString() })); }
   }
 }
 

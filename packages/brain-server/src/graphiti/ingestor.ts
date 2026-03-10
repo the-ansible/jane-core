@@ -151,7 +151,7 @@ function subscribeAgentResults(nats: NatsConnection): void {
             jobContext = (job.context_json as Record<string, unknown>) ?? {};
             jobPrompt = job.prompt?.slice(0, 300) ?? '';
           }
-        } catch { /* non-critical */ }
+        } catch (err) { log('warn', 'Failed to look up job context', { jobId: payload.jobId, error: String(err) }); }
 
         const outcome = payload.status === 'done' ? 'completed' : 'failed';
         const resultSummary = payload.result

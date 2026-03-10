@@ -128,7 +128,8 @@ export async function searchMemory(query: string, limit = 5): Promise<MemoryFact
     });
     if (!res.ok) return [];
     return (await res.json()) as MemoryFact[];
-  } catch {
+  } catch (err) {
+    log('warn', 'Graphiti memory search failed', { query, error: String(err) });
     return [];
   }
 }

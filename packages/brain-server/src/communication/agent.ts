@@ -44,8 +44,8 @@ function loadInnerVoice(): string {
       innerVoiceCacheTime = now;
       return innerVoiceCache;
     }
-  } catch {
-    // Fall through to default
+  } catch (err) {
+    log('warn', 'Failed to read INNER_VOICE.md, using default', { error: String(err) });
   }
 
   return 'You are Jane, a personal AI assistant. Be direct, warm, and genuine.';
@@ -281,7 +281,8 @@ export function parseAgentResponse(stdout: string): AgentIntent | null {
         }
       }
     }
-  } catch {
+  } catch (err) {
+    log('warn', 'Failed to parse agent JSON output, using raw', { error: String(err) });
     resultText = stdout.trim();
   }
 
@@ -309,7 +310,8 @@ export function parseAgentResponse(stdout: string): AgentIntent | null {
         },
       } : {}),
     };
-  } catch {
+  } catch (err) {
+    log('warn', 'Failed to parse agent intent JSON, falling back to reply', { error: String(err) });
     return { type: 'reply', content: resultText, tone: 'casual' };
   }
 }

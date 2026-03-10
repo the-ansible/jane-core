@@ -255,7 +255,7 @@ export function createCommRoutes(deps: CommRouteDeps): Hono {
             'communication.interactive.inbound',
             sc.encode(JSON.stringify(event))
           );
-        } catch { /* fire-and-forget */ }
+        } catch (err) { log('warn', 'Failed to publish interactive event to NATS', { error: String(err) }); }
       }
 
       return c.json({ captured: true, direction: 'inbound', sessionId: interactiveSessionId });
@@ -293,7 +293,7 @@ export function createCommRoutes(deps: CommRouteDeps): Hono {
             'communication.interactive.outbound',
             sc.encode(JSON.stringify(event))
           );
-        } catch { /* fire-and-forget */ }
+        } catch (err) { log('warn', 'Failed to publish interactive event to NATS', { error: String(err) }); }
       }
 
       return c.json({ captured: true, direction: 'outbound', sessionId: interactiveSessionId });
@@ -511,16 +511,16 @@ export function createCommRoutes(deps: CommRouteDeps): Hono {
 
       // Listen for new events
       const unsubEvent = onEvent((ev) => {
-        stream.writeSSE({ data: JSON.stringify(ev), event: 'event', id: String(id++) }).catch(() => {});
+        stream.writeSSE({ data: JSON.stringify(ev), event: 'event', id: String(id++) }).catch((err) => log('debug', 'SSE event write failed (client likely disconnected)', { error: String(err) }));
       });
 
       const unsubRun = onRunUpdate((run) => {
-        stream.writeSSE({ data: JSON.stringify(run), event: 'pipeline-run', id: String(id++) }).catch(() => {});
+        stream.writeSSE({ data: JSON.stringify(run), event: 'pipeline-run', id: String(id++) }).catch((err) => log('debug', 'SSE pipeline-run write failed', { error: String(err) }));
       });
 
       // Keep alive
       const keepAlive = setInterval(() => {
-        stream.writeSSE({ data: '', event: 'ping', id: String(id++) }).catch(() => {});
+        stream.writeSSE({ data: '', event: 'ping', id: String(id++) }).catch((err) => log('debug', 'SSE ping write failed', { error: String(err) }));
       }, 15000);
 
       // Cleanup orphaned runs periodically

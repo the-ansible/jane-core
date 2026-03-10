@@ -250,7 +250,7 @@ async function dispatchAndPublish(params: {
       workdir,
       env,
       onActivity: () => {
-        updateHeartbeat(jobId).catch(() => {});
+        updateHeartbeat(jobId).catch((err) => log('warn', 'Failed to update heartbeat', { jobId, error: String(err) }));
       },
       nats,
     });
@@ -267,7 +267,7 @@ async function dispatchAndPublish(params: {
   // Cleanup isolation artifacts (skip for session workspaces — they persist)
   if (!params.sessionWorkspace) {
     if (params.worktreePath && params.projectPath) {
-      await removeWorktree(jobId, params.projectPath).catch(() => {});
+      await removeWorktree(jobId, params.projectPath).catch((err) => log('warn', 'Failed to remove worktree', { jobId, error: String(err) }));
     }
     if (params.scratchDir) {
       cleanupScratchDir(jobId);
@@ -276,14 +276,14 @@ async function dispatchAndPublish(params: {
 
   // Touch session workspace activity
   if (params.sessionWorkspace) {
-    await touchWorkspaceActivity(params.sessionWorkspace.sessionId).catch(() => {});
+    await touchWorkspaceActivity(params.sessionWorkspace.sessionId).catch((err) => log('warn', 'Failed to touch workspace activity', { sessionId: params.sessionWorkspace!.sessionId, error: String(err) }));
   }
 
   // Update job status
   if (result.success && result.resultText) {
-    await markJobDone(jobId, result.resultText).catch(() => {});
+    await markJobDone(jobId, result.resultText).catch((err) => log('warn', 'Failed to mark job done in DB', { jobId, error: String(err) }));
   } else {
-    await markJobFailed(jobId, result.error ?? 'Unknown error').catch(() => {});
+    await markJobFailed(jobId, result.error ?? 'Unknown error').catch((err) => log('warn', 'Failed to mark job failed in DB', { jobId, error: String(err) }));
   }
 
   // Publish result to NATS

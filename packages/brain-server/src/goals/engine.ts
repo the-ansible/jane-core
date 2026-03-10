@@ -145,7 +145,7 @@ function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
       }
       // remaining >= intervalMs: interval already fires at the right time — nothing to do
     })
-    .catch(() => {}); // Non-critical — if DB unavailable, proceed with normal schedule
+    .catch((err) => log('warn', 'Failed to recover goal engine schedule from DB', { error: String(err) }));
 }
 
 export function stopGoalEngine(): void {
@@ -181,7 +181,7 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
   setSchedulerState(SCHEDULER_KEY, {
     lastRunAt: new Date(runAt).toISOString(),
     nextRunAt: new Date(runAt + cycleIntervalMs).toISOString(),
-  }).catch(() => {});
+  }).catch((err) => log('warn', 'Failed to persist goal engine scheduler state', { error: String(err) }));
 
   const cycleId = await createCycle();
   log('info', 'Goal cycle started', { cycleId });
@@ -254,8 +254,8 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     // the action agent with prior attempt history.
     const goalSessionId = best.goalId; // Use goal UUID as its stable session ID
     const actionSessionId = crypto.randomUUID();
-    await registerSession(goalSessionId, undefined, { type: 'goal', goalId: goalSessionId }).catch(() => {});
-    await registerSession(actionSessionId, goalSessionId, { type: 'goal-action', goalId: goalSessionId, cycleId }).catch(() => {});
+    await registerSession(goalSessionId, undefined, { type: 'goal', goalId: goalSessionId }).catch((err) => log('warn', 'Failed to register goal session', { goalSessionId, error: String(err) }));
+    await registerSession(actionSessionId, goalSessionId, { type: 'goal-action', goalId: goalSessionId, cycleId }).catch((err) => log('warn', 'Failed to register action session', { actionSessionId, error: String(err) }));
 
     const launchResult = await launchAgent({
       role: 'executor',
@@ -290,13 +290,13 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
       selectedAction: best.description,
       outcome: 'done',
       notes: null,
-    }).catch(() => {});
+    }).catch((err) => log('warn', 'Failed to record goal cycle memory', { cycleId, error: String(err) }));
 
     log('info', 'Goal cycle complete', { cycleId, actionId, jobId, action: best.description.slice(0, 80) });
 
   } catch (err) {
     const errMsg = String(err);
-    await failCycle(cycleId, errMsg).catch(() => {});
+    await failCycle(cycleId, errMsg).catch((e) => log('warn', 'Failed to mark cycle as failed', { cycleId, error: String(e) }));
     publishCycleStatus(nats, cycleId, 'failed', errMsg, null);
 
     recordGoalCycleMemory({
@@ -306,7 +306,7 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
       selectedAction: null,
       outcome: 'failed',
       notes: errMsg.slice(0, 400),
-    }).catch(() => {});
+    }).catch((e) => log('warn', 'Failed to record failed cycle memory', { cycleId, error: String(e) }));
 
     log('error', 'Goal cycle failed', { cycleId, error: errMsg });
   } finally {
@@ -366,7 +366,8 @@ async function buildContext(goalIds: string[] = []): Promise<string> {
       `Recently completed/failed actions per goal (do not repeat these — assign score 1 if duplicate):\n${recentDoneContext}`,
       `Relevant memories:\n${memoryContext}`,
     ].join('\n\n');
-  } catch {
+  } catch (err) {
+    log('warn', 'Failed to build context for scoring', { error: String(err) });
     return `Current time: ${new Date().toISOString()}`;
   }
 }
@@ -380,7 +381,7 @@ async function persistRejectedCandidates(candidates: CandidateAction[], cycleId:
       rationale: c.rationale,
       score: c.score,
       status: 'rejected',
-    }).catch(() => {});
+    }).catch((err) => log('warn', 'Failed to record rejected candidate', { goalId: c.goalId, error: String(err) }));
   }
 }
 
@@ -630,7 +631,7 @@ async function restartOrphanedJob(
   }
 
   // Mark the old job as failed
-  await markJobFailed(oldJobId, 'Orphaned job — process died, restarting with context').catch(() => {});
+  await markJobFailed(oldJobId, 'Orphaned job — process died, restarting with context').catch((err) => log('warn', 'Failed to mark orphaned job as failed', { jobId: oldJobId, error: String(err) }));
 
   const restartPrompt = `You are Jane, an AI assistant working autonomously to advance your goals.
 
@@ -657,8 +658,8 @@ When complete, summarize what you accomplished and what changed.`;
 
   // Register a new child session for the restart, inheriting from the goal's session
   const restartSessionId = crypto.randomUUID();
-  await registerSession(goalId, undefined, { type: 'goal', goalId }).catch(() => {});
-  await registerSession(restartSessionId, goalId, { type: 'goal-action-restart', goalId }).catch(() => {});
+  await registerSession(goalId, undefined, { type: 'goal', goalId }).catch((err) => log('warn', 'Failed to register restart goal session', { goalId, error: String(err) }));
+  await registerSession(restartSessionId, goalId, { type: 'goal-action-restart', goalId }).catch((err) => log('warn', 'Failed to register restart action session', { restartSessionId, error: String(err) }));
 
   const restartResult = await launchAgent({
     role: 'executor',
@@ -707,8 +708,8 @@ async function recoverOrphanedJobs(): Promise<number> {
 
     if (!alive) {
       const reason = `Recovered at startup: PID ${job.pid} no longer exists (orphaned by previous server restart)`;
-      await markJobFailed(job.id, reason).catch(() => {});
-      const updated = await failExecutingGoalActionByJobId(job.id, reason).catch(() => false);
+      await markJobFailed(job.id, reason).catch((err) => log('warn', 'Failed to mark orphaned job as failed at startup', { jobId: job.id, error: String(err) }));
+      const updated = await failExecutingGoalActionByJobId(job.id, reason).catch((err) => { log('warn', 'Failed to fail goal action for orphaned job', { jobId: job.id, error: String(err) }); return false; });
       if (updated) recovered++;
       log('warn', 'Recovered orphaned job — dead PID', { jobId: job.id, pid: job.pid });
     }
@@ -732,7 +733,7 @@ function publishCycleStatus(
       actionId,
       ts: new Date().toISOString(),
     })));
-  } catch { /* non-critical */ }
+  } catch (err) { log('warn', 'Failed to publish cycle status', { cycleId, error: String(err) }); }
 }
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {
