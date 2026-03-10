@@ -22,6 +22,8 @@ import memoryModule from './modules/memory.js';
 import parentSessionModule from './modules/parent-session.js';
 import goalHistoryModule from './modules/goal-history.js';
 import vaultSearchModule from './modules/vault-search.js';
+import projectContextModule from './modules/project-context.js';
+import gitChangesModule from './modules/git-changes.js';
 
 const MODULE_REGISTRY = new Map<string, ContextModule>([
   ['conversation', conversationModule],
@@ -31,6 +33,8 @@ const MODULE_REGISTRY = new Map<string, ContextModule>([
   ['parent-session', parentSessionModule],
   ['goal-history', goalHistoryModule],
   ['vault-search', vaultSearchModule],
+  ['project-context', projectContextModule],
+  ['git-changes', gitChangesModule],
 ]);
 
 /**

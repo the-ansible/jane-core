@@ -40,7 +40,7 @@ Environment variables available to you: JOB_ID (this job's unique ID), SESSION_I
 Do not modify files directly under /agent/projects/ or /agent/apps/ for code changes. Use workspace worktrees instead. Reading those directories for reference is fine.
 
 When you finish, provide a clear summary of what you accomplished, what files were changed, and any issues encountered.`,
-  defaultModules: ['memory', 'system-state', 'goal-history'],
+  defaultModules: ['memory', 'system-state', 'goal-history', 'vault-search'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 
@@ -126,7 +126,7 @@ Analyze the problem, gather evidence, and determine:
 3. What action should be taken?
 
 Provide a clear investigation report with findings and recommendations.`,
-  defaultModules: ['memory', 'system-state'],
+  defaultModules: ['memory', 'system-state', 'vault-search'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 
@@ -151,7 +151,7 @@ Provide a clear report:
 - **Root cause:** What actually caused it, with evidence
 - **Fix:** What was changed (or what needs to change)
 - **Verification:** How you confirmed the fix works`,
-  defaultModules: ['memory', 'system-state'],
+  defaultModules: ['memory', 'system-state', 'vault-search', 'project-context', 'git-changes'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 
@@ -185,7 +185,7 @@ Produce:
 - Risk assessment
 
 Focus on clarity and simplicity. Don't over-engineer.`,
-  defaultModules: ['memory', 'system-state', 'vault-search'],
+  defaultModules: ['memory', 'system-state', 'vault-search', 'project-context'],
   defaultRuntime: { tool: 'claude-code', model: 'opus' },
 });
 
@@ -212,7 +212,7 @@ If you need a workspace and don't have one, provision it:
 
 Work in the returned workspace path. Commit to the worktree branch.
 Environment variables available: JOB_ID, SESSION_ID, NATS_URL.`,
-  defaultModules: ['memory', 'vault-search'],
+  defaultModules: ['memory', 'vault-search', 'project-context', 'git-changes'],
   defaultRuntime: { tool: 'claude-code', model: 'sonnet' },
 });
 
