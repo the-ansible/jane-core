@@ -21,6 +21,9 @@ const SCHEMA = process.env.BRAIN_SCHEMA ?? 'brain';
 const MAX_ACTIONS = 10;
 const TOKEN_BUDGET = 3000;
 
+/** Orphaned startup recovery outcomes — infrastructure interruptions, not real work failures. */
+const ORPHANED_OUTCOME_PREFIX = 'Recovered at startup:';
+
 let pool: pg.Pool | null = null;
 
 function getPool(): pg.Pool {
@@ -79,17 +82,39 @@ const goalHistoryModule: ContextModule = {
 
       if (actions.length === 0) return null;
 
+      // Separate real work attempts from infrastructure interruptions (orphaned jobs)
+      const orphanedCount = actions.filter(
+        (a) => a.outcome_text?.startsWith(ORPHANED_OUTCOME_PREFIX),
+      ).length;
+      const realActions = actions.filter(
+        (a) => !a.outcome_text?.startsWith(ORPHANED_OUTCOME_PREFIX),
+      );
+
       // Step 4: format the fragment
+      const headerNote = orphanedCount > 0
+        ? ` (${orphanedCount} infrastructure interruption${orphanedCount > 1 ? 's' : ''} excluded — brain-server restarts that cut off in-flight jobs)`
+        : '';
       const lines: string[] = [
         `GOAL HISTORY — "${goal.title}"`,
         `Goal: ${goal.description.slice(0, 300)}`,
         '',
-        `Prior actions (${actions.length}, newest first):`,
+        `Prior actions (${realActions.length}, newest first)${headerNote}:`,
       ];
+
+      if (realActions.length === 0) {
+        lines.push('  No completed work attempts yet.');
+        const text = lines.join('\n');
+        return {
+          source: 'goal-history',
+          text,
+          tokenEstimate: estimateTokens(text),
+          meta: { goalId, goalTitle: goal.title, actionCount: 0, orphanedCount },
+        };
+      }
 
       let tokenEstimate = estimateTokens(lines.join('\n'));
 
-      for (const action of actions) {
+      for (const action of realActions) {
         const date = new Date(action.updated_at).toISOString().slice(0, 16);
         const statusTag = action.status === 'done' ? '✓' : '✗';
         const actionLines: string[] = [
@@ -118,7 +143,7 @@ const goalHistoryModule: ContextModule = {
         source: 'goal-history',
         text,
         tokenEstimate: estimateTokens(text),
-        meta: { goalId, goalTitle: goal.title, actionCount: actions.length },
+        meta: { goalId, goalTitle: goal.title, actionCount: realActions.length, orphanedCount },
       };
     } catch (err) {
       log('warn', 'Goal history module failed', { error: String(err) });
