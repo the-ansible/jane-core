@@ -9,7 +9,8 @@
  */
 
 import { invokeAdapter } from '../executor/index.js';
-import type { Goal, CandidateAction } from './types.js';
+import type { Goal, CandidateAction, ScoreBreakdown } from './types.js';
+import { computeCompositeScore } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -90,9 +91,19 @@ Set "needsWorkspace": true if this action involves code changes, file edits to s
 }
 
 /**
- * Score each candidate 1-10 against the full goal set.
- * Mutates candidates in-place with a .score, returns sorted desc.
- * Pass context (from buildContext) to penalize already-completed work.
+ * Score each candidate using multi-dimensional rubric against the full goal set.
+ *
+ * Each candidate is scored on five dimensions (1-10 each):
+ *   relevance   (35%) — how directly does this advance the goal?
+ *   impact      (25%) — expected magnitude of improvement?
+ *   urgency     (20%) — how time-sensitive / critical right now?
+ *   novelty     (10%) — how different is this from recent completed work?
+ *   feasibility (10%) — achievable in a single session?
+ *
+ * The composite score is computed as a weighted average and stored on .score.
+ * The breakdown is stored on .scoreBreakdown.
+ * Returns candidates sorted descending by composite score.
+ * Falls back to flat score=5 if LLM scoring fails.
  */
 export async function scoreCandidates(
   candidates: CandidateAction[],
@@ -110,10 +121,10 @@ export async function scoreCandidates(
     .join('\n');
 
   const recentActionsSection = context
-    ? `\n## Recent Action History (penalize duplicates heavily)\n${context}\n`
+    ? `\n## Recent Action History (assign novelty=1 for near-duplicates)\n${context}\n`
     : '';
 
-  const prompt = `You are scoring candidate actions for an AI assistant named Jane.
+  const prompt = `You are evaluating candidate actions for an AI assistant named Jane.
 
 ## Jane's Goals (higher priority = more important)
 ${goalSummary}
@@ -121,34 +132,54 @@ ${recentActionsSection}
 ## Candidates to Score
 ${candidateList}
 
-Score each candidate 1-10 where:
-- 10 = directly advances a high-priority goal, high feasibility, concrete outcome
-- 5  = moderate impact or indirect benefit
-- 1  = low impact, tangential, or impractical
-- 1  = ALSO assign 1 if this duplicates a recently completed or failed action above
+Score each candidate on FIVE dimensions, each 1-10:
+- relevance:   How directly does this advance the stated goal? (10 = perfectly aligned, 1 = tangential)
+- impact:      How much improvement will this produce? (10 = major breakthrough, 1 = trivial)
+- urgency:     How time-sensitive / critical is this right now? (10 = must do now, 1 = can wait indefinitely)
+- novelty:     How different is this from recent completed work above? (10 = entirely new direction, 1 = near-duplicate of recent work)
+- feasibility: How achievable is this in a single work session? (10 = clearly doable, 1 = highly uncertain/risky)
 
-Consider: goal alignment, priority weighting, feasibility, expected outcome clarity, and whether the action was already attempted recently.
+Weights: relevance=35%, impact=25%, urgency=20%, novelty=10%, feasibility=10%.
 
-Respond ONLY with a JSON array of scores in order, no markdown:
-[score0, score1, score2, ...]`;
+Respond ONLY with a JSON array, one object per candidate, in the same order:
+[{"relevance":N,"impact":N,"urgency":N,"novelty":N,"feasibility":N}, ...]`;
 
   try {
     const raw = await claudeGenerate(prompt);
-    const scores = extractJson(raw);
-    if (!Array.isArray(scores)) return candidates;
+    const parsed = extractJson(raw);
+    if (!Array.isArray(parsed)) return applyDefaultScores(candidates);
 
     candidates.forEach((c, i) => {
-      const s = parseFloat(String(scores[i]));
-      c.score = isNaN(s) ? 5 : Math.max(1, Math.min(10, s));
+      const entry = parsed[i];
+      if (entry && typeof entry === 'object') {
+        const breakdown: ScoreBreakdown = {
+          relevance:   clamp(parseFloat(String(entry.relevance   ?? 5))),
+          impact:      clamp(parseFloat(String(entry.impact      ?? 5))),
+          urgency:     clamp(parseFloat(String(entry.urgency     ?? 5))),
+          novelty:     clamp(parseFloat(String(entry.novelty     ?? 5))),
+          feasibility: clamp(parseFloat(String(entry.feasibility ?? 5))),
+        };
+        c.scoreBreakdown = breakdown;
+        c.score = Math.round(computeCompositeScore(breakdown) * 10) / 10;
+      } else {
+        c.score = 5;
+      }
     });
 
     return [...candidates].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
   } catch (err) {
     log('warn', 'Candidate scoring failed', { error: String(err) });
-    // Return candidates with default score so cycle can still proceed
-    candidates.forEach((c) => { c.score = 5; });
-    return candidates;
+    return applyDefaultScores(candidates);
   }
+}
+
+function clamp(n: number): number {
+  return isNaN(n) ? 5 : Math.max(1, Math.min(10, n));
+}
+
+function applyDefaultScores(candidates: CandidateAction[]): CandidateAction[] {
+  candidates.forEach((c) => { c.score = 5; });
+  return candidates;
 }
 
 // ---------------------------------------------------------------------------

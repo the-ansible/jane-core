@@ -1,5 +1,5 @@
 /**
- * Tests for goals/candidates.ts — Phase 7.1.
+ * Tests for goals/candidates.ts — Phase 7.1 + Phase 8.1 (multi-dimensional scoring).
  *
  * Validates the invokeAdapter-based LLM invocation for candidate generation
  * and scoring. Mocks the executor module to avoid real LLM calls.
@@ -7,6 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Goal, CandidateAction } from './types.js';
+import { computeCompositeScore, SCORE_WEIGHTS } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -46,6 +47,40 @@ const { generateCandidates, scoreCandidates } = await import('./candidates.js');
 
 beforeEach(() => {
   mockInvokeAdapter.mockReset();
+});
+
+// ---------------------------------------------------------------------------
+// computeCompositeScore + SCORE_WEIGHTS — Phase 8.1
+// ---------------------------------------------------------------------------
+
+describe('computeCompositeScore', () => {
+  it('weights sum to 1.0', () => {
+    const total = Object.values(SCORE_WEIGHTS).reduce((sum, w) => sum + w, 0);
+    expect(total).toBeCloseTo(1.0, 5);
+  });
+
+  it('computes correct weighted average for uniform score of 10', () => {
+    const score = computeCompositeScore({ relevance: 10, impact: 10, urgency: 10, novelty: 10, feasibility: 10 });
+    expect(score).toBeCloseTo(10, 5);
+  });
+
+  it('computes correct weighted average for uniform score of 1', () => {
+    const score = computeCompositeScore({ relevance: 1, impact: 1, urgency: 1, novelty: 1, feasibility: 1 });
+    expect(score).toBeCloseTo(1, 5);
+  });
+
+  it('computes correct weighted average for mixed scores', () => {
+    // 9*0.35 + 8*0.25 + 7*0.20 + 6*0.10 + 10*0.10 = 3.15+2.0+1.4+0.6+1.0 = 8.15
+    const score = computeCompositeScore({ relevance: 9, impact: 8, urgency: 7, novelty: 6, feasibility: 10 });
+    expect(score).toBeCloseTo(8.15, 5);
+  });
+
+  it('gives highest weight to relevance', () => {
+    // Relevance dominant (10 vs 1 for all others)
+    const highRel = computeCompositeScore({ relevance: 10, impact: 1, urgency: 1, novelty: 1, feasibility: 1 });
+    const highImp = computeCompositeScore({ relevance: 1, impact: 10, urgency: 1, novelty: 1, feasibility: 1 });
+    expect(highRel).toBeGreaterThan(highImp); // relevance (35%) > impact (25%)
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -219,29 +254,110 @@ describe('generateCandidates', () => {
 });
 
 // ---------------------------------------------------------------------------
-// scoreCandidates
+// scoreCandidates — Phase 8.1 multi-dimensional scoring
 // ---------------------------------------------------------------------------
 
 describe('scoreCandidates', () => {
-  it('assigns scores from LLM response', async () => {
+  it('assigns structured breakdown scores and computes composite', async () => {
     const goals = [makeGoal()];
     const candidates: CandidateAction[] = [
       { goalId: 'goal-1', goalTitle: 'Become a more capable assistant', description: 'Action A', rationale: '', needsWorkspace: false, projectPaths: [] },
       { goalId: 'goal-1', goalTitle: 'Become a more capable assistant', description: 'Action B', rationale: '', needsWorkspace: false, projectPaths: [] },
     ];
 
+    // LLM returns structured breakdown objects
+    const breakdowns = [
+      { relevance: 9, impact: 8, urgency: 7, novelty: 6, feasibility: 10 },
+      { relevance: 3, impact: 4, urgency: 2, novelty: 9, feasibility: 8 },
+    ];
     mockInvokeAdapter.mockResolvedValueOnce({
       success: true,
-      resultText: '[8, 4]',
+      resultText: JSON.stringify(breakdowns),
       rawOutput: '',
       durationMs: 50,
     });
 
     const result = await scoreCandidates(candidates, goals);
+
+    // Sorted descending by composite score — Action A should win
     expect(result[0].description).toBe('Action A');
-    expect(result[0].score).toBe(8);
+    expect(result[0].scoreBreakdown).toBeDefined();
+    expect(result[0].scoreBreakdown?.relevance).toBe(9);
+    expect(result[0].scoreBreakdown?.impact).toBe(8);
+    expect(result[0].scoreBreakdown?.urgency).toBe(7);
+    expect(result[0].scoreBreakdown?.novelty).toBe(6);
+    expect(result[0].scoreBreakdown?.feasibility).toBe(10);
+
+    // Composite: 9*0.35 + 8*0.25 + 7*0.20 + 6*0.10 + 10*0.10
+    // = 3.15 + 2.0 + 1.4 + 0.6 + 1.0 = 8.15
+    expect(result[0].score).toBeCloseTo(8.15, 1);
+
     expect(result[1].description).toBe('Action B');
-    expect(result[1].score).toBe(4);
+    expect(result[1].scoreBreakdown?.relevance).toBe(3);
+  });
+
+  it('sorts candidates descending by composite score', async () => {
+    const goals = [makeGoal()];
+    const candidates: CandidateAction[] = [
+      { goalId: 'goal-1', goalTitle: 'Become a more capable assistant', description: 'Low scorer', rationale: '', needsWorkspace: false, projectPaths: [] },
+      { goalId: 'goal-1', goalTitle: 'Become a more capable assistant', description: 'High scorer', rationale: '', needsWorkspace: false, projectPaths: [] },
+    ];
+
+    mockInvokeAdapter.mockResolvedValueOnce({
+      success: true,
+      resultText: JSON.stringify([
+        { relevance: 2, impact: 2, urgency: 2, novelty: 2, feasibility: 2 },
+        { relevance: 9, impact: 9, urgency: 9, novelty: 9, feasibility: 9 },
+      ]),
+      rawOutput: '',
+      durationMs: 50,
+    });
+
+    const result = await scoreCandidates(candidates, goals);
+    expect(result[0].description).toBe('High scorer');
+    expect(result[1].description).toBe('Low scorer');
+  });
+
+  it('clamps out-of-range dimension scores to 1-10', async () => {
+    const goals = [makeGoal()];
+    const candidates: CandidateAction[] = [
+      { goalId: 'goal-1', goalTitle: 'Become a more capable assistant', description: 'Action', rationale: '', needsWorkspace: false, projectPaths: [] },
+    ];
+
+    mockInvokeAdapter.mockResolvedValueOnce({
+      success: true,
+      resultText: JSON.stringify([
+        { relevance: 15, impact: -2, urgency: 0, novelty: 11, feasibility: 7 },
+      ]),
+      rawOutput: '',
+      durationMs: 50,
+    });
+
+    const result = await scoreCandidates(candidates, goals);
+    const b = result[0].scoreBreakdown!;
+    expect(b.relevance).toBe(10);   // clamped from 15
+    expect(b.impact).toBe(1);       // clamped from -2
+    expect(b.urgency).toBe(1);      // clamped from 0
+    expect(b.novelty).toBe(10);     // clamped from 11
+    expect(b.feasibility).toBe(7);  // unchanged
+  });
+
+  it('falls back to default score=5 if LLM returns non-array JSON', async () => {
+    const goals = [makeGoal()];
+    const candidates: CandidateAction[] = [
+      { goalId: 'goal-1', goalTitle: 'Become a more capable assistant', description: 'Action', rationale: '', needsWorkspace: false, projectPaths: [] },
+    ];
+
+    mockInvokeAdapter.mockResolvedValueOnce({
+      success: true,
+      resultText: '{"error": "unexpected format"}',
+      rawOutput: '',
+      durationMs: 50,
+    });
+
+    const result = await scoreCandidates(candidates, goals);
+    expect(result[0].score).toBe(5);
+    expect(result[0].scoreBreakdown).toBeUndefined();
   });
 
   it('returns candidates with default score on scoring failure', async () => {
@@ -268,5 +384,28 @@ describe('scoreCandidates', () => {
     const result = await scoreCandidates([], [makeGoal()]);
     expect(result).toHaveLength(0);
     expect(mockInvokeAdapter).not.toHaveBeenCalled();
+  });
+
+  it('handles missing dimensions with default value 5', async () => {
+    const goals = [makeGoal()];
+    const candidates: CandidateAction[] = [
+      { goalId: 'goal-1', goalTitle: 'Become a more capable assistant', description: 'Action', rationale: '', needsWorkspace: false, projectPaths: [] },
+    ];
+
+    // LLM omits some fields
+    mockInvokeAdapter.mockResolvedValueOnce({
+      success: true,
+      resultText: JSON.stringify([{ relevance: 8 }]),  // only relevance provided
+      rawOutput: '',
+      durationMs: 50,
+    });
+
+    const result = await scoreCandidates(candidates, goals);
+    const b = result[0].scoreBreakdown!;
+    expect(b.relevance).toBe(8);
+    expect(b.impact).toBe(5);      // default
+    expect(b.urgency).toBe(5);     // default
+    expect(b.novelty).toBe(5);     // default
+    expect(b.feasibility).toBe(5); // default
   });
 });

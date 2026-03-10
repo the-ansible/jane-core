@@ -231,6 +231,20 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
       return;
     }
 
+    // Log score breakdown for the selected action
+    if (best.scoreBreakdown) {
+      const b = best.scoreBreakdown;
+      log('info', 'Selected action score breakdown', {
+        cycleId,
+        score: best.score,
+        relevance: b.relevance,
+        impact: b.impact,
+        urgency: b.urgency,
+        novelty: b.novelty,
+        feasibility: b.feasibility,
+      });
+    }
+
     // 6. Persist the chosen action
     const actionId = await createGoalAction({
       goalId: best.goalId,
