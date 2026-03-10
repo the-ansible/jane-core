@@ -116,7 +116,7 @@ function subscribeAutonomicAlerts(nats: NatsConnection): { unsubscribe: () => vo
         log('warn', 'Failed to process autonomic alert', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Autonomic alert subscription loop exited', { error: String(err) }));
 
   return { unsubscribe: () => sub.unsubscribe() };
 }
@@ -167,7 +167,7 @@ function subscribeGoalCycleStatus(nats: NatsConnection): { unsubscribe: () => vo
         log('warn', 'Failed to process goal cycle status', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Goal cycle status subscription loop exited', { error: String(err) }));
 
   return { unsubscribe: () => sub.unsubscribe() };
 }
@@ -218,7 +218,7 @@ function subscribeJobFailures(nats: NatsConnection): { unsubscribe: () => void }
         log('warn', 'Failed to process job result', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Job failures subscription loop exited', { error: String(err) }));
 
   return { unsubscribe: () => sub.unsubscribe() };
 }
@@ -289,7 +289,7 @@ Work autonomously. Check \`/agent/operations/lessons-learned.md\` for relevant p
 function publishNats(nats: NatsConnection, subject: string, payload: Record<string, unknown>): void {
   try {
     nats.publish(subject, sc.encode(JSON.stringify(payload)));
-  } catch { /* non-critical */ }
+  } catch (err) { log('warn', 'Failed to publish NATS event', { subject, error: String(err) }); }
 }
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {

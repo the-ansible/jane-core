@@ -126,7 +126,7 @@ function subscribeGoalCycle(nats: NatsConnection): void {
         log('warn', 'Failed to ingest goal.cycle.status', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Goal cycle subscription loop exited', { error: String(err) }));
 }
 
 function subscribeAgentResults(nats: NatsConnection): void {
@@ -186,7 +186,7 @@ function subscribeAgentResults(nats: NatsConnection): void {
         log('warn', 'Failed to ingest agent.results event', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Agent results subscription loop exited', { error: String(err) }));
 }
 
 function subscribeAutonomicAlerts(nats: NatsConnection): void {
@@ -229,7 +229,7 @@ function subscribeAutonomicAlerts(nats: NatsConnection): void {
         log('warn', 'Failed to ingest layer.autonomic.alert', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Autonomic alert subscription loop exited', { error: String(err) }));
 }
 
 function subscribeLayerEvents(nats: NatsConnection, subject: string, layerName: string): void {
@@ -273,7 +273,7 @@ function subscribeLayerEvents(nats: NatsConnection, subject: string, layerName: 
         log('warn', `Failed to ingest ${subject} event`, { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', `Layer event subscription loop exited for ${subject}`, { error: String(err) }));
 }
 
 function subscribeSessionCompacted(nats: NatsConnection): void {
@@ -309,7 +309,7 @@ function subscribeSessionCompacted(nats: NatsConnection): void {
         log('warn', 'Failed to ingest memory.session.compacted', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Session compacted subscription loop exited', { error: String(err) }));
 }
 
 function subscribeOutbound(nats: NatsConnection): void {
@@ -353,7 +353,7 @@ function subscribeOutbound(nats: NatsConnection): void {
         log('warn', 'Failed to ingest communication.outbound event', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Outbound subscription loop exited', { error: String(err) }));
 }
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,29 @@ import { startGraphitiIngestor } from './graphiti/ingestor.js';
 import { initExecutor, initContextSchema, initWorkspaceSchema, initSessionsSchema, startWorkspaceCleanup } from './executor/index.js';
 import { initCommunication, startCommunication, stopCommunication } from './communication/index.js';
 
+// Global error handlers — prevent silent crashes from unhandled rejections
+process.on('uncaughtException', (err) => {
+  console.log(JSON.stringify({
+    level: 'error',
+    msg: 'Uncaught exception',
+    component: 'brain-server',
+    ts: new Date().toISOString(),
+    error: String(err),
+    stack: err.stack,
+  }));
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.log(JSON.stringify({
+    level: 'error',
+    msg: 'Unhandled promise rejection',
+    component: 'brain-server',
+    ts: new Date().toISOString(),
+    error: String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  }));
+});
+
 const PORT = parseInt(process.env.PORT || '3103', 10);
 const NATS_URL = process.env.NATS_URL || 'nats://life-system-nats:4222';
 

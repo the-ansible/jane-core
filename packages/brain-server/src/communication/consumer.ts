@@ -301,7 +301,15 @@ export async function startConsumer(js: JetStreamClient): Promise<void> {
             safetyGate?.recordError();
             msg.ack();
           }
-        })();
+        })().catch((err) => {
+          console.log(JSON.stringify({
+            level: 'error',
+            msg: 'Unhandled error in message processor',
+            component: 'comm.consumer',
+            error: String(err),
+            ts: new Date().toISOString(),
+          }));
+        });
       }
     } catch (err) {
       console.log(JSON.stringify({

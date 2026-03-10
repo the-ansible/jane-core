@@ -314,7 +314,7 @@ async function checkDisk(): Promise<MonitorResult> {
 function publishNats(nats: NatsConnection, subject: string, payload: Record<string, unknown>): void {
   try {
     nats.publish(subject, sc.encode(JSON.stringify(payload)));
-  } catch { /* non-critical */ }
+  } catch (err) { log('warn', 'Failed to publish NATS event', { subject, error: String(err) }); }
 }
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {

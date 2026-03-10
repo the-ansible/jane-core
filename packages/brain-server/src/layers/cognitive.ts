@@ -99,7 +99,7 @@ function subscribeEscalations(nats: NatsConnection): { unsubscribe: () => void }
         log('warn', 'Error processing escalation', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Escalation subscription loop exited', { error: String(err) }));
 
   return { unsubscribe: () => sub.unsubscribe() };
 }
@@ -134,7 +134,7 @@ function subscribeDirectives(nats: NatsConnection): { unsubscribe: () => void } 
         log('warn', 'Error processing directive', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Directive subscription loop exited', { error: String(err) }));
 
   return { unsubscribe: () => sub.unsubscribe() };
 }
@@ -165,11 +165,11 @@ function subscribeJobResults(nats: NatsConnection): void {
                 ts: new Date().toISOString(),
               })));
             }
-          }).catch(() => { /* non-critical */ });
+          }).catch((err) => log('warn', 'Failed to look up goal action by job ID', { error: String(err) }));
         }
-      } catch { /* non-critical */ }
+      } catch (err) { log('warn', 'Error processing job result', { error: String(err) }); }
     }
-  })();
+  })().catch((err) => log('error', 'Job results subscription loop exited', { error: String(err) }));
 }
 
 // ---------------------------------------------------------------------------

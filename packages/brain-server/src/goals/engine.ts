@@ -103,7 +103,7 @@ export function startGoalEngine(nats: NatsConnection): void {
       log('info', 'Manual cycle trigger received');
       runGoalCycle(nats).catch((err) => log('error', 'Manual cycle error', { error: String(err) }));
     }
-  })();
+  })().catch((err) => log('error', 'Manual trigger subscription loop exited', { error: String(err) }));
 
   // Set up regular interval immediately, then async-check persisted state for catch-up
   cycleTimer = setInterval(() => {

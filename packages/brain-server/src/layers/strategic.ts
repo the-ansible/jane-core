@@ -271,7 +271,7 @@ function subscribeCognitiveResults(nats: NatsConnection): { unsubscribe: () => v
         log('warn', 'Error processing cognitive result', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Cognitive result subscription loop exited', { error: String(err) }));
 
   return { unsubscribe: () => sub.unsubscribe() };
 }
@@ -397,7 +397,7 @@ Work autonomously. You are the strategic mind — your job is to ensure the whol
 function publishNats(nats: NatsConnection, subject: string, payload: Record<string, unknown>): void {
   try {
     nats.publish(subject, sc.encode(JSON.stringify(payload)));
-  } catch { /* non-critical */ }
+  } catch (err) { log('warn', 'Failed to publish NATS event', { subject, error: String(err) }); }
 }
 
 function log(level: string, msg: string, extra?: Record<string, unknown>): void {

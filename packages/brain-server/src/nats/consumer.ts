@@ -58,7 +58,7 @@ export function startConsumer(nats: NatsConnection): void {
         log('error', 'Error handling compaction event', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Compaction subscription loop exited', { error: String(err) }));
 
   (async () => {
     for await (const msg of subscription!) {
@@ -102,7 +102,7 @@ export function startConsumer(nats: NatsConnection): void {
         log('error', 'Error processing job request', { error: String(err) });
       }
     }
-  })();
+  })().catch((err) => log('error', 'Job request subscription loop exited', { error: String(err) }));
 }
 
 export function stopConsumer(): void {
