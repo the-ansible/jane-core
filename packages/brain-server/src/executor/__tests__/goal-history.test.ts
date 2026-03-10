@@ -136,6 +136,7 @@ describe('goal-history: resolve from session metadata', () => {
     expect(result!.tokenEstimate).toBeGreaterThan(0);
     expect(result!.meta?.goalId).toBe(GOAL_ID);
     expect(result!.meta?.actionCount).toBe(2);
+    expect(result!.meta?.orphanedCount).toBe(0);
   });
 });
 
@@ -170,6 +171,116 @@ describe('goal-history: session ID is a goal ID', () => {
     expect(result).not.toBeNull();
     expect(result!.text).toContain('My Goal');
     expect(result!.text).toContain('Did the thing');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: orphaned startup recovery filtering
+// ---------------------------------------------------------------------------
+
+describe('goal-history: orphaned startup recovery filtering', () => {
+  beforeEach(() => { vi.clearAllMocks(); _resetPool(); });
+
+  const ORPHANED_OUTCOME = 'Recovered at startup: PID 12345 no longer exists (orphaned by previous server restart)';
+
+  it('filters orphaned actions and notes count in header', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: { goalId: GOAL_ID } }] });
+    mockQuery.mockResolvedValueOnce({ rows: [{ id: GOAL_ID, title: 'Deploy Brain', description: 'Release and deploy' }] });
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          id: 'aaa',
+          description: 'Real deploy attempt',
+          status: 'done',
+          outcome_text: 'Deployed v0.4.4 successfully',
+          review_text: null,
+          created_at: '2026-03-10T00:00:00Z',
+          updated_at: '2026-03-10T01:00:00Z',
+        },
+        {
+          id: 'bbb',
+          description: 'Retry deploy',
+          status: 'failed',
+          outcome_text: ORPHANED_OUTCOME,
+          review_text: null,
+          created_at: '2026-03-09T23:00:00Z',
+          updated_at: '2026-03-09T23:30:00Z',
+        },
+        {
+          id: 'ccc',
+          description: 'First deploy attempt',
+          status: 'failed',
+          outcome_text: ORPHANED_OUTCOME,
+          review_text: null,
+          created_at: '2026-03-09T22:00:00Z',
+          updated_at: '2026-03-09T22:30:00Z',
+        },
+      ],
+    });
+
+    const result = await goalHistoryModule.assemble(makeParams(SESSION_ID));
+    expect(result).not.toBeNull();
+    // Real action should appear
+    expect(result!.text).toContain('Real deploy attempt');
+    expect(result!.text).toContain('Deployed v0.4.4 successfully');
+    // Orphaned actions should NOT appear as work attempts
+    expect(result!.text).not.toContain('Retry deploy');
+    expect(result!.text).not.toContain('First deploy attempt');
+    expect(result!.text).not.toContain('PID 12345');
+    // Header should note the excluded count
+    expect(result!.text).toContain('2 infrastructure interruption');
+    expect(result!.text).toContain('Prior actions (1');
+    // Meta should reflect filtered counts
+    expect(result!.meta?.actionCount).toBe(1);
+    expect(result!.meta?.orphanedCount).toBe(2);
+  });
+
+  it('returns informative message when all actions are orphaned', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: { goalId: GOAL_ID } }] });
+    mockQuery.mockResolvedValueOnce({ rows: [{ id: GOAL_ID, title: 'Deploy', description: 'Deploy the server' }] });
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          id: 'aaa',
+          description: 'Deploy attempt',
+          status: 'failed',
+          outcome_text: ORPHANED_OUTCOME,
+          review_text: null,
+          created_at: '2026-03-09T22:00:00Z',
+          updated_at: '2026-03-09T22:30:00Z',
+        },
+      ],
+    });
+
+    const result = await goalHistoryModule.assemble(makeParams(SESSION_ID));
+    // Should return a fragment (not null) to inform agent that goal has been attempted
+    expect(result).not.toBeNull();
+    expect(result!.text).toContain('No completed work attempts yet');
+    expect(result!.text).toContain('1 infrastructure interruption');
+    expect(result!.meta?.actionCount).toBe(0);
+    expect(result!.meta?.orphanedCount).toBe(1);
+  });
+
+  it('does not mention interruptions when all actions are real work', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: { goalId: GOAL_ID } }] });
+    mockQuery.mockResolvedValueOnce({ rows: [{ id: GOAL_ID, title: 'Fix Bug', description: 'Fix the bug' }] });
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        id: 'aaa',
+        description: 'Fixed the bug',
+        status: 'done',
+        outcome_text: 'Bug is fixed',
+        review_text: null,
+        created_at: '2026-03-09T00:00:00Z',
+        updated_at: '2026-03-09T01:00:00Z',
+      }],
+    });
+
+    const result = await goalHistoryModule.assemble(makeParams(SESSION_ID));
+    expect(result).not.toBeNull();
+    expect(result!.text).not.toContain('infrastructure interruption');
+    expect(result!.text).toContain('Prior actions (1, newest first):');
+    expect(result!.meta?.orphanedCount).toBe(0);
   });
 });
 
