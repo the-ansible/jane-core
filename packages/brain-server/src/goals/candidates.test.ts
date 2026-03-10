@@ -43,7 +43,7 @@ vi.mock('../executor/index.js', () => ({
 }));
 
 // Import AFTER mocking
-const { generateCandidates, scoreCandidates } = await import('./candidates.js');
+const { generateCandidates, scoreCandidates, selectBestCandidate } = await import('./candidates.js');
 
 beforeEach(() => {
   mockInvokeAdapter.mockReset();
@@ -407,5 +407,75 @@ describe('scoreCandidates', () => {
     expect(b.urgency).toBe(5);     // default
     expect(b.novelty).toBe(5);     // default
     expect(b.feasibility).toBe(5); // default
+  });
+});
+
+// ---------------------------------------------------------------------------
+// selectBestCandidate — Phase 8.2 priority tiebreaking
+// ---------------------------------------------------------------------------
+
+describe('selectBestCandidate', () => {
+  function makeCandidate(overrides: Partial<CandidateAction> = {}): CandidateAction {
+    return {
+      goalId: 'goal-1',
+      goalTitle: 'Become a more capable assistant',
+      description: 'Default action',
+      rationale: '',
+      score: 7,
+      needsWorkspace: false,
+      projectPaths: [],
+      ...overrides,
+    };
+  }
+
+  it('returns null for empty array', () => {
+    expect(selectBestCandidate([], [])).toBeNull();
+  });
+
+  it('returns the single candidate when only one exists', () => {
+    const c = makeCandidate({ description: 'Only action' });
+    expect(selectBestCandidate([c], [makeGoal()])).toBe(c);
+  });
+
+  it('returns the highest-scoring candidate when scores differ beyond threshold', () => {
+    const high = makeCandidate({ description: 'High', score: 9.0 });
+    const low  = makeCandidate({ description: 'Low',  score: 7.0 });
+    const result = selectBestCandidate([high, low], [makeGoal()]);
+    expect(result?.description).toBe('High');
+  });
+
+  it('breaks ties by goal priority when scores are within threshold', () => {
+    const goals = [
+      makeGoal({ id: 'goal-low',  title: 'Low priority goal',  priority: 50 }),
+      makeGoal({ id: 'goal-high', title: 'High priority goal', priority: 90 }),
+    ];
+    // Both score 8.0 — within 0.5 tie threshold
+    const cLow  = makeCandidate({ goalId: 'goal-low',  goalTitle: 'Low priority goal',  description: 'Low-priority action',  score: 8.0 });
+    const cHigh = makeCandidate({ goalId: 'goal-high', goalTitle: 'High priority goal', description: 'High-priority action', score: 8.0 });
+
+    const result = selectBestCandidate([cLow, cHigh], goals);
+    expect(result?.description).toBe('High-priority action');
+  });
+
+  it('does NOT break ties when score gap exceeds threshold', () => {
+    const goals = [
+      makeGoal({ id: 'goal-low',  title: 'Low priority goal',  priority: 50 }),
+      makeGoal({ id: 'goal-high', title: 'High priority goal', priority: 90 }),
+    ];
+    // cLow scores higher beyond the tie threshold
+    const cLow  = makeCandidate({ goalId: 'goal-low',  description: 'Low-priority but higher-scoring',  score: 9.0 });
+    const cHigh = makeCandidate({ goalId: 'goal-high', description: 'High-priority but lower-scoring', score: 8.0 });
+
+    const result = selectBestCandidate([cLow, cHigh], goals);
+    expect(result?.description).toBe('Low-priority but higher-scoring');
+  });
+
+  it('returns first tied candidate when goal priorities are equal', () => {
+    const goals = [makeGoal({ id: 'goal-1', priority: 80 }), makeGoal({ id: 'goal-2', priority: 80 })];
+    const c1 = makeCandidate({ goalId: 'goal-1', description: 'First tied', score: 8.0 });
+    const c2 = makeCandidate({ goalId: 'goal-2', description: 'Second tied', score: 8.0 });
+
+    const result = selectBestCandidate([c1, c2], goals);
+    expect(result?.description).toBe('First tied'); // falls back to sort order
   });
 });
