@@ -30,6 +30,7 @@ import { recordGoalCycleMemory } from '../memory/recorder.js';
 import { getGoalContextMemories } from '../memory/retriever.js';
 import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
 import { writeGoalActionSnapshot } from '../executor/goal-snapshots.js';
+import vaultSearchModule from '../executor/context/modules/vault-search.js';
 
 /** Max reviewed attempts before a goal is abandoned. */
 const MAX_REVIEWED_ATTEMPTS = 3;
@@ -205,7 +206,7 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     }
 
     // 2. Gather context
-    const context = await buildContext(goals.map((g) => g.id));
+    const context = await buildContext(goals.map((g) => g.id), goals);
 
     // 3. Generate candidates via LLM
     const candidates = await generateCandidates(goals, context);
@@ -318,7 +319,7 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
 // Internals
 // ---------------------------------------------------------------------------
 
-async function buildContext(goalIds: string[] = []): Promise<string> {
+async function buildContext(goalIds: string[] = [], goals: import('./types.js').Goal[] = []): Promise<string> {
   try {
     const now = Date.now();
     const [recent, memoryContext, recentDonePerGoal, globalRecentActions] = await Promise.all([
@@ -358,18 +359,59 @@ async function buildContext(goalIds: string[] = []): Promise<string> {
         }).join('\n')
       : '  (none yet)';
 
-    return [
+    // Vault knowledge: search for docs relevant to the active goals
+    const vaultContext = await buildVaultContext(goals).catch(() => null);
+
+    const sections = [
       `Current time: ${new Date().toISOString()}`,
       `System: Jane's brain server (Node.js/TypeScript, PM2-managed)`,
       `Recent cycle activity:\n${cycleContext}`,
       `RECENT COMPLETED WORK — DO NOT RE-PROPOSE actions completed within the last 24 hours:\n${globalRecentContext}`,
       `Recently completed/failed actions per goal (do not repeat these — assign score 1 if duplicate):\n${recentDoneContext}`,
       `Relevant memories:\n${memoryContext}`,
-    ].join('\n\n');
+    ];
+    if (vaultContext) sections.push(vaultContext);
+    return sections.join('\n\n');
   } catch (err) {
     log('warn', 'Failed to build context for scoring', { error: String(err) });
     return `Current time: ${new Date().toISOString()}`;
   }
+}
+
+/**
+ * Search the vault for documentation relevant to the active goals.
+ * Uses keyword extraction from goal titles and descriptions. Returns
+ * a formatted vault section string, or null if nothing relevant found.
+ * Token budget: 2500 tokens (keeps the context from ballooning).
+ */
+async function buildVaultContext(goals: import('./types.js').Goal[]): Promise<string | null> {
+  if (goals.length === 0) return null;
+
+  // Build a combined prompt from all goal titles + descriptions for keyword extraction
+  const goalText = goals
+    .map((g) => `${g.title}: ${g.description}`)
+    .join(' ');
+
+  const fragment = await vaultSearchModule.assemble({
+    role: 'executor',
+    prompt: goalText,
+    plan: {
+      tokenBudget: 2500,
+      modules: ['vault-search'],
+      summaryChunkSize: 6,
+      summaryModel: 'haiku',
+      summaryPromptTemplate: 'default_v1',
+      rawSummarizationThreshold: 12,
+      maxSummaries: 10,
+      modelContextSize: 200000,
+      tokenBudgetPct: 0.06,
+      topicTrackingEnabled: false,
+      associativeRetrievalEnabled: false,
+    },
+  });
+
+  if (!fragment || !fragment.text) return null;
+  return fragment.text;
 }
 
 async function persistRejectedCandidates(candidates: CandidateAction[], cycleId: string): Promise<void> {

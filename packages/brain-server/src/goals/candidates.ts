@@ -8,12 +8,8 @@
  * Fallback: Mercury API (instant reasoning) when CLI subprocess fails.
  */
 
-import { launchClaude } from '@jane-core/claude-launcher';
-import { readFileSync } from 'node:fs';
+import { invokeAdapter } from '../executor/index.js';
 import type { Goal, CandidateAction } from './types.js';
-
-const CLAUDE_MODEL = process.env.GOAL_CLAUDE_MODEL || 'claude-sonnet-4-6';
-const LAUNCH_TIMEOUT_MS = 120_000; // 2 min
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -159,80 +155,39 @@ Respond ONLY with a JSON array of scores in order, no markdown:
 // Internals
 // ---------------------------------------------------------------------------
 
-async function claudeGenerate(prompt: string): Promise<string> {
-  // Primary: Claude CLI subprocess
-  try {
-    const result = await launchClaude({
-      prompt,
-      model: CLAUDE_MODEL,
-      outputFormat: 'json',
-      maxTurns: 1,
-      timeout: LAUNCH_TIMEOUT_MS,
-    });
-
-    if (result.timedOut) throw new Error('Claude launcher timed out');
-    if (result.exitCode !== 0) throw new Error(`Claude launcher exited with code ${result.exitCode}`);
-    const text = result.resultText ?? result.stdout.trim();
-    if (!text) throw new Error('Claude launcher returned empty response');
-    return text;
-  } catch (primaryErr) {
-    log('warn', 'Claude CLI launcher failed — falling back to Mercury API', { error: String(primaryErr) });
-    return mercuryFallback(prompt);
-  }
-}
-
 /**
- * Mercury API fallback — used when the Claude CLI subprocess fails.
- * Fast and reliable, avoids per-token API costs.
+ * Generate LLM output for goal cycle use-cases (candidate generation, scoring).
+ *
+ * Uses invokeAdapter() to route through the executor's adapter registry:
+ *   Primary:  Mercury (fast HTTP call, no subprocess overhead)
+ *   Fallback: Ollama (local, free, acceptable for structured JSON output)
+ *
+ * This replaces the previous launchClaude subprocess + manual Mercury fallback
+ * pattern. Both of those are now unified behind the executor's adapter system.
  */
-async function mercuryFallback(prompt: string): Promise<string> {
-  const apiKey = getMercuryApiKey();
-  if (!apiKey) throw new Error('MERCURY_API_KEY not set — cannot fall back to Mercury');
-
-  const response = await fetch('https://api.inceptionlabs.ai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'mercury-2',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 4096,
-    }),
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Mercury API error ${response.status}: ${text.slice(0, 200)}`);
-  }
-
-  const data = await response.json() as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = data?.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error('Mercury returned no content');
-  return content;
-}
-
-function getMercuryApiKey(): string | undefined {
-  if (process.env.MERCURY_API_KEY) return process.env.MERCURY_API_KEY;
-
+async function claudeGenerate(prompt: string): Promise<string> {
+  // Primary: Mercury — fast HTTP call, no subprocess, consistent reliability
   try {
-    const environ = readFileSync('/proc/1/environ');
-    const vars = environ.toString().split('\0');
-    for (const v of vars) {
-      if (v.startsWith('MERCURY_API_KEY=')) {
-        const val = v.slice('MERCURY_API_KEY='.length);
-        if (val) return val;
-      }
-    }
-  } catch {
-    // /proc/1/environ not available
+    const result = await invokeAdapter({
+      runtime: 'mercury',
+      model: 'mercury-2',
+      prompt,
+      maxTokens: 4096,
+    });
+    if (result.success && result.resultText) return result.resultText;
+    throw new Error(result.error ?? 'Mercury returned no result');
+  } catch (primaryErr) {
+    log('warn', 'Mercury failed — falling back to Ollama', { error: String(primaryErr) });
   }
 
-  return undefined;
+  // Fallback: Ollama — local, free, no external dependency
+  const result = await invokeAdapter({
+    runtime: 'ollama',
+    model: 'gemma3:12b',
+    prompt,
+  });
+  if (result.success && result.resultText) return result.resultText;
+  throw new Error(`Both Mercury and Ollama failed: ${result.error ?? 'unknown'}`);
 }
 
 function extractJson(text: string): unknown {
