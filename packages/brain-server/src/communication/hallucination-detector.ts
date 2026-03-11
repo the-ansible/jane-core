@@ -5,17 +5,20 @@
  * external sources (Wolfram Alpha primary, Ollama self-check fallback),
  * and flags low-confidence results for review.
  *
- * The detector is fire-and-forget with respect to the pipeline — it does NOT
- * block the outbound response. Results are logged to NDJSON for analysis and
- * optionally annotated on the composed message.
+ * A secondary Wikipedia REST API verification step runs in parallel for
+ * factual and general claims. When Wikipedia returns relevant content, the
+ * confidence scores from both sources are averaged to reduce false positives
+ * and negatives.
  *
  * Architecture:
  *   1. Heuristic pre-filter: skip if message contains no verifiable claims
  *   2. Claim extraction via Ollama (cheap, local)
- *   3. Per-claim verification via Wolfram Alpha (numeric/factual) or Ollama
- *      self-check (free-text claims)
- *   4. Score aggregation → overall confidence level
- *   5. Log to NDJSON + optionally append a [⚠ low confidence] annotation
+ *   3. Per-claim primary verification: Wolfram Alpha (numeric/temporal) or
+ *      Ollama self-check (factual/general)
+ *   4. Per-claim secondary verification: Wikipedia REST API (all claim types)
+ *   5. Score fusion: average primary + Wikipedia when both available
+ *   6. Score aggregation → overall confidence level
+ *   7. Log to NDJSON + optionally append a [⚠ low confidence] annotation
  */
 
 import fs from 'node:fs';
@@ -37,10 +40,21 @@ export interface ClaimVerificationResult {
   category: FactualClaim['category'];
   /** 0–100: how confident the verifier is the claim is accurate */
   confidence: number;
-  /** Which verifier was used */
+  /** Which primary verifier was used */
   source: 'wolfram' | 'ollama-selfcheck' | 'skipped';
   /** Optional brief explanation from the verifier */
   note?: string;
+  /** Wikipedia secondary verification result (present when Wikipedia was consulted) */
+  wikipedia?: WikipediaVerificationResult;
+}
+
+export interface WikipediaVerificationResult {
+  /** 0–100 confidence from Wikipedia source */
+  confidence: number;
+  /** Short excerpt or article title used for verification */
+  snippet: string;
+  /** Whether Wikipedia returned a relevant article */
+  found: boolean;
 }
 
 export interface HallucinationReport {
@@ -65,8 +79,10 @@ export interface DetectorResult {
 
 const WOLFRAM_BASE_URL = 'https://api.wolframalpha.com/v1/result';
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://host.docker.internal:11434';
+const WIKIPEDIA_REST_BASE = 'https://en.wikipedia.org/api/rest_v1';
 const OLLAMA_TIMEOUT_MS = 15_000;
 const WOLFRAM_TIMEOUT_MS = 10_000;
+const WIKIPEDIA_TIMEOUT_MS = 8_000;
 
 /** Flag the message if overall confidence falls below this threshold */
 const CONFIDENCE_FLAG_THRESHOLD = 60;
@@ -329,14 +345,143 @@ Claim: "${claim}"`;
 }
 
 // ---------------------------------------------------------------------------
+// Wikipedia secondary verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Query the Wikipedia REST API for content related to the claim.
+ *
+ * Strategy:
+ *   1. Search Wikipedia for the claim text (up to 3 results)
+ *   2. Fetch the summary of the top result
+ *   3. Ask Ollama to reconcile the claim against the Wikipedia summary
+ *
+ * Returns a WikipediaVerificationResult. On any error, returns found=false
+ * so the caller can safely ignore it.
+ */
+export async function verifyWithWikipedia(claim: string): Promise<WikipediaVerificationResult> {
+  try {
+    // Step 1: search for relevant articles
+    const searchUrl = new URL(`${WIKIPEDIA_REST_BASE}/page/search/title`);
+    searchUrl.searchParams.set('q', claim);
+    searchUrl.searchParams.set('limit', '3');
+
+    const searchRes = await fetch(searchUrl.toString(), {
+      headers: { 'User-Agent': 'Jane-AI-Assistant/1.0 (jane@jane.ai)' },
+      signal: AbortSignal.timeout(WIKIPEDIA_TIMEOUT_MS),
+    });
+
+    if (!searchRes.ok) {
+      log('warn', 'Wikipedia search HTTP error', { status: searchRes.status });
+      return { confidence: 50, snippet: '', found: false };
+    }
+
+    const searchData = await searchRes.json() as {
+      pages?: Array<{ title: string; description?: string; key: string }>;
+    };
+
+    const pages = searchData.pages ?? [];
+    if (pages.length === 0) {
+      return { confidence: 50, snippet: 'No Wikipedia article found', found: false };
+    }
+
+    // Step 2: fetch summary of the top result
+    const topKey = pages[0].key;
+    const summaryUrl = `${WIKIPEDIA_REST_BASE}/page/summary/${encodeURIComponent(topKey)}`;
+    const summaryRes = await fetch(summaryUrl, {
+      headers: { 'User-Agent': 'Jane-AI-Assistant/1.0 (jane@jane.ai)' },
+      signal: AbortSignal.timeout(WIKIPEDIA_TIMEOUT_MS),
+    });
+
+    if (!summaryRes.ok) {
+      // Search found something but summary failed — treat as partial hit
+      const desc = pages[0].description ?? '';
+      return { confidence: 50, snippet: desc.slice(0, 200), found: true };
+    }
+
+    const summaryData = await summaryRes.json() as {
+      extract?: string;
+      title?: string;
+    };
+
+    const extract = summaryData.extract ?? '';
+    const title = summaryData.title ?? pages[0].title;
+    const snippet = extract.slice(0, 400);
+
+    if (!snippet) {
+      return { confidence: 50, snippet: `Found: ${title}`, found: true };
+    }
+
+    // Step 3: reconcile claim against Wikipedia content
+    const reconcile = await reconcileClaimWithAnswer(claim, `Wikipedia on "${title}": ${snippet}`);
+
+    return {
+      confidence: reconcile.confidence,
+      snippet: `${title}: ${snippet.slice(0, 200)}`,
+      found: true,
+    };
+  } catch (err) {
+    log('warn', 'Wikipedia verification failed', { claim: claim.slice(0, 80), error: String(err) });
+    return { confidence: 50, snippet: '', found: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Score fusion
+// ---------------------------------------------------------------------------
+
+/**
+ * Fuse a primary confidence score with a Wikipedia confidence score.
+ *
+ * Rules:
+ * - If Wikipedia didn't find a relevant article, use primary score as-is.
+ * - If both sources found content, average them (equal weight).
+ * - If primary was skipped but Wikipedia found content, use Wikipedia alone.
+ */
+export function fuseConfidenceScores(
+  primaryConfidence: number,
+  primarySource: ClaimVerificationResult['source'],
+  wikipedia: WikipediaVerificationResult | undefined,
+): number {
+  if (!wikipedia || !wikipedia.found) {
+    return primaryConfidence;
+  }
+
+  if (primarySource === 'skipped') {
+    // Primary had no data — use Wikipedia alone
+    return wikipedia.confidence;
+  }
+
+  // Both sources contributed — average them
+  return Math.round((primaryConfidence + wikipedia.confidence) / 2);
+}
+
+// ---------------------------------------------------------------------------
 // Per-claim routing
 // ---------------------------------------------------------------------------
 
 async function verifyClaim(claim: FactualClaim): Promise<ClaimVerificationResult> {
-  if (claim.category === 'numeric' || claim.category === 'temporal') {
-    return verifyWithWolfram(claim.text);
-  }
-  return verifyWithOllamaSelfCheck(claim.text, claim.category);
+  const isNumericOrTemporal = claim.category === 'numeric' || claim.category === 'temporal';
+
+  // Run primary verification
+  const primaryPromise = isNumericOrTemporal
+    ? verifyWithWolfram(claim.text)
+    : verifyWithOllamaSelfCheck(claim.text, claim.category);
+
+  // Run Wikipedia secondary verification in parallel for all claim types.
+  // For numeric/temporal, Wikipedia cross-checks when Wolfram is unavailable.
+  // For factual/general, Wikipedia is a strong secondary signal.
+  const wikiPromise = verifyWithWikipedia(claim.text);
+
+  const [primary, wikipedia] = await Promise.all([primaryPromise, wikiPromise]);
+
+  const fusedConfidence = fuseConfidenceScores(primary.confidence, primary.source, wikipedia);
+
+  return {
+    ...primary,
+    confidence: fusedConfidence,
+    wikipedia,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -382,11 +527,11 @@ export async function detectHallucinations(
 
     log('info', 'Claims extracted, verifying', { messageId, count: claims.length });
 
-    // 3. Verify all claims in parallel
+    // 3. Verify all claims in parallel (each claim runs primary + Wikipedia internally)
     const results = await Promise.all(claims.map(verifyClaim));
 
-    // 4. Aggregate confidence
-    const verified = results.filter(r => r.source !== 'skipped');
+    // 4. Aggregate confidence — a claim counts as verified if primary ran OR Wikipedia found content
+    const verified = results.filter(r => r.source !== 'skipped' || (r.wikipedia?.found ?? false));
     const overallConfidence = verified.length > 0
       ? Math.round(verified.reduce((sum, r) => sum + r.confidence, 0) / verified.length)
       : 100;

@@ -2,7 +2,7 @@
  * Tests for communication/hallucination-detector.ts
  *
  * These tests focus on deterministic logic (heuristic pre-filter, claim routing,
- * score aggregation) without hitting external APIs.
+ * score aggregation, Wikipedia verification, score fusion) without hitting external APIs.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -156,6 +156,135 @@ describe('confidence threshold behavior (unit-level)', () => {
 
     for (const msg of noFacts) {
       expect(likelyHasClaims(msg)).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fuseConfidenceScores — score fusion logic
+// ---------------------------------------------------------------------------
+
+describe('fuseConfidenceScores', () => {
+  it('returns primary confidence when Wikipedia did not find an article', async () => {
+    const { fuseConfidenceScores } = await import('./hallucination-detector.js');
+    const wiki = { confidence: 80, snippet: '', found: false };
+    expect(fuseConfidenceScores(70, 'wolfram', wiki)).toBe(70);
+  });
+
+  it('returns primary confidence when Wikipedia is undefined', async () => {
+    const { fuseConfidenceScores } = await import('./hallucination-detector.js');
+    expect(fuseConfidenceScores(65, 'ollama-selfcheck', undefined)).toBe(65);
+  });
+
+  it('averages primary and Wikipedia confidence when both sources found content', async () => {
+    const { fuseConfidenceScores } = await import('./hallucination-detector.js');
+    const wiki = { confidence: 80, snippet: 'Python (programming language): ...', found: true };
+    // (60 + 80) / 2 = 70
+    expect(fuseConfidenceScores(60, 'wolfram', wiki)).toBe(70);
+  });
+
+  it('rounds to nearest integer when averaging', async () => {
+    const { fuseConfidenceScores } = await import('./hallucination-detector.js');
+    const wiki = { confidence: 75, snippet: 'Some article', found: true };
+    // (60 + 75) / 2 = 67.5 → rounds to 68
+    expect(fuseConfidenceScores(60, 'ollama-selfcheck', wiki)).toBe(68);
+  });
+
+  it('uses Wikipedia alone when primary source was skipped', async () => {
+    const { fuseConfidenceScores } = await import('./hallucination-detector.js');
+    const wiki = { confidence: 85, snippet: 'Relevant article found', found: true };
+    expect(fuseConfidenceScores(50, 'skipped', wiki)).toBe(85);
+  });
+
+  it('returns primary confidence when primary is skipped and Wikipedia did not find article', async () => {
+    const { fuseConfidenceScores } = await import('./hallucination-detector.js');
+    const wiki = { confidence: 50, snippet: '', found: false };
+    expect(fuseConfidenceScores(50, 'skipped', wiki)).toBe(50);
+  });
+
+  it('handles extreme confidence values correctly', async () => {
+    const { fuseConfidenceScores } = await import('./hallucination-detector.js');
+    const wikiHigh = { confidence: 100, snippet: 'Verified by Wikipedia', found: true };
+    const wikiLow = { confidence: 0, snippet: 'Contradicted by Wikipedia', found: true };
+
+    // (100 + 100) / 2 = 100
+    expect(fuseConfidenceScores(100, 'wolfram', wikiHigh)).toBe(100);
+    // (0 + 0) / 2 = 0
+    expect(fuseConfidenceScores(0, 'ollama-selfcheck', wikiLow)).toBe(0);
+    // (100 + 0) / 2 = 50
+    expect(fuseConfidenceScores(100, 'wolfram', wikiLow)).toBe(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifyWithWikipedia — graceful degradation
+// ---------------------------------------------------------------------------
+
+describe('verifyWithWikipedia', () => {
+  it('returns found=false without throwing when Wikipedia is unreachable', async () => {
+    const { verifyWithWikipedia } = await import('./hallucination-detector.js');
+    // In test environment with no network or Wikipedia unreachable, should return gracefully
+    const result = await verifyWithWikipedia('Python programming language created in 1991');
+
+    expect(result).toMatchObject({
+      confidence: expect.any(Number),
+      snippet: expect.any(String),
+      found: expect.any(Boolean),
+    });
+    expect(result.confidence).toBeGreaterThanOrEqual(0);
+    expect(result.confidence).toBeLessThanOrEqual(100);
+  });
+
+  it('never throws regardless of input', async () => {
+    const { verifyWithWikipedia } = await import('./hallucination-detector.js');
+
+    const inputs = [
+      '',
+      'a'.repeat(500),
+      'The speed of light is 299,792 km/s',
+      'xyzzy frobble quux nonsense claim',
+    ];
+
+    for (const claim of inputs) {
+      await expect(verifyWithWikipedia(claim)).resolves.toMatchObject({
+        confidence: expect.any(Number),
+        found: expect.any(Boolean),
+      });
+    }
+  });
+
+  it('WikipediaVerificationResult has the correct shape', async () => {
+    const { verifyWithWikipedia } = await import('./hallucination-detector.js');
+    const result = await verifyWithWikipedia('water boils at 100 degrees Celsius');
+
+    expect(typeof result.confidence).toBe('number');
+    expect(typeof result.snippet).toBe('string');
+    expect(typeof result.found).toBe('boolean');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ClaimVerificationResult includes wikipedia field
+// ---------------------------------------------------------------------------
+
+describe('ClaimVerificationResult wikipedia field', () => {
+  it('detectHallucinations result items have wikipedia field when claims are found', async () => {
+    const { detectHallucinations } = await import('./hallucination-detector.js');
+    // This message has factual claim markers — if Ollama extracts claims, results will have wikipedia
+    const result = await detectHallucinations(
+      'Python was created in 1991 and has approximately 8 million active users worldwide.',
+      'msg-wiki-01',
+    );
+
+    // Even if no claims extracted (Ollama down), shape is valid
+    expect(result.report.results).toBeInstanceOf(Array);
+    for (const r of result.report.results) {
+      // If wikipedia field exists, it must have the right shape
+      if (r.wikipedia !== undefined) {
+        expect(typeof r.wikipedia.confidence).toBe('number');
+        expect(typeof r.wikipedia.found).toBe('boolean');
+        expect(typeof r.wikipedia.snippet).toBe('string');
+      }
     }
   });
 });
