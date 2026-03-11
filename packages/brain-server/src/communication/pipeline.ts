@@ -1,6 +1,6 @@
 /**
  * Pipeline -- routes inbound messages through the communication pipeline.
- * route -> safety -> context -> agent -> composer -> publish
+ * route -> safety -> context -> agent -> composer -> hallucination-check -> publish
  *
  * No classifier. Routing is sender-driven via CommunicationEvent fields.
  * All LLM calls go through invokeAdapter (same process, no HTTP/NATS hop).
@@ -30,6 +30,9 @@ import {
 import { assembleContext } from './context/assembler.js';
 import { updateAssemblyOutcome } from './context/db.js';
 import { compactAndIngest, searchMemory } from './graphiti.js';
+import { detectHallucinations } from './hallucination-detector.js';
+import { analyzeClarification } from './clarifier.js';
+import { formatWithConfidenceBadges } from './response-formatter.js';
 
 const sc = StringCodec();
 
@@ -245,7 +248,26 @@ async function handleAgentResponse(
   completeStage(runId, 'composer', `${composerMs}ms`);
   setRunOutputs(runId, { composerOutput: composedMessage });
 
-  // 5.5 Dispatch task (fire-and-forget)
+  // 5.5 Hallucination detection + response formatting (non-blocking, 8s budget)
+  // Detects factual claims, verifies them, then formats the message with
+  // per-claim confidence badges (✅ verified / ⚠️ uncertain / 🚨 low confidence).
+  let finalMessage = composedMessage;
+  try {
+    const nullDetector = { report: { messageId: event.id, timestamp: new Date().toISOString(), claimsFound: 0, claimsVerified: 0, overallConfidence: 100, flagged: false, results: [] }, annotatedMessage: composedMessage };
+    const { report } = await Promise.race([
+      detectHallucinations(composedMessage, event.id),
+      new Promise<typeof nullDetector>((resolve) =>
+        setTimeout(() => resolve(nullDetector), 8_000)
+      ),
+    ]);
+    // Apply the formatting layer: per-claim badges + verification section
+    finalMessage = formatWithConfidenceBadges(composedMessage, report);
+  } catch {
+    // Non-blocking: any error falls back to original message
+    finalMessage = composedMessage;
+  }
+
+  // 5.6 Dispatch task (fire-and-forget)
   if (deps.nats) {
     if (intent.task?.description) {
       // Fast path: agent already identified the task
@@ -313,7 +335,7 @@ async function handleAgentResponse(
     channelType: event.channelType,
     direction: 'outbound' as const,
     contentType: 'markdown' as const,
-    content: composedMessage,
+    content: finalMessage,
     sender: {
       id: 'jane',
       displayName: 'Jane',
@@ -342,7 +364,7 @@ async function handleAgentResponse(
 
     appendMessage(event.sessionId, {
       role: 'assistant',
-      content: composedMessage,
+      content: finalMessage,
       timestamp: responseEvent.timestamp,
       eventId: responseEvent.id,
       sender: { id: 'jane', displayName: 'Jane', type: 'agent' },
