@@ -85,6 +85,14 @@ const OLLAMA_TIMEOUT_MS = 15_000;
 const WOLFRAM_TIMEOUT_MS = 10_000;
 const WIKIPEDIA_TIMEOUT_MS = 8_000;
 
+/** Retry configuration for Wikipedia fetch calls */
+const WIKIPEDIA_MAX_RETRIES = 3;
+const WIKIPEDIA_RETRY_BASE_MS = 100;
+
+/** Wikipedia result cache: claim text → {result, expiresAt} */
+const wikiCache = new Map<string, { result: WikipediaVerificationResult; expiresAt: number }>();
+const WIKIPEDIA_CACHE_TTL_MS = 30 * 60 * 1_000; // 30 minutes
+
 /** Flag the message if overall confidence falls below this threshold (baseline — may be overridden by calibration). */
 const DEFAULT_CONFIDENCE_FLAG_THRESHOLD = 60;
 
@@ -385,31 +393,101 @@ Claim: "${claim}"`;
 // Wikipedia secondary verification
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Wikipedia fetch helper — retry with exponential backoff
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch a URL, retrying on network-level failures (TypeError) with
+ * exponential backoff. HTTP error responses (4xx/5xx) are returned
+ * immediately without retry — they are not transient.
+ *
+ * @param url      The URL to fetch
+ * @param init     RequestInit options (headers, signal, etc.)
+ * @param retries  Maximum number of additional attempts after the first
+ * @param baseMs   Base delay in milliseconds for the first retry
+ */
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  retries = WIKIPEDIA_MAX_RETRIES,
+  baseMs = WIKIPEDIA_RETRY_BASE_MS,
+): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      // Only retry on network errors (TypeError: fetch failed), not AbortError
+      const isNetworkError = err instanceof TypeError;
+      const isAbort = err instanceof Error && err.name === 'AbortError';
+
+      if (!isNetworkError || isAbort || attempt === retries) {
+        throw err;
+      }
+
+      lastErr = err;
+      const delay = baseMs * Math.pow(2, attempt);
+      log('warn', 'Wikipedia fetch failed, retrying', {
+        attempt: attempt + 1,
+        maxRetries: retries,
+        delayMs: delay,
+        error: String(err).slice(0, 80),
+      });
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// ---------------------------------------------------------------------------
+// Wikipedia secondary verification
+// ---------------------------------------------------------------------------
+
 /**
  * Query the Wikipedia REST API for content related to the claim.
  *
  * Strategy:
+ *   0. Check in-memory cache — return cached result if still valid (30 min TTL)
  *   1. Search Wikipedia for the claim text (up to 3 results)
+ *      — uses fetchWithRetry (up to 3 attempts, exponential backoff)
  *   2. Fetch the summary of the top result
+ *      — uses fetchWithRetry
  *   3. Ask Ollama to reconcile the claim against the Wikipedia summary
+ *   4. Store successful result in cache
  *
  * Returns a WikipediaVerificationResult. On any error, returns found=false
- * so the caller can safely ignore it.
+ * so the caller can safely ignore it. Falls back to the most recent cached
+ * result for the same claim when the network is down.
  */
 export async function verifyWithWikipedia(claim: string): Promise<WikipediaVerificationResult> {
+  // 0. Cache lookup
+  const cacheKey = claim.trim().toLowerCase().slice(0, 200);
+  const cached = wikiCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
+
+  const wikiHeaders = { 'User-Agent': 'Jane-AI-Assistant/1.0 (jane@jane.ai)' };
+
   try {
-    // Step 1: search for relevant articles
+    // 1. Search for relevant articles
     const searchUrl = new URL(`${WIKIPEDIA_REST_BASE}/page/search/title`);
     searchUrl.searchParams.set('q', claim);
     searchUrl.searchParams.set('limit', '3');
 
-    const searchRes = await fetch(searchUrl.toString(), {
-      headers: { 'User-Agent': 'Jane-AI-Assistant/1.0 (jane@jane.ai)' },
+    const searchRes = await fetchWithRetry(searchUrl.toString(), {
+      headers: wikiHeaders,
       signal: AbortSignal.timeout(WIKIPEDIA_TIMEOUT_MS),
     });
 
     if (!searchRes.ok) {
       log('warn', 'Wikipedia search HTTP error', { status: searchRes.status });
+      // Return stale cache if available rather than a blank miss
+      if (cached) {
+        log('info', 'Wikipedia search failed — serving stale cache', { claim: claim.slice(0, 80) });
+        return cached.result;
+      }
       return { confidence: 50, snippet: '', found: false };
     }
 
@@ -419,21 +497,25 @@ export async function verifyWithWikipedia(claim: string): Promise<WikipediaVerif
 
     const pages = searchData.pages ?? [];
     if (pages.length === 0) {
-      return { confidence: 50, snippet: 'No Wikipedia article found', found: false };
+      const result = { confidence: 50, snippet: 'No Wikipedia article found', found: false };
+      wikiCache.set(cacheKey, { result, expiresAt: Date.now() + WIKIPEDIA_CACHE_TTL_MS });
+      return result;
     }
 
-    // Step 2: fetch summary of the top result
+    // 2. Fetch summary of the top result
     const topKey = pages[0].key;
     const summaryUrl = `${WIKIPEDIA_REST_BASE}/page/summary/${encodeURIComponent(topKey)}`;
-    const summaryRes = await fetch(summaryUrl, {
-      headers: { 'User-Agent': 'Jane-AI-Assistant/1.0 (jane@jane.ai)' },
+    const summaryRes = await fetchWithRetry(summaryUrl, {
+      headers: wikiHeaders,
       signal: AbortSignal.timeout(WIKIPEDIA_TIMEOUT_MS),
     });
 
     if (!summaryRes.ok) {
       // Search found something but summary failed — treat as partial hit
       const desc = pages[0].description ?? '';
-      return { confidence: 50, snippet: desc.slice(0, 200), found: true };
+      const result = { confidence: 50, snippet: desc.slice(0, 200), found: true };
+      wikiCache.set(cacheKey, { result, expiresAt: Date.now() + WIKIPEDIA_CACHE_TTL_MS });
+      return result;
     }
 
     const summaryData = await summaryRes.json() as {
@@ -446,21 +528,38 @@ export async function verifyWithWikipedia(claim: string): Promise<WikipediaVerif
     const snippet = extract.slice(0, 400);
 
     if (!snippet) {
-      return { confidence: 50, snippet: `Found: ${title}`, found: true };
+      const result = { confidence: 50, snippet: `Found: ${title}`, found: true };
+      wikiCache.set(cacheKey, { result, expiresAt: Date.now() + WIKIPEDIA_CACHE_TTL_MS });
+      return result;
     }
 
-    // Step 3: reconcile claim against Wikipedia content
+    // 3. Reconcile claim against Wikipedia content
     const reconcile = await reconcileClaimWithAnswer(claim, `Wikipedia on "${title}": ${snippet}`);
 
-    return {
+    const result: WikipediaVerificationResult = {
       confidence: reconcile.confidence,
       snippet: `${title}: ${snippet.slice(0, 200)}`,
       found: true,
     };
+
+    // 4. Cache the successful result
+    wikiCache.set(cacheKey, { result, expiresAt: Date.now() + WIKIPEDIA_CACHE_TTL_MS });
+
+    return result;
   } catch (err) {
     log('warn', 'Wikipedia verification failed', { claim: claim.slice(0, 80), error: String(err) });
+    // Fall back to stale cache if available
+    if (cached) {
+      log('info', 'Wikipedia unreachable — serving stale cache', { claim: claim.slice(0, 80) });
+      return cached.result;
+    }
     return { confidence: 50, snippet: '', found: false };
   }
+}
+
+/** Exposed for testing: clear the Wikipedia result cache */
+export function clearWikipediaCache(): void {
+  wikiCache.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +725,7 @@ export async function detectHallucinations(
         messageId,
         overallConfidence,
         claimsFound: claims.length,
-        lowConfidenceClaims: results.filter(r => r.confidence < CONFIDENCE_FLAG_THRESHOLD).map(r => r.claim.slice(0, 80)),
+        lowConfidenceClaims: results.filter(r => r.confidence < confidenceFlagThreshold).map(r => r.claim.slice(0, 80)),
       });
     } else {
       log('info', 'Hallucination check passed', { messageId, overallConfidence, claimsVerified: verified.length });

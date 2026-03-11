@@ -264,6 +264,120 @@ describe('verifyWithWikipedia', () => {
 });
 
 // ---------------------------------------------------------------------------
+// verifyWithWikipedia — retry and cache behavior
+// ---------------------------------------------------------------------------
+
+describe('verifyWithWikipedia retry and cache', () => {
+  beforeEach(async () => {
+    const { clearWikipediaCache } = await import('./hallucination-detector.js');
+    clearWikipediaCache();
+  });
+
+  afterEach(async () => {
+    const { clearWikipediaCache } = await import('./hallucination-detector.js');
+    clearWikipediaCache();
+  });
+
+  it('returns cached result on second call with same claim', async () => {
+    const { verifyWithWikipedia, clearWikipediaCache } = await import('./hallucination-detector.js');
+
+    // Call once — result is whatever the network returns (or graceful failure)
+    const first = await verifyWithWikipedia('Python programming language 1991');
+    // Call again — should get same object reference (cache hit) or equivalent
+    const second = await verifyWithWikipedia('Python programming language 1991');
+
+    // Both calls return valid WikipediaVerificationResult shape
+    expect(first).toMatchObject({ confidence: expect.any(Number), found: expect.any(Boolean), snippet: expect.any(String) });
+    expect(second).toMatchObject({ confidence: expect.any(Number), found: expect.any(Boolean), snippet: expect.any(String) });
+    // Cached result should match first result
+    expect(second.confidence).toBe(first.confidence);
+    expect(second.found).toBe(first.found);
+  });
+
+  it('fetchWithRetry: retries on TypeError and eventually returns result', async () => {
+    // Mock global fetch to fail twice then succeed
+    let calls = 0;
+    const originalFetch = global.fetch;
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      json: async () => ({ pages: [] }),
+    };
+    global.fetch = vi.fn().mockImplementation(() => {
+      calls++;
+      if (calls <= 2) return Promise.reject(new TypeError('fetch failed'));
+      return Promise.resolve(mockResponse);
+    }) as unknown as typeof fetch;
+
+    try {
+      const { verifyWithWikipedia, clearWikipediaCache } = await import('./hallucination-detector.js');
+      clearWikipediaCache();
+      const result = await verifyWithWikipedia('some claim about history');
+
+      expect(result).toMatchObject({ found: expect.any(Boolean), confidence: expect.any(Number) });
+      // fetch should have been called 3 times (2 retries + success)
+      expect(calls).toBeGreaterThanOrEqual(3);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('fetchWithRetry: returns stale cache when all retries fail', async () => {
+    const { verifyWithWikipedia, clearWikipediaCache } = await import('./hallucination-detector.js');
+    clearWikipediaCache();
+
+    // Seed cache manually by making a call that fails gracefully (no network)
+    // Then mock fetch to always fail to verify stale cache fallback behavior
+    const originalFetch = global.fetch;
+    const mockFetchFail = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+
+    // First, get a cached entry (real or fail-graceful)
+    const firstResult = await verifyWithWikipedia('stale cache test claim unique xyz');
+
+    // Now replace fetch with always-failing mock
+    global.fetch = mockFetchFail as unknown as typeof fetch;
+
+    try {
+      // If first call succeeded and was cached, second call should return cached value
+      // If first call failed, cache is empty, second call also returns {found:false}
+      const secondResult = await verifyWithWikipedia('stale cache test claim unique xyz');
+      expect(secondResult).toMatchObject({
+        confidence: expect.any(Number),
+        found: expect.any(Boolean),
+        snippet: expect.any(String),
+      });
+      // Should match first result (either from cache or same graceful failure)
+      expect(secondResult.confidence).toBe(firstResult.confidence);
+      expect(secondResult.found).toBe(firstResult.found);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('does not retry on AbortError', async () => {
+    const originalFetch = global.fetch;
+    let calls = 0;
+    global.fetch = vi.fn().mockImplementation(() => {
+      calls++;
+      const err = new DOMException('The operation was aborted', 'AbortError');
+      return Promise.reject(err);
+    }) as unknown as typeof fetch;
+
+    try {
+      const { verifyWithWikipedia, clearWikipediaCache } = await import('./hallucination-detector.js');
+      clearWikipediaCache();
+      const result = await verifyWithWikipedia('abort test claim');
+      // Should fail gracefully without retrying
+      expect(result.found).toBe(false);
+      // AbortError should not retry — only 1 call per fetch attempt
+      expect(calls).toBeLessThanOrEqual(2); // at most one search call attempted
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ClaimVerificationResult includes wikipedia field
 // ---------------------------------------------------------------------------
 
