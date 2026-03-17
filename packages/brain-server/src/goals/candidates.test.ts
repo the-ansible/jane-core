@@ -43,7 +43,7 @@ vi.mock('../executor/index.js', () => ({
 }));
 
 // Import AFTER mocking
-const { generateCandidates, scoreCandidates, selectBestCandidate } = await import('./candidates.js');
+const { generateCandidates, scoreCandidates, selectBestCandidate, DEFAULT_MIN_SCORE } = await import('./candidates.js');
 
 beforeEach(() => {
   mockInvokeAdapter.mockReset();
@@ -421,7 +421,7 @@ describe('selectBestCandidate', () => {
       goalTitle: 'Become a more capable assistant',
       description: 'Default action',
       rationale: '',
-      score: 7,
+      score: 9,   // above DEFAULT_MIN_SCORE (8.0) so threshold tests use explicit overrides
       needsWorkspace: false,
       projectPaths: [],
       ...overrides,
@@ -477,5 +477,55 @@ describe('selectBestCandidate', () => {
 
     const result = selectBestCandidate([c1, c2], goals);
     expect(result?.description).toBe('First tied'); // falls back to sort order
+  });
+
+  // ---------------------------------------------------------------------------
+  // Minimum score threshold (Phase 8.3)
+  // ---------------------------------------------------------------------------
+
+  it('DEFAULT_MIN_SCORE is 8.0', () => {
+    expect(DEFAULT_MIN_SCORE).toBe(8.0);
+  });
+
+  it('returns null when best candidate score is below default threshold', () => {
+    const c = makeCandidate({ description: 'Low confidence', score: 7.9 });
+    expect(selectBestCandidate([c], [makeGoal()])).toBeNull();
+  });
+
+  it('returns candidate when score exactly meets default threshold', () => {
+    const c = makeCandidate({ description: 'Meets threshold', score: 8.0 });
+    expect(selectBestCandidate([c], [makeGoal()])?.description).toBe('Meets threshold');
+  });
+
+  it('returns candidate when score exceeds default threshold', () => {
+    const c = makeCandidate({ description: 'Above threshold', score: 9.5 });
+    expect(selectBestCandidate([c], [makeGoal()])?.description).toBe('Above threshold');
+  });
+
+  it('skips all candidates when all score below threshold', () => {
+    const goals = [makeGoal()];
+    const candidates = [
+      makeCandidate({ description: 'Best but still low', score: 7.5 }),
+      makeCandidate({ description: 'Second low',         score: 6.0 }),
+      makeCandidate({ description: 'Third low',          score: 4.0 }),
+    ];
+    expect(selectBestCandidate(candidates, goals)).toBeNull();
+  });
+
+  it('respects a custom minScore parameter', () => {
+    const goals = [makeGoal()];
+    const c = makeCandidate({ description: 'Passes low threshold', score: 5.0 });
+    // With custom minScore of 4.0, score 5.0 should be accepted
+    expect(selectBestCandidate([c], goals, 4.0)?.description).toBe('Passes low threshold');
+    // Same candidate fails the default threshold of 8.0
+    expect(selectBestCandidate([c], goals)).toBeNull();
+  });
+
+  it('returns null for zero-score candidate even with threshold 0 not met', () => {
+    // Edge case: score undefined treated as 0, threshold 0 — meets threshold
+    const c = makeCandidate({ description: 'Zero score', score: 0 });
+    expect(selectBestCandidate([c], [makeGoal()], 0)).toBe(c);
+    // But fails with threshold 0.1
+    expect(selectBestCandidate([c], [makeGoal()], 0.1)).toBeNull();
   });
 });
