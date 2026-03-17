@@ -13,6 +13,9 @@ import { computeCompositeScore } from './types.js';
 // Candidates within this score band are considered tied; goal priority breaks the tie.
 const TIE_THRESHOLD = 0.5;
 
+/** Default minimum composite score (0-10) a candidate must meet to be executed. */
+export const DEFAULT_MIN_SCORE = 8.0;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -181,17 +184,32 @@ Respond ONLY with a JSON array, one object per candidate, in the same order:
  * tied. Within a tie group, the candidate targeting the highest-priority goal
  * wins. Falls back to the raw sort order when priorities are equal.
  *
- * @param scored - Candidates sorted descending by composite score (output of scoreCandidates)
- * @param goals  - Active goals (used to resolve goal priorities for tiebreaking)
+ * Returns null if the top candidate's composite score is below minScore —
+ * caller should log a cycle-skipped event and skip execution for this cycle.
+ *
+ * @param scored   - Candidates sorted descending by composite score (output of scoreCandidates)
+ * @param goals    - Active goals (used to resolve goal priorities for tiebreaking)
+ * @param minScore - Minimum composite score required to execute (default: DEFAULT_MIN_SCORE)
  */
 export function selectBestCandidate(
   scored: CandidateAction[],
   goals: Goal[],
+  minScore: number = DEFAULT_MIN_SCORE,
 ): CandidateAction | null {
   if (scored.length === 0) return null;
 
   const best = scored[0];
   const bestScore = best.score ?? 0;
+
+  // Reject the entire slate if no candidate clears the minimum threshold
+  if (bestScore < minScore) {
+    log('info', 'Best candidate below minimum score threshold — cycle will be skipped', {
+      bestScore,
+      minScore,
+      description: best.description.slice(0, 80),
+    });
+    return null;
+  }
 
   // Collect all candidates tied with the best
   const tied = scored.filter((c) => bestScore - (c.score ?? 0) <= TIE_THRESHOLD);

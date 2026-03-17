@@ -20,7 +20,7 @@
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import { listActiveGoals, listActiveGoalsByLane, listExecutingGoalIds, touchGoalEvaluated, createGoalAction, updateGoalAction, updateGoal, getGoal, getGoalAction, createCycle, completeCycle, failCycle, listCycles, recoverStaleGoalActions, failExecutingGoalActionByJobId, listRecentDoneActionsPerGoal, listCompletedActionsForGoal, countReviewedUnachievedActions, listGoalActions, listRecentCompletedActionsGlobal, getNextLane } from './registry.js';
-import { generateCandidates, scoreCandidates, selectBestCandidate } from './candidates.js';
+import { generateCandidates, scoreCandidates, selectBestCandidate, DEFAULT_MIN_SCORE } from './candidates.js';
 import type { GoalLane } from './types.js';
 import { ALL_LANES } from './types.js';
 import { buildReviewPrompt, parseReviewVerdict } from './reviewer.js';
@@ -43,6 +43,9 @@ const MAX_REVIEWED_ATTEMPTS = 3;
 const DEFAULT_CYCLE_INTERVAL_MS = 1 * 60 * 60 * 1000;
 const SCHEDULER_KEY = 'goal-engine';
 
+/** Minimum composite score (0-10) required to execute a candidate. Configurable via GOAL_MIN_SCORE_THRESHOLD. */
+let minScoreThreshold = DEFAULT_MIN_SCORE;
+
 const sc = StringCodec();
 
 let cycleTimer: ReturnType<typeof setInterval> | null = null;
@@ -63,6 +66,11 @@ const PAUSE_KEY = 'goal-engine-paused';
 export function startGoalEngine(nats: NatsConnection): void {
   cycleIntervalMs = parseInt(process.env.GOAL_CYCLE_INTERVAL_MS ?? '', 10)
     || DEFAULT_CYCLE_INTERVAL_MS;
+
+  const envThreshold = parseFloat(process.env.GOAL_MIN_SCORE_THRESHOLD ?? '');
+  if (!isNaN(envThreshold) && envThreshold >= 0 && envThreshold <= 10) {
+    minScoreThreshold = envThreshold;
+  }
 
   // Recover goal actions stuck in transitional states from a previous server run
   recoverStaleGoalActions()
@@ -135,7 +143,7 @@ export function startGoalEngine(nats: NatsConnection): void {
     })
     .catch((err) => log('warn', 'Failed to restore pause state', { error: String(err) }));
 
-  log('info', 'Goal engine started', { intervalMs: cycleIntervalMs });
+  log('info', 'Goal engine started', { intervalMs: cycleIntervalMs, minScoreThreshold });
 }
 
 /**
@@ -298,15 +306,24 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     // 4. Score candidates — pass context so scorer can penalize duplicates
     const scored = await scoreCandidates(candidates, goals, context);
 
-    // 5. Select best — picks highest-scoring candidate, breaks ties by goal priority
-    const best = selectBestCandidate(scored, goals);
+    // 5. Select best — picks highest-scoring candidate above the minimum threshold,
+    //    breaks ties by goal priority. Returns null if all candidates score below the threshold.
+    const best = selectBestCandidate(scored, goals, minScoreThreshold);
 
     // Emit per-candidate scoring metrics to the NDJSON log for analysis
     emitScoringMetrics(cycleId, scored, best);
 
     if (!best) {
       for (const g of goals) await touchGoalEvaluated(g.id);
-      await completeCycle(cycleId, goals.length, candidates.length, null, 'No candidates after scoring');
+
+      // Distinguish threshold skip (candidates existed but scored too low) from empty slate
+      const skipReason = scored.length > 0
+        ? `cycle-skipped: best candidate score (${(scored[0].score ?? 0).toFixed(1)}) below minimum threshold (${minScoreThreshold})`
+        : 'No candidates after scoring';
+
+      log('info', skipReason, { cycleId, bestScore: scored[0]?.score, minScoreThreshold });
+      await completeCycle(cycleId, goals.length, candidates.length, null, skipReason);
+      publishCycleStatus(nats, cycleId, scored.length > 0 ? 'skipped' : 'done', skipReason, null);
       return;
     }
 
