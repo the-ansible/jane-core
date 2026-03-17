@@ -8,7 +8,8 @@
  */
 
 import pg from 'pg';
-import type { Goal, GoalAction, GoalCycle, GoalLevel, GoalStatus, ActionStatus, CycleStatus } from './types.js';
+import type { Goal, GoalAction, GoalCycle, GoalLevel, GoalStatus, ActionStatus, CycleStatus, GoalLane, LaneActivity } from './types.js';
+import { ALL_LANES } from './types.js';
 
 const { Pool } = pg;
 
@@ -85,6 +86,12 @@ export async function initGoalRegistry(): Promise<void> {
   // Migrations for existing tables
   await p.query(`ALTER TABLE ${SCHEMA}.goal_actions ADD COLUMN IF NOT EXISTS review_text TEXT`);
   await p.query(`ALTER TABLE ${SCHEMA}.goal_actions ADD COLUMN IF NOT EXISTS review_job_id UUID REFERENCES ${SCHEMA}.agent_jobs(id)`);
+  // Lane columns
+  await p.query(`ALTER TABLE ${SCHEMA}.goals ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT 'system' CHECK (lane IN ('system','self','craft'))`);
+  await p.query(`ALTER TABLE ${SCHEMA}.goal_actions ADD COLUMN IF NOT EXISTS lane TEXT CHECK (lane IN ('system','self','craft'))`);
+  await p.query(`ALTER TABLE ${SCHEMA}.goal_cycles ADD COLUMN IF NOT EXISTS lane TEXT CHECK (lane IN ('system','self','craft'))`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_goals_lane ON ${SCHEMA}.goals (lane)`);
+  await p.query(`CREATE INDEX IF NOT EXISTS idx_goal_actions_lane ON ${SCHEMA}.goal_actions (lane, updated_at DESC)`);
   // Update check constraint to include 'reviewing' status
   await p.query(`
     DO $$ BEGIN
@@ -155,6 +162,7 @@ export async function createGoal(params: {
   motivation?: string;
   level: GoalLevel;
   priority?: number;
+  lane?: GoalLane;
   parentId?: string;
   successCriteria?: string;
 }): Promise<string> {
@@ -171,8 +179,8 @@ export async function createGoal(params: {
   }
 
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO ${SCHEMA}.goals (title, description, motivation, level, priority, parent_id, success_criteria)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO ${SCHEMA}.goals (title, description, motivation, level, priority, lane, parent_id, success_criteria)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id`,
     [
       params.title,
@@ -180,6 +188,7 @@ export async function createGoal(params: {
       params.motivation ?? null,
       params.level,
       params.priority ?? 50,
+      params.lane ?? 'system',
       params.parentId ?? null,
       params.successCriteria ?? null,
     ]
@@ -220,6 +229,7 @@ export async function updateGoal(id: string, updates: Partial<{
   level: GoalLevel;
   priority: number;
   status: GoalStatus;
+  lane: GoalLane;
   parentId: string | null;
   successCriteria: string;
   progressNotes: string;
@@ -234,6 +244,7 @@ export async function updateGoal(id: string, updates: Partial<{
   if (updates.level !== undefined)           { sets.push(`level = $${i++}`);            vals.push(updates.level); }
   if (updates.priority !== undefined)        { sets.push(`priority = $${i++}`);         vals.push(updates.priority); }
   if (updates.status !== undefined)          { sets.push(`status = $${i++}`);           vals.push(updates.status); }
+  if (updates.lane !== undefined)            { sets.push(`lane = $${i++}`);             vals.push(updates.lane); }
   if (updates.parentId !== undefined)        { sets.push(`parent_id = $${i++}`);        vals.push(updates.parentId); }
   if (updates.successCriteria !== undefined) { sets.push(`success_criteria = $${i++}`); vals.push(updates.successCriteria); }
   if (updates.progressNotes !== undefined)   { sets.push(`progress_notes = $${i++}`);   vals.push(updates.progressNotes); }
@@ -266,10 +277,11 @@ export async function createGoalAction(params: {
   rationale?: string;
   score?: number;
   status?: ActionStatus;
+  lane?: GoalLane;
 }): Promise<string> {
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO ${SCHEMA}.goal_actions (goal_id, cycle_id, description, rationale, score, status)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO ${SCHEMA}.goal_actions (goal_id, cycle_id, description, rationale, score, status, lane)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING id`,
     [
       params.goalId,
@@ -278,6 +290,7 @@ export async function createGoalAction(params: {
       params.rationale ?? null,
       params.score ?? null,
       params.status ?? 'proposed',
+      params.lane ?? null,
     ]
   );
   return rows[0].id;
@@ -549,12 +562,68 @@ export async function failExecutingGoalActionByJobId(jobId: string, reason: stri
 }
 
 // ---------------------------------------------------------------------------
+// Lane queries
+// ---------------------------------------------------------------------------
+
+/** List active goals filtered by lane. */
+export async function listActiveGoalsByLane(lane: GoalLane): Promise<Goal[]> {
+  const { rows } = await getPool().query<Goal>(
+    `SELECT * FROM ${SCHEMA}.goals WHERE status = 'active' AND lane = $1 ORDER BY priority DESC, created_at ASC`,
+    [lane]
+  );
+  return rows;
+}
+
+/**
+ * Return the most recent completed action timestamp per lane.
+ * Joins through goals to get the lane from the goal, not the action.
+ * Used to determine which lane is most neglected.
+ */
+export async function listRecentLaneActivity(): Promise<LaneActivity> {
+  const { rows } = await getPool().query<{ lane: string; last_at: Date }>(
+    `SELECT g.lane, MAX(ga.updated_at) AS last_at
+     FROM ${SCHEMA}.goal_actions ga
+     JOIN ${SCHEMA}.goals g ON g.id = ga.goal_id
+     WHERE ga.status IN ('done', 'failed')
+       AND g.lane IS NOT NULL
+     GROUP BY g.lane`,
+  );
+  const result: LaneActivity = { system: null, self: null, craft: null };
+  for (const row of rows) {
+    if (row.lane === 'system' || row.lane === 'self' || row.lane === 'craft') {
+      result[row.lane] = row.last_at;
+    }
+  }
+  return result;
+}
+
+/**
+ * Determine which lane should be served next.
+ * Picks the lane whose most recent completed action is oldest (or never used).
+ * Falls back to 'system' on error.
+ */
+export async function getNextLane(): Promise<GoalLane> {
+  const activity = await listRecentLaneActivity();
+  let oldestLane: GoalLane = ALL_LANES[0];
+  let oldestTime = Infinity;
+  for (const lane of ALL_LANES) {
+    const t = activity[lane]?.getTime() ?? 0;
+    if (t < oldestTime) {
+      oldestTime = t;
+      oldestLane = lane;
+    }
+  }
+  return oldestLane;
+}
+
+// ---------------------------------------------------------------------------
 // Goal Cycles
 // ---------------------------------------------------------------------------
 
-export async function createCycle(): Promise<string> {
+export async function createCycle(lane?: GoalLane): Promise<string> {
   const { rows } = await getPool().query<{ id: string }>(
-    `INSERT INTO ${SCHEMA}.goal_cycles DEFAULT VALUES RETURNING id`
+    `INSERT INTO ${SCHEMA}.goal_cycles (lane) VALUES ($1) RETURNING id`,
+    [lane ?? null]
   );
   return rows[0].id;
 }

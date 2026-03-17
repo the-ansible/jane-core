@@ -7,6 +7,22 @@ export type GoalStatus = 'active' | 'paused' | 'achieved' | 'abandoned';
 export type ActionStatus = 'proposed' | 'selected' | 'executing' | 'reviewing' | 'done' | 'failed' | 'rejected';
 export type CycleStatus = 'running' | 'done' | 'failed';
 
+/**
+ * Lane taxonomy for balanced goal attention.
+ *
+ * Lanes live on GOALS, not on actions. A goal's lane represents the purpose
+ * the work serves, not the type of work being done. A craft goal like
+ * "be known on the Internet" might generate a technical action (build a sitemap),
+ * but that action still serves the craft purpose.
+ *
+ * - system: Infrastructure, maintenance, health, deployments
+ * - self:   Behavioral research, personality study, introspection
+ * - craft:  Writing, publishing, creative output, public presence
+ */
+export type GoalLane = 'system' | 'self' | 'craft';
+
+export const ALL_LANES: GoalLane[] = ['system', 'self', 'craft'];
+
 export interface Goal {
   id: string;
   title: string;
@@ -15,6 +31,7 @@ export interface Goal {
   level: GoalLevel;
   priority: number;           // 1-100, higher = more important
   status: GoalStatus;
+  lane: GoalLane;             // which lane this goal serves
   parent_id: string | null;
   success_criteria: string | null;
   progress_notes: string | null;
@@ -35,6 +52,7 @@ export interface GoalAction {
   outcome_text: string | null;
   review_text: string | null;
   review_job_id: string | null;
+  lane: GoalLane | null;      // inherited from goal at creation time (for analytics)
   created_at: Date;
   updated_at: Date;
 }
@@ -42,12 +60,20 @@ export interface GoalAction {
 export interface GoalCycle {
   id: string;
   status: CycleStatus;
+  lane: GoalLane | null;      // which lane this cycle targeted
   goals_assessed: number;
   candidates_generated: number;
   action_selected_id: string | null;
   cycle_notes: string | null;
   started_at: Date;
   completed_at: Date | null;
+}
+
+/** Per-lane timestamp of the most recently completed action. null means never used. */
+export interface LaneActivity {
+  system: Date | null;
+  self: Date | null;
+  craft: Date | null;
 }
 
 /**

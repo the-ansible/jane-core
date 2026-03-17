@@ -33,6 +33,11 @@ import { compactAndIngest, searchMemory } from './graphiti.js';
 import { detectHallucinations } from './hallucination-detector.js';
 import { analyzeClarification } from './clarifier.js';
 import { formatWithConfidenceBadges } from './response-formatter.js';
+import {
+  setPendingFeedback,
+  buildFeedbackPrompt,
+  handleFeedbackReply,
+} from './feedback-prompter.js';
 
 const sc = StringCodec();
 
@@ -158,6 +163,44 @@ async function handleAgentResponse(
   pipelineStart: number,
   runId: string,
 ): Promise<PipelineResult> {
+  // 0. Check if this message is a feedback reply to a pending confidence-flag prompt.
+  //    If so, record the verdict and acknowledge — no need to invoke the full LLM pipeline.
+  const feedbackResult = handleFeedbackReply(event.sessionId, event.content);
+  if (feedbackResult.handled) {
+    const ackMessage = feedbackResult.skipped
+      ? 'Got it, skipping the feedback.'
+      : feedbackResult.verdict?.verdict === 'confirmed'
+        ? 'Thanks for confirming. Noted.'
+        : `Thanks for the correction. I've logged it.`;
+
+    // Publish acknowledgement via NATS if connected
+    if (deps.nats) {
+      const ackEvent = {
+        v: COMMUNICATION_EVENT_VERSION,
+        id: uuidv7(),
+        parentId: event.id,
+        sessionId: event.sessionId,
+        channelType: event.channelType,
+        direction: 'outbound' as const,
+        contentType: 'markdown' as const,
+        content: ackMessage,
+        sender: { id: 'jane', displayName: 'Jane', type: 'agent' as const },
+        recipients: event.sender ? [{ id: event.sender.id, displayName: event.sender.displayName, type: event.sender.type }] : [],
+        metadata: { feedbackAck: true },
+        timestamp: new Date().toISOString(),
+      };
+      const ackSubject = `communication.outbound.${event.channelType}`;
+      try {
+        deps.nats.publish(ackSubject, sc.encode(JSON.stringify(ackEvent)));
+        pushEvent(ackEvent as CommunicationEvent, ackSubject);
+      } catch { /* non-critical */ }
+    }
+
+    recordPipelineOutcome({ action: 'feedback-ack', responded: true, totalMs: Date.now() - pipelineStart });
+    completeRun(runId, 'success', { routeAction: 'feedback-ack' });
+    return { action: routing.action, reason: 'feedback-reply-handled', responded: true };
+  }
+
   // Safety check before LLM calls
   beginStage(runId, 'safety_check');
   if (deps.safety) {
@@ -252,6 +295,7 @@ async function handleAgentResponse(
   // Detects factual claims, verifies them, then formats the message with
   // per-claim confidence badges (✅ verified / ⚠️ uncertain / 🚨 low confidence).
   let finalMessage = composedMessage;
+  let hallucinationReport: import('./hallucination-detector.js').HallucinationReport | null = null;
   try {
     const nullDetector = { report: { messageId: event.id, timestamp: new Date().toISOString(), claimsFound: 0, claimsVerified: 0, overallConfidence: 100, flagged: false, results: [] }, annotatedMessage: composedMessage };
     const { report } = await Promise.race([
@@ -262,6 +306,7 @@ async function handleAgentResponse(
     ]);
     // Apply the formatting layer: per-claim badges + verification section
     finalMessage = formatWithConfidenceBadges(composedMessage, report);
+    hallucinationReport = report;
   } catch {
     // Non-blocking: any error falls back to original message
     finalMessage = composedMessage;
@@ -388,6 +433,55 @@ async function handleAgentResponse(
     recordPipelineOutcome({
       action: routing.action, responded: true, agentMs, composerMs, totalMs: Date.now() - pipelineStart,
     });
+
+    // 5.7 If confidence flags were added, store pending feedback state and send a brief
+    // follow-up asking Chris to confirm or correct. Fire-and-forget — never blocks.
+    if (hallucinationReport && deps.nats) {
+      const flaggedClaims = hallucinationReport.results.filter(
+        r => r.source !== 'skipped' && r.confidence < 80,
+      );
+      if (flaggedClaims.length > 0) {
+        const pendingReq = {
+          messageId: responseEvent.id,
+          sessionId: event.sessionId,
+          claims: flaggedClaims.map(r => ({ text: r.claim, confidence: r.confidence })),
+          createdAt: Date.now(),
+        };
+        setPendingFeedback(event.sessionId, responseEvent.id, hallucinationReport);
+        // Capture nats ref for the timeout closure
+        const natsRef = deps.nats;
+        const promptText = buildFeedbackPrompt(pendingReq);
+        // Small delay so the follow-up appears after the main response
+        setTimeout(() => {
+          try {
+            const promptEvent = {
+              v: COMMUNICATION_EVENT_VERSION,
+              id: uuidv7(),
+              parentId: responseEvent.id,
+              sessionId: event.sessionId,
+              channelType: event.channelType,
+              direction: 'outbound' as const,
+              contentType: 'markdown' as const,
+              content: promptText,
+              sender: { id: 'jane', displayName: 'Jane', type: 'agent' as const },
+              recipients: event.sender ? [{ id: event.sender.id, displayName: event.sender.displayName, type: event.sender.type }] : [],
+              metadata: { feedbackPrompt: true },
+              timestamp: new Date().toISOString(),
+            };
+            const promptSubject = `communication.outbound.${event.channelType}`;
+            natsRef.publish(promptSubject, sc.encode(JSON.stringify(promptEvent)));
+            pushEvent(promptEvent as CommunicationEvent, promptSubject);
+            pipelineLog('info', 'Confidence feedback prompt sent', {
+              sessionId: event.sessionId,
+              messageId: responseEvent.id,
+              flaggedCount: flaggedClaims.length,
+            });
+          } catch (err) {
+            pipelineLog('warn', 'Failed to send confidence feedback prompt', { error: String(err) });
+          }
+        }, 500);
+      }
+    }
 
     return {
       action: routing.action, reason: routing.reason, responded: true,

@@ -48,8 +48,8 @@ import type { JobType } from '../jobs/types.js';
 import {
   listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles,
 } from '../goals/registry.js';
-import { isCycleActive } from '../goals/engine.js';
-import type { GoalLevel, GoalStatus } from '../goals/types.js';
+import { isCycleActive, isEnginePaused, pauseGoalEngine, resumeGoalEngine, isEngineRunning } from '../goals/engine.js';
+import type { GoalLevel, GoalStatus, GoalLane } from '../goals/types.js';
 import {
   getLayerStatuses, getLayerStatus, isInitialized,
   triggerStrategicEvaluation, issueDirective,
@@ -228,6 +228,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
 
   app.post('/api/goals/cycles/trigger', async (c) => {
     if (!deps.nats) return c.json({ error: 'NATS not connected' }, 503);
+    if (isEnginePaused()) return c.json({ error: 'Goal engine is paused' }, 409);
     if (isCycleActive()) return c.json({ error: 'Cycle already running' }, 409);
 
     try {
@@ -236,6 +237,20 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }
+  });
+
+  app.post('/api/goals/engine/pause', async (c) => {
+    await pauseGoalEngine();
+    return c.json({ status: 'paused', running: isEngineRunning(), paused: true });
+  });
+
+  app.post('/api/goals/engine/resume', async (c) => {
+    await resumeGoalEngine();
+    return c.json({ status: 'resumed', running: isEngineRunning(), paused: false });
+  });
+
+  app.get('/api/goals/engine/status', async (c) => {
+    return c.json({ running: isEngineRunning(), paused: isEnginePaused(), cycleActive: isCycleActive() });
   });
 
   app.get('/api/goals/:id', async (c) => {
@@ -257,6 +272,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         motivation?: string;
         level?: GoalLevel;
         priority?: number;
+        lane?: GoalLane;
         parentId?: string;
         successCriteria?: string;
       };
@@ -271,6 +287,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         motivation: body.motivation,
         level: body.level,
         priority: body.priority,
+        lane: body.lane,
         parentId: body.parentId,
         successCriteria: body.successCriteria,
       });
@@ -295,6 +312,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         level: GoalLevel;
         priority: number;
         status: GoalStatus;
+        lane: GoalLane;
         parentId: string | null;
         successCriteria: string;
         progressNotes: string;
