@@ -3,6 +3,8 @@
  *
  * GET  /health                    — liveness check
  * GET  /metrics                   — running job count + uptime
+ * GET  /api/health/timeout-overflow        — TimeoutOverflowWarning event count + log
+ * POST /api/health/timeout-overflow/reset  — reset counter
  * GET  /api/jobs                  — list recent jobs
  * GET  /api/jobs/:id              — get a specific job
  * POST /api/jobs                  — submit a job directly via HTTP
@@ -65,6 +67,7 @@ import { runConsolidation, isConsolidating, getLastConsolidationResult } from '.
 import type { MemoryType, MemorySource } from '../memory/types.js';
 import { runBackfill } from '../memory/backfill.js';
 import { getIngestionHistory, countIngestedSessions } from '../memory/ingestion-log.js';
+import { getTimeoutOverflowStats, resetTimeoutOverflowCount } from '../layers/timeout-overflow-monitor.js';
 
 const sc = StringCodec();
 
@@ -93,6 +96,19 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       uptimeMs: Date.now() - startTime,
       ts: new Date().toISOString(),
     });
+  });
+
+  // GET /api/health/timeout-overflow — TimeoutOverflowWarning event counts and recent log
+  // POST /api/health/timeout-overflow/reset — reset counter (testing / after a deploy)
+  app.get('/api/health/timeout-overflow', (c) => {
+    const stats = getTimeoutOverflowStats();
+    const status = stats.totalCount >= stats.alertThreshold ? 'warning' : 'ok';
+    return c.json({ status, ...stats, ts: new Date().toISOString() });
+  });
+
+  app.post('/api/health/timeout-overflow/reset', (c) => {
+    resetTimeoutOverflowCount();
+    return c.json({ reset: true, ts: new Date().toISOString() });
   });
 
   app.get('/api/jobs', async (c) => {
