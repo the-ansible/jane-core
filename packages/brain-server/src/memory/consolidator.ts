@@ -231,14 +231,14 @@ function scheduleNext(): void {
     nextRunAt: new Date(Date.now() + CONSOLIDATION_INTERVAL_MS).toISOString(),
   }).catch((err) => log('warn', 'Failed to persist consolidator scheduler state', { error: String(err) }));
 
-  consolidationTimer = setTimeout(async () => {
+  consolidationTimer = safeTimeout(async () => {
     try {
       await runConsolidation();
     } catch (err) {
       log('error', 'Scheduled consolidation threw', { error: String(err) });
     }
     scheduleNext();
-  }, CONSOLIDATION_INTERVAL_MS);
+  }, CONSOLIDATION_INTERVAL_MS, 'consolidator-schedule');
 }
 
 async function claudeGenerate(prompt: string): Promise<string> {

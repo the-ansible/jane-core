@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readAllFeedback, type ClaimFeedback } from './feedback-collector.js';
+import { safeTimeout } from '../safe-timeout.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -427,14 +428,14 @@ function scheduleNextRun(): void {
   const nextRunAt = new Date(Date.now() + ms).toISOString();
   log('info', 'Retraining pipeline scheduled', { nextRunAt, ms });
 
-  retrainingTimer = setTimeout(async () => {
+  retrainingTimer = safeTimeout(async () => {
     try {
       await runRetrainingPipeline();
     } catch (err) {
       log('error', 'Scheduled retraining threw', { error: String(err) });
     }
     scheduleNextRun(); // Re-schedule for the next day
-  }, ms);
+  }, ms, 'retraining-schedule');
 }
 
 /**
