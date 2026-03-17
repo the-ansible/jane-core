@@ -24,6 +24,36 @@ export const MAX_TIMEOUT = 0x7fffffff; // 2^31 - 1 = 2,147,483,647 ms ≈ 24.8 d
 /** Minimum delay — zero is valid; Node fires on the next event-loop tick. */
 export const MIN_TIMEOUT = 0;
 
+// ---------------------------------------------------------------------------
+// Clamp-event telemetry
+// ---------------------------------------------------------------------------
+
+/** Total number of times safeTimeout has clamped an invalid delay. */
+let clampCount = 0;
+
+const recentClamps: Array<{
+  label: string | undefined;
+  requestedMs: number;
+  clampedMs: number;
+  ts: string;
+}> = [];
+
+const MAX_RECENT_CLAMPS = 50;
+
+/** Return clamp statistics — used by the /health/scheduler endpoint. */
+export function getClampStats(): {
+  totalClampCount: number;
+  recentClamps: typeof recentClamps;
+} {
+  return { totalClampCount: clampCount, recentClamps: [...recentClamps] };
+}
+
+/** Reset clamp counters (useful after a deploy / in tests). */
+export function resetClampStats(): void {
+  clampCount = 0;
+  recentClamps.length = 0;
+}
+
 /**
  * Schedule `callback` after `delayMs` milliseconds, with safety validation.
  *
@@ -42,15 +72,21 @@ export function safeTimeout(
   const safe = clampDelay(delayMs);
   if (safe !== delayMs) {
     const tag = label ? ` [${label}]` : '';
+    const ts = new Date().toISOString();
     console.log(
       JSON.stringify({
         level: 'warn',
         msg: `safeTimeout${tag}: clamping invalid delay`,
         requestedMs: delayMs,
         clampedMs: safe,
-        ts: new Date().toISOString(),
+        ts,
       }),
     );
+
+    // Record in telemetry
+    clampCount += 1;
+    recentClamps.push({ label, requestedMs: delayMs, clampedMs: safe, ts });
+    if (recentClamps.length > MAX_RECENT_CLAMPS) recentClamps.shift();
   }
   return setTimeout(callback, safe);
 }

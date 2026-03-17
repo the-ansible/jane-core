@@ -3,6 +3,7 @@
  *
  * GET  /health                    — liveness check
  * GET  /metrics                   — running job count + uptime
+ * GET  /health/scheduler          — scheduler health: overflow warnings + safeTimeout clamp stats + engine status
  * GET  /api/health/timeout-overflow        — TimeoutOverflowWarning event count + log
  * POST /api/health/timeout-overflow/reset  — reset counter
  * GET  /api/jobs                  — list recent jobs
@@ -68,6 +69,7 @@ import type { MemoryType, MemorySource } from '../memory/types.js';
 import { runBackfill } from '../memory/backfill.js';
 import { getIngestionHistory, countIngestedSessions } from '../memory/ingestion-log.js';
 import { getTimeoutOverflowStats, resetTimeoutOverflowCount } from '../layers/timeout-overflow-monitor.js';
+import { getClampStats, resetClampStats } from '../safe-timeout.js';
 
 const sc = StringCodec();
 
@@ -96,6 +98,38 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       uptimeMs: Date.now() - startTime,
       ts: new Date().toISOString(),
     });
+  });
+
+  // GET /health/scheduler — comprehensive scheduler health: overflow warnings + clamp stats + engine status
+  // POST /health/scheduler/reset — reset all scheduler health counters
+  app.get('/health/scheduler', (c) => {
+    const overflowStats = getTimeoutOverflowStats();
+    const clampStats = getClampStats();
+    const overflowStatus = overflowStats.totalCount >= overflowStats.alertThreshold ? 'warning' : 'ok';
+    const clampStatus = clampStats.totalClampCount > 0 ? 'warning' : 'ok';
+    const status = overflowStatus === 'warning' || clampStatus === 'warning' ? 'warning' : 'ok';
+
+    return c.json({
+      status,
+      scheduler: {
+        cycleActive: isCycleActive(),
+      },
+      timeoutOverflow: {
+        status: overflowStatus,
+        ...overflowStats,
+      },
+      safeTimeoutClamps: {
+        status: clampStatus,
+        ...clampStats,
+      },
+      ts: new Date().toISOString(),
+    });
+  });
+
+  app.post('/health/scheduler/reset', (c) => {
+    resetTimeoutOverflowCount();
+    resetClampStats();
+    return c.json({ reset: true, ts: new Date().toISOString() });
   });
 
   // GET /api/health/timeout-overflow — TimeoutOverflowWarning event counts and recent log
