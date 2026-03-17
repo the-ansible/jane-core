@@ -31,7 +31,7 @@ import { assembleContext } from './context/assembler.js';
 import { updateAssemblyOutcome } from './context/db.js';
 import { compactAndIngest, searchMemory } from './graphiti.js';
 import { detectHallucinations } from './hallucination-detector.js';
-import { analyzeClarification } from './clarifier.js';
+import { analyzeClarification, queryChrisInsight } from './clarifier.js';
 import { formatWithConfidenceBadges } from './response-formatter.js';
 import {
   setPendingFeedback,
@@ -218,11 +218,12 @@ async function handleAgentResponse(
   }
   completeStage(runId, 'safety_check');
 
-  // Get assembled context and long-term memory in parallel
+  // Get assembled context, long-term memory, and Chris insights in parallel
   beginStage(runId, 'context_assembly');
-  const [agentContext, graphitiMemory] = await Promise.all([
+  const [agentContext, graphitiMemory, chrisInsightResult] = await Promise.all([
     assembleContext(event.sessionId, 'agent', event.id),
     searchMemory(event.content, 5).catch(() => []),
+    Promise.resolve(queryChrisInsight(event.content, 5)),
   ]);
   completeStage(runId, 'context_assembly');
 
@@ -232,6 +233,17 @@ async function handleAgentResponse(
       msg: 'Graphiti memory retrieved',
       component: 'comm.pipeline',
       factCount: graphitiMemory.length,
+      ts: new Date().toISOString(),
+    }));
+  }
+
+  if (chrisInsightResult.insights.length > 0) {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'Chris Insights retrieved',
+      component: 'comm.pipeline',
+      insightCount: chrisInsightResult.insights.length,
+      topSource: chrisInsightResult.insights[0]?.source,
       ts: new Date().toISOString(),
     }));
   }
@@ -247,6 +259,7 @@ async function handleAgentResponse(
     routing,
     assembledContext: agentContext,
     graphitiMemory,
+    chrisInsights: chrisInsightResult.insights.length > 0 ? chrisInsightResult.summary : undefined,
   });
   const agentMs = Date.now() - agentStart;
 

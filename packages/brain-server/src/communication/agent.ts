@@ -19,6 +19,8 @@ export interface AgentContext {
   assembledContext: AssembledContext;
   graphitiMemory?: MemoryFact[];
   recoveryInfo?: { recoveryCount: number; originalStartedAt: string };
+  /** Prose summary from queryChrisInsight — injected into the agent prompt for real-time context */
+  chrisInsights?: string;
 }
 
 export interface AgentResult {
@@ -97,6 +99,13 @@ Do NOT include any text outside the JSON object.`;
 function buildConversationPrompt(context: AgentContext): string {
   const parts: string[] = [];
   const { assembledContext } = context;
+
+  // Inject Chris Insights (from vault, retrieved via queryChrisInsight)
+  if (context.chrisInsights) {
+    parts.push('CHRIS CONTEXT (from stored insights vault):');
+    parts.push(context.chrisInsights);
+    parts.push('');
+  }
 
   // Inject long-term memory facts from Graphiti
   const facts = context.graphitiMemory?.filter((f) => f.fact?.trim());
