@@ -15,6 +15,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { LayerStatus } from './types.js';
 import { recordLayerEvent, createDirective, getSchedulerState, setSchedulerState } from './registry.js';
+import { safeTimeout } from '../safe-timeout.js';
 import { listGoals, listGoalActions } from '../goals/registry.js';
 import { listCycles } from '../goals/registry.js';
 import { launchAgent } from '../executor/index.js';
@@ -118,7 +119,7 @@ async function scheduleWithRecovery(nats: NatsConnection): Promise<void> {
       // Not yet due — fire a one-shot timeout for the remaining window, then start the regular interval
       nextRunAt = new Date(now + remaining);
       log('info', 'Scheduling strategic evaluation catch-up timer', { remainingMs: remaining, nextRunAt: nextRunAt.toISOString() });
-      evaluationTimer = setTimeout(() => {
+      evaluationTimer = safeTimeout(() => {
         runStrategicEvaluation(nats, 'scheduled').catch((err) =>
           log('error', 'Scheduled strategic evaluation failed', { error: String(err) })
         );
@@ -128,7 +129,7 @@ async function scheduleWithRecovery(nats: NatsConnection): Promise<void> {
             log('error', 'Scheduled strategic evaluation failed', { error: String(err) })
           );
         }, EVALUATION_INTERVAL_MS);
-      }, remaining) as unknown as ReturnType<typeof setInterval>;
+      }, remaining, 'strategic') as unknown as ReturnType<typeof setInterval>;
     }
   } else {
     // No prior state — schedule at normal interval from now

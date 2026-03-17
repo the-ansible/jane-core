@@ -15,6 +15,7 @@
 import { launchClaude } from '@jane-core/claude-launcher';
 import { listMemories, recordMemory, recordPattern, applyImportanceDecay, purgeExpiredMemories } from './registry.js';
 import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
+import { safeTimeout } from '../safe-timeout.js';
 import type { Memory } from './types.js';
 
 const CLAUDE_MODEL = process.env.CONSOLIDATION_CLAUDE_MODEL || 'claude-sonnet-4-6';
@@ -62,12 +63,12 @@ export function startConsolidator(): void {
       } else {
         // Not yet due — schedule for the right time, then switch to regular interval
         log('info', 'Memory consolidator rescheduling to match persisted schedule', { remainingMs: remaining });
-        consolidationTimer = setTimeout(async () => {
+        consolidationTimer = safeTimeout(async () => {
           try { await runConsolidation(); } catch (err) {
             log('error', 'Scheduled consolidation threw', { error: String(err) });
           }
           scheduleNext();
-        }, remaining);
+        }, remaining, 'consolidator');
       }
     })
     .catch(() => scheduleNext()); // If DB unavailable, proceed with normal schedule

@@ -17,6 +17,7 @@ import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
 import type { MonitorResult, LayerStatus } from './types.js';
 import { recordLayerEvent, getSchedulerState, setSchedulerState } from './registry.js';
+import { safeTimeout } from '../safe-timeout.js';
 import pg from 'pg';
 
 const sc = StringCodec();
@@ -64,10 +65,10 @@ function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
         // Due sooner than the full interval — reschedule
         clearInterval(monitorTimer!);
         log('info', 'Autonomic monitor rescheduling to match persisted schedule', { remainingMs: remaining });
-        monitorTimer = setTimeout(() => {
+        monitorTimer = safeTimeout(() => {
           runAllMonitors(nats).catch((err) => log('warn', 'Rescheduled monitor run failed', { error: String(err) }));
           monitorTimer = setInterval(() => runAllMonitors(nats), intervalMs);
-        }, remaining) as unknown as ReturnType<typeof setInterval>;
+        }, remaining, 'autonomic') as unknown as ReturnType<typeof setInterval>;
       }
     })
     .catch((err) => log('warn', 'Failed to recover autonomic schedule from DB', { error: String(err) }));

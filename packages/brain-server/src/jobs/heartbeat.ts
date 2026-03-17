@@ -14,6 +14,7 @@ import { getRunningJobs, markJobUnresponsive } from './registry.js';
 import { getLastActivity } from '../executor/index.js';
 import { failExecutingGoalActionByJobId } from '../goals/registry.js';
 import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
+import { safeTimeout } from '../safe-timeout.js';
 import type { JobAlert } from './types.js';
 
 const POLL_INTERVAL_MS = 30_000;           // check every 30s
@@ -51,12 +52,12 @@ function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
         // Due sooner than full interval — reschedule
         clearInterval(intervalHandle!);
         log('info', 'Heartbeat monitor rescheduling to match persisted schedule', { remainingMs: remaining });
-        intervalHandle = setTimeout(() => {
+        intervalHandle = safeTimeout(() => {
           checkRunningJobs(nats).catch((err) => log('warn', 'Rescheduled heartbeat check failed', { error: String(err) }));
           intervalHandle = setInterval(async () => {
             await checkRunningJobs(nats);
           }, intervalMs);
-        }, remaining) as unknown as NodeJS.Timeout;
+        }, remaining, 'heartbeat') as unknown as NodeJS.Timeout;
       }
     })
     .catch((err) => log('warn', 'Failed to recover heartbeat schedule from DB', { error: String(err) }));

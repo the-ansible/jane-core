@@ -19,8 +19,10 @@
 
 import type { NatsConnection } from 'nats';
 import { StringCodec } from 'nats';
-import { listActiveGoals, listExecutingGoalIds, touchGoalEvaluated, createGoalAction, updateGoalAction, updateGoal, getGoal, getGoalAction, createCycle, completeCycle, failCycle, listCycles, recoverStaleGoalActions, failExecutingGoalActionByJobId, listRecentDoneActionsPerGoal, listCompletedActionsForGoal, countReviewedUnachievedActions, listGoalActions, listRecentCompletedActionsGlobal } from './registry.js';
+import { listActiveGoals, listActiveGoalsByLane, listExecutingGoalIds, touchGoalEvaluated, createGoalAction, updateGoalAction, updateGoal, getGoal, getGoalAction, createCycle, completeCycle, failCycle, listCycles, recoverStaleGoalActions, failExecutingGoalActionByJobId, listRecentDoneActionsPerGoal, listCompletedActionsForGoal, countReviewedUnachievedActions, listGoalActions, listRecentCompletedActionsGlobal, getNextLane } from './registry.js';
 import { generateCandidates, scoreCandidates, selectBestCandidate } from './candidates.js';
+import type { GoalLane } from './types.js';
+import { ALL_LANES } from './types.js';
 import { buildReviewPrompt, parseReviewVerdict } from './reviewer.js';
 import { emitScoringMetrics } from './metrics.js';
 import { getRunningJobs, markJobFailed } from '../jobs/registry.js';
@@ -30,6 +32,7 @@ import type { JobResult } from '../jobs/types.js';
 import { recordGoalCycleMemory } from '../memory/recorder.js';
 import { getGoalContextMemories } from '../memory/retriever.js';
 import { getSchedulerState, setSchedulerState } from '../layers/registry.js';
+import { safeTimeout } from '../safe-timeout.js';
 import { writeGoalActionSnapshot } from '../executor/goal-snapshots.js';
 import vaultSearchModule from '../executor/context/modules/vault-search.js';
 
@@ -45,6 +48,13 @@ const sc = StringCodec();
 let cycleTimer: ReturnType<typeof setInterval> | null = null;
 let isCycleRunning = false;
 let cycleIntervalMs = DEFAULT_CYCLE_INTERVAL_MS;
+let isPaused = false;
+
+/** Cooldown for "no candidates" notifications — avoid spamming Chris. */
+const NO_CANDIDATES_NOTIFY_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
+let lastNoCandidatesNotifyAt: number | null = null;
+
+const PAUSE_KEY = 'goal-engine-paused';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -115,6 +125,16 @@ export function startGoalEngine(nats: NatsConnection): void {
   // Check if we're overdue or can fire sooner than the full interval
   recoverSchedule(nats, cycleIntervalMs);
 
+  // Restore pause state from DB
+  getSchedulerState(PAUSE_KEY)
+    .then((state) => {
+      if (state?.paused === true) {
+        isPaused = true;
+        log('info', 'Goal engine restored paused state from DB');
+      }
+    })
+    .catch((err) => log('warn', 'Failed to restore pause state', { error: String(err) }));
+
   log('info', 'Goal engine started', { intervalMs: cycleIntervalMs });
 }
 
@@ -138,12 +158,12 @@ function recoverSchedule(nats: NatsConnection, intervalMs: number): void {
         // Due sooner than the interval — reschedule to fire at the right time
         clearInterval(cycleTimer!);
         log('info', 'Goal engine rescheduling to match persisted schedule', { remainingMs: remaining });
-        cycleTimer = setTimeout(() => {
+        cycleTimer = safeTimeout(() => {
           runGoalCycle(nats).catch((err) => log('error', 'Scheduled cycle error', { error: String(err) }));
           cycleTimer = setInterval(() => {
             runGoalCycle(nats).catch((err) => log('error', 'Scheduled cycle error', { error: String(err) }));
           }, intervalMs);
-        }, remaining) as unknown as ReturnType<typeof setInterval>;
+        }, remaining, 'goal-engine') as unknown as ReturnType<typeof setInterval>;
       }
       // remaining >= intervalMs: interval already fires at the right time — nothing to do
     })
@@ -166,11 +186,36 @@ export function isCycleActive(): boolean {
   return isCycleRunning;
 }
 
+export function isEnginePaused(): boolean {
+  return isPaused;
+}
+
+/** Pause the goal engine. Persists across restarts via DB. */
+export async function pauseGoalEngine(): Promise<void> {
+  isPaused = true;
+  await setSchedulerState(PAUSE_KEY, { paused: true, pausedAt: new Date().toISOString() })
+    .catch((err) => log('warn', 'Failed to persist pause state', { error: String(err) }));
+  log('info', 'Goal engine paused');
+}
+
+/** Resume the goal engine. Persists across restarts via DB. */
+export async function resumeGoalEngine(): Promise<void> {
+  isPaused = false;
+  await setSchedulerState(PAUSE_KEY, { paused: false })
+    .catch((err) => log('warn', 'Failed to persist resume state', { error: String(err) }));
+  log('info', 'Goal engine resumed');
+}
+
 // ---------------------------------------------------------------------------
 // Core cycle
 // ---------------------------------------------------------------------------
 
 export async function runGoalCycle(nats: NatsConnection): Promise<void> {
+  if (isPaused) {
+    log('info', 'Goal engine is paused — skipping cycle');
+    return;
+  }
+
   if (isCycleRunning) {
     log('info', 'Cycle already running — skipping');
     return;
@@ -185,14 +230,34 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     nextRunAt: new Date(runAt + cycleIntervalMs).toISOString(),
   }).catch((err) => log('warn', 'Failed to persist goal engine scheduler state', { error: String(err) }));
 
-  const cycleId = await createCycle();
-  log('info', 'Goal cycle started', { cycleId });
+  // Determine target lane (least recently served)
+  const targetLane: GoalLane = await getNextLane().catch(() => 'system' as GoalLane);
+  const cycleId = await createCycle(targetLane);
+  log('info', 'Goal cycle started', { cycleId, targetLane });
 
   try {
-    // 1. Load active goals, excluding any already being worked on
-    const [allGoals, executingGoalIds] = await Promise.all([listActiveGoals(), listExecutingGoalIds()]);
+    // 1. Load goals for target lane, excluding any already being worked on.
+    //    If the target lane is empty, try other lanes in neglect order.
+    const executingGoalIds = await listExecutingGoalIds();
     const executingSet = new Set(executingGoalIds);
-    const goals = allGoals.filter((g) => !executingSet.has(g.id));
+
+    let goals: import('./types.js').Goal[] = [];
+    let usedLane: GoalLane = targetLane;
+
+    // Try target lane first, then fall back through other lanes
+    const laneOrder = [targetLane, ...ALL_LANES.filter(l => l !== targetLane)];
+    for (const lane of laneOrder) {
+      const laneGoals = await listActiveGoalsByLane(lane);
+      const available = laneGoals.filter((g) => !executingSet.has(g.id));
+      if (available.length > 0) {
+        goals = available;
+        usedLane = lane;
+        if (lane !== targetLane) {
+          log('info', 'Target lane empty, fell back to next lane', { targetLane, usedLane: lane, cycleId });
+        }
+        break;
+      }
+    }
 
     if (executingGoalIds.length > 0) {
       log('info', 'Skipping goals with active jobs', { skipped: executingGoalIds.length, cycleId });
@@ -209,15 +274,24 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     // 2. Gather context
     const context = await buildContext(goals.map((g) => g.id), goals);
 
-    // 3. Generate candidates via LLM
+    // 3. Generate candidates via LLM (scoped to the lane's goals)
     const candidates = await generateCandidates(goals, context);
-    log('info', 'Candidates generated', { cycleId, count: candidates.length });
+    log('info', 'Candidates generated', { cycleId, count: candidates.length, lane: usedLane });
 
     if (candidates.length === 0) {
       // Still mark goals as evaluated even when LLM is unavailable
       for (const g of goals) await touchGoalEvaluated(g.id);
-      await completeCycle(cycleId, goals.length, 0, null, 'No candidates generated — Claude returned empty array or no matching goal titles');
+      await completeCycle(cycleId, goals.length, 0, null, `No candidates generated for lane:${usedLane}`);
       publishCycleStatus(nats, cycleId, 'done', 'No candidates generated', null);
+
+      // Notify Chris when no candidates are generated, rate-limited to once per 4 hours
+      const now = Date.now();
+      if (lastNoCandidatesNotifyAt === null || now - lastNoCandidatesNotifyAt >= NO_CANDIDATES_NOTIFY_COOLDOWN_MS) {
+        lastNoCandidatesNotifyAt = now;
+        const goalList = goals.map((g) => `- ${g.title}`).join('\n');
+        notifyChris(nats, `My goal engine ran a cycle (lane: ${usedLane}) but couldn't generate any candidate actions. I have ${goals.length} goal${goals.length !== 1 ? 's' : ''} in this lane:\n\n${goalList}\n\nDo any of these feel stuck or unclear? Any context or direction you can give me would help.`);
+      }
+
       return;
     }
 
@@ -250,7 +324,7 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
       });
     }
 
-    // 6. Persist the chosen action
+    // 6. Persist the chosen action (lane inherited from goal for analytics)
     const actionId = await createGoalAction({
       goalId: best.goalId,
       cycleId,
@@ -258,10 +332,11 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
       rationale: best.rationale,
       score: best.score,
       status: 'selected',
+      lane: usedLane,
     });
 
     // Reject the others
-    await persistRejectedCandidates(scored.slice(1), cycleId);
+    await persistRejectedCandidates(scored.slice(1), cycleId, usedLane);
 
     // Mark all assessed goals as evaluated
     for (const g of goals) await touchGoalEvaluated(g.id);
@@ -300,7 +375,7 @@ export async function runGoalCycle(nats: NatsConnection): Promise<void> {
     });
 
     // 8. Complete cycle record
-    await completeCycle(cycleId, goals.length, candidates.length, actionId, `Selected for ${best.goalTitle}: ${best.description.slice(0, 200)}`);
+    await completeCycle(cycleId, goals.length, candidates.length, actionId, `[lane:${usedLane}] Selected for ${best.goalTitle}: ${best.description.slice(0, 200)}`);
     publishCycleStatus(nats, cycleId, 'done', `Executing: ${best.description}`, actionId);
 
     recordGoalCycleMemory({
@@ -433,7 +508,7 @@ async function buildVaultContext(goals: import('./types.js').Goal[]): Promise<st
   return fragment.text;
 }
 
-async function persistRejectedCandidates(candidates: CandidateAction[], cycleId: string): Promise<void> {
+async function persistRejectedCandidates(candidates: CandidateAction[], cycleId: string, lane?: GoalLane): Promise<void> {
   for (const c of candidates) {
     await createGoalAction({
       goalId: c.goalId,
@@ -442,6 +517,7 @@ async function persistRejectedCandidates(candidates: CandidateAction[], cycleId:
       rationale: c.rationale,
       score: c.score,
       status: 'rejected',
+      lane,
     }).catch((err) => log('warn', 'Failed to record rejected candidate', { goalId: c.goalId, error: String(err) }));
   }
 }
