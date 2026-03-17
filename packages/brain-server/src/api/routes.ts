@@ -2,7 +2,7 @@
  * Brain Server HTTP API
  *
  * GET  /health                    — liveness check
- * GET  /metrics                   — running job count + uptime
+ * GET  /metrics                   — Prometheus text format (Accept: text/plain or ?format=prometheus) or JSON; includes TimeoutOverflow + safeTimeout clamp counters
  * GET  /health/scheduler          — scheduler health: overflow warnings + safeTimeout clamp stats + engine status
  * GET  /api/health/timeout-overflow        — TimeoutOverflowWarning event count + log
  * POST /api/health/timeout-overflow/reset  — reset counter
@@ -92,10 +92,55 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
   });
 
   app.get('/metrics', (c) => {
+    const accept = c.req.header('accept') ?? '';
+    const format = c.req.query('format');
+    const wantsPrometheus =
+      format === 'prometheus' ||
+      accept.includes('text/plain') ||
+      accept.includes('application/openmetrics-text');
+
+    const runningJobs = getRunningProcessCount();
+    const uptimeSec = (Date.now() - startTime) / 1000;
+    const overflowStats = getTimeoutOverflowStats();
+    const clampStats = getClampStats();
+
+    if (wantsPrometheus) {
+      const lines: string[] = [
+        '# HELP brain_uptime_seconds Brain server uptime in seconds',
+        '# TYPE brain_uptime_seconds gauge',
+        `brain_uptime_seconds ${uptimeSec.toFixed(3)}`,
+        '',
+        '# HELP brain_running_jobs Current number of running agent jobs',
+        '# TYPE brain_running_jobs gauge',
+        `brain_running_jobs ${runningJobs}`,
+        '',
+        '# HELP brain_timeout_overflow_total Total TimeoutOverflowWarning/TimeoutNaNWarning events since last reset',
+        '# TYPE brain_timeout_overflow_total counter',
+        `brain_timeout_overflow_total ${overflowStats.totalCount}`,
+        '',
+        '# HELP brain_safe_timeout_clamp_total Total number of times safeTimeout clamped an out-of-range delay',
+        '# TYPE brain_safe_timeout_clamp_total counter',
+        `brain_safe_timeout_clamp_total ${clampStats.totalClampCount}`,
+        '',
+        '# HELP brain_timeout_overflow_alert_threshold Count at which a Slack alert is sent',
+        '# TYPE brain_timeout_overflow_alert_threshold gauge',
+        `brain_timeout_overflow_alert_threshold ${overflowStats.alertThreshold}`,
+        '',
+      ];
+      return new Response(lines.join('\n'), {
+        headers: { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' },
+      });
+    }
+
     return c.json({
-      runningJobs: getRunningProcessCount(),
+      runningJobs,
       runningJobIds: getRunningProcessIds(),
       uptimeMs: Date.now() - startTime,
+      scheduler: {
+        timeoutOverflowTotal: overflowStats.totalCount,
+        safeTimeoutClampTotal: clampStats.totalClampCount,
+        alertThreshold: overflowStats.alertThreshold,
+      },
       ts: new Date().toISOString(),
     });
   });
