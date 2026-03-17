@@ -126,6 +126,10 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         '# TYPE brain_timeout_overflow_alert_threshold gauge',
         `brain_timeout_overflow_alert_threshold ${overflowStats.alertThreshold}`,
         '',
+        '# HELP brain_timeout_overflow_window_count TimeoutOverflowWarning events in the last 5-minute rolling window',
+        '# TYPE brain_timeout_overflow_window_count gauge',
+        `brain_timeout_overflow_window_count ${overflowStats.windowCount}`,
+        '',
       ];
       return new Response(lines.join('\n'), {
         headers: { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' },
@@ -138,8 +142,11 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       uptimeMs: Date.now() - startTime,
       scheduler: {
         timeoutOverflowTotal: overflowStats.totalCount,
+        timeoutOverflowWindowCount: overflowStats.windowCount,
         safeTimeoutClampTotal: clampStats.totalClampCount,
         alertThreshold: overflowStats.alertThreshold,
+        windowThreshold: overflowStats.windowThreshold,
+        lastRestartAt: overflowStats.lastRestartAt,
       },
       ts: new Date().toISOString(),
     });
@@ -151,8 +158,9 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     const overflowStats = getTimeoutOverflowStats();
     const clampStats = getClampStats();
     const overflowStatus = overflowStats.totalCount >= overflowStats.alertThreshold ? 'warning' : 'ok';
+    const windowStatus = overflowStats.windowCount >= overflowStats.windowThreshold ? 'critical' : 'ok';
     const clampStatus = clampStats.totalClampCount > 0 ? 'warning' : 'ok';
-    const status = overflowStatus === 'warning' || clampStatus === 'warning' ? 'warning' : 'ok';
+    const status = windowStatus === 'critical' || overflowStatus === 'warning' || clampStatus === 'warning' ? (windowStatus === 'critical' ? 'critical' : 'warning') : 'ok';
 
     return c.json({
       status,
