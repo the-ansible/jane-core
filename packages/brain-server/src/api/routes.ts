@@ -1,7 +1,8 @@
 /**
  * Brain Server HTTP API
  *
- * GET  /health                    — liveness check
+ * GET  /health                    — liveness check (fast, no DB query)
+ * GET  /health/full               — comprehensive health: DB connectivity, NATS, engine status
  * GET  /metrics                   — Prometheus text format (Accept: text/plain or ?format=prometheus) or JSON; includes TimeoutOverflow + safeTimeout clamp counters
  * GET  /health/scheduler          — scheduler health: overflow warnings + safeTimeout clamp stats + engine status
  * GET  /api/health/timeout-overflow        — TimeoutOverflowWarning event count + log
@@ -70,6 +71,7 @@ import { runBackfill } from '../memory/backfill.js';
 import { getIngestionHistory, countIngestedSessions } from '../memory/ingestion-log.js';
 import { getTimeoutOverflowStats, resetTimeoutOverflowCount } from '../layers/timeout-overflow-monitor.js';
 import { getClampStats, resetClampStats } from '../safe-timeout.js';
+import { fullHealthCheck } from './health.js';
 
 const sc = StringCodec();
 
@@ -89,6 +91,14 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
       natsConnected: deps.nats !== null,
       ts: new Date().toISOString(),
     });
+  });
+
+  // GET /health/full — comprehensive readiness check: DB, NATS, uptime
+  // Returns 200 with status:'ok'|'degraded'|'error'. Used by the PM2 health-check script.
+  app.get('/health/full', async (c) => {
+    const result = await fullHealthCheck(deps.nats !== null, Date.now() - startTime);
+    const httpStatus = result.status === 'error' ? 503 : 200;
+    return c.json(result, httpStatus);
   });
 
   app.get('/metrics', (c) => {
