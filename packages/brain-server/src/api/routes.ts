@@ -3,7 +3,7 @@
  *
  * GET  /health                    — liveness check (fast, no DB query)
  * GET  /health/full               — comprehensive health: DB connectivity, NATS, engine status
- * GET  /metrics                   — Prometheus text format (Accept: text/plain or ?format=prometheus) or JSON; includes TimeoutOverflow + safeTimeout clamp counters
+ * GET  /metrics                   — Prometheus text format (Accept: text/plain or ?format=prometheus) or JSON; includes uptime, jobs, NATS/DB health, lane-rotation stats, HTTP request latency histograms
  * GET  /health/scheduler          — scheduler health: overflow warnings + safeTimeout clamp stats + engine status
  * GET  /api/health/timeout-overflow        — TimeoutOverflowWarning event count + log
  * POST /api/health/timeout-overflow/reset  — reset counter
@@ -48,7 +48,7 @@ import { invokeAdapter, listWorkspaces, getWorkspace, cleanupWorkspace, ensureWo
 import { assembleContext } from '../executor/context/index.js';
 import type { JobType } from '../jobs/types.js';
 import {
-  listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles,
+  listGoals, getGoal, createGoal, updateGoal, listGoalActions, listCycles, getLaneStats,
 } from '../goals/registry.js';
 import { isCycleActive, isEnginePaused, pauseGoalEngine, resumeGoalEngine, isEngineRunning } from '../goals/engine.js';
 import type { GoalLevel, GoalStatus, GoalLane } from '../goals/types.js';
@@ -71,7 +71,8 @@ import { runBackfill } from '../memory/backfill.js';
 import { getIngestionHistory, countIngestedSessions } from '../memory/ingestion-log.js';
 import { getTimeoutOverflowStats, resetTimeoutOverflowCount } from '../layers/timeout-overflow-monitor.js';
 import { getClampStats, resetClampStats } from '../safe-timeout.js';
-import { fullHealthCheck } from './health.js';
+import { checkDatabaseHealth, fullHealthCheck } from './health.js';
+import { recordRequest, renderRequestMetricsPrometheus, getRequestMetrics } from './request-metrics.js';
 
 const sc = StringCodec();
 
@@ -83,6 +84,17 @@ const GATEWAY_PREFIX = '/apps/brain';
 const startTime = Date.now();
 
 function registerRoutes(app: Hono, deps: ServerDeps): void {
+  // Request timing middleware — records every completed request for Prometheus /metrics
+  app.use('*', async (c, next) => {
+    const start = Date.now();
+    await next();
+    // Skip metrics endpoint itself to avoid self-referential noise
+    const path = new URL(c.req.url).pathname;
+    if (path !== '/metrics' && path !== '/apps/brain/metrics') {
+      recordRequest(c.req.method, path, Date.now() - start);
+    }
+  });
+
   app.get('/health', (c) => {
     return c.json({
       status: 'ok',
@@ -101,7 +113,7 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     return c.json(result, httpStatus);
   });
 
-  app.get('/metrics', (c) => {
+  app.get('/metrics', async (c) => {
     const accept = c.req.header('accept') ?? '';
     const format = c.req.query('format');
     const wantsPrometheus =
@@ -113,8 +125,16 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
     const uptimeSec = (Date.now() - startTime) / 1000;
     const overflowStats = getTimeoutOverflowStats();
     const clampStats = getClampStats();
+    const natsConnected = deps.nats !== null;
+
+    // Fetch DB health and lane stats in parallel; degrade gracefully on error
+    const [dbHealth, laneStats] = await Promise.all([
+      checkDatabaseHealth().catch(() => ({ status: 'error' as const, latencyMs: -1 })),
+      getLaneStats().catch(() => null),
+    ]);
 
     if (wantsPrometheus) {
+      const nowMs = Date.now();
       const lines: string[] = [
         '# HELP brain_uptime_seconds Brain server uptime in seconds',
         '# TYPE brain_uptime_seconds gauge',
@@ -123,6 +143,18 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         '# HELP brain_running_jobs Current number of running agent jobs',
         '# TYPE brain_running_jobs gauge',
         `brain_running_jobs ${runningJobs}`,
+        '',
+        '# HELP brain_nats_connected Whether NATS is connected (1=connected, 0=disconnected)',
+        '# TYPE brain_nats_connected gauge',
+        `brain_nats_connected ${natsConnected ? 1 : 0}`,
+        '',
+        '# HELP brain_db_connected Whether the database is reachable (1=ok, 0=error)',
+        '# TYPE brain_db_connected gauge',
+        `brain_db_connected ${dbHealth.status === 'ok' ? 1 : 0}`,
+        '',
+        '# HELP brain_db_latency_ms Last database health-check round-trip latency in milliseconds',
+        '# TYPE brain_db_latency_ms gauge',
+        `brain_db_latency_ms ${dbHealth.latencyMs}`,
         '',
         '# HELP brain_timeout_overflow_total Total TimeoutOverflowWarning/TimeoutNaNWarning events since last reset',
         '# TYPE brain_timeout_overflow_total counter',
@@ -141,15 +173,66 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         `brain_timeout_overflow_window_count ${overflowStats.windowCount}`,
         '',
       ];
+
+      // Lane rotation metrics (skip if DB unavailable)
+      if (laneStats) {
+        lines.push(
+          '# HELP brain_lane_actions_total Total completed (done+failed) goal actions per lane',
+          '# TYPE brain_lane_actions_total counter',
+        );
+        for (const lane of ['system', 'self', 'craft'] as const) {
+          lines.push(`brain_lane_actions_total{lane="${lane}"} ${laneStats.actionCounts[lane]}`);
+        }
+        lines.push('');
+
+        lines.push(
+          '# HELP brain_lane_cycles_total Total completed goal cycles per lane',
+          '# TYPE brain_lane_cycles_total counter',
+        );
+        for (const lane of ['system', 'self', 'craft'] as const) {
+          lines.push(`brain_lane_cycles_total{lane="${lane}"} ${laneStats.cycleCounts[lane]}`);
+        }
+        lines.push('');
+
+        lines.push(
+          '# HELP brain_lane_active_goals Number of active goals per lane',
+          '# TYPE brain_lane_active_goals gauge',
+        );
+        for (const lane of ['system', 'self', 'craft'] as const) {
+          lines.push(`brain_lane_active_goals{lane="${lane}"} ${laneStats.activeGoalCounts[lane]}`);
+        }
+        lines.push('');
+
+        lines.push(
+          '# HELP brain_lane_idle_seconds Seconds since last completed action in this lane (0 if never used)',
+          '# TYPE brain_lane_idle_seconds gauge',
+        );
+        for (const lane of ['system', 'self', 'craft'] as const) {
+          const lastAt = laneStats.lastActivity[lane];
+          const idleSec = lastAt ? (nowMs - lastAt.getTime()) / 1000 : 0;
+          lines.push(`brain_lane_idle_seconds{lane="${lane}"} ${idleSec.toFixed(1)}`);
+        }
+        lines.push('');
+      }
+
+      // HTTP request metrics
+      const reqMetrics = renderRequestMetricsPrometheus();
+      if (reqMetrics) {
+        lines.push(reqMetrics, '');
+      }
+
       return new Response(lines.join('\n'), {
         headers: { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' },
       });
     }
 
+    // JSON response
     return c.json({
       runningJobs,
       runningJobIds: getRunningProcessIds(),
       uptimeMs: Date.now() - startTime,
+      nats: { connected: natsConnected },
+      database: { connected: dbHealth.status === 'ok', latencyMs: dbHealth.latencyMs },
       scheduler: {
         timeoutOverflowTotal: overflowStats.totalCount,
         timeoutOverflowWindowCount: overflowStats.windowCount,
@@ -158,6 +241,13 @@ function registerRoutes(app: Hono, deps: ServerDeps): void {
         windowThreshold: overflowStats.windowThreshold,
         lastRestartAt: overflowStats.lastRestartAt,
       },
+      lanes: laneStats ? {
+        actionCounts: laneStats.actionCounts,
+        cycleCounts: laneStats.cycleCounts,
+        activeGoalCounts: laneStats.activeGoalCounts,
+        lastActivity: laneStats.lastActivity,
+      } : null,
+      httpRequests: getRequestMetrics(),
       ts: new Date().toISOString(),
     });
   });

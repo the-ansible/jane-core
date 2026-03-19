@@ -617,6 +617,75 @@ export async function getNextLane(): Promise<GoalLane> {
 }
 
 // ---------------------------------------------------------------------------
+// Lane statistics (for Prometheus metrics)
+// ---------------------------------------------------------------------------
+
+export interface LaneStats {
+  /** Total completed (done+failed) actions per lane, all time */
+  actionCounts: Record<GoalLane, number>;
+  /** Completed goal cycles per lane (done only) */
+  cycleCounts: Record<GoalLane, number>;
+  /** Last completed action timestamp per lane */
+  lastActivity: LaneActivity;
+  /** Number of active goals per lane */
+  activeGoalCounts: Record<GoalLane, number>;
+}
+
+/**
+ * Aggregate lane statistics for the Prometheus /metrics endpoint.
+ * Single round-trip: all queries run in parallel.
+ */
+export async function getLaneStats(): Promise<LaneStats> {
+  const pool = getPool();
+
+  const [actionRows, cycleRows, activeRows, activity] = await Promise.all([
+    pool.query<{ lane: string; cnt: string }>(
+      `SELECT g.lane, COUNT(*) AS cnt
+       FROM ${SCHEMA}.goal_actions ga
+       JOIN ${SCHEMA}.goals g ON g.id = ga.goal_id
+       WHERE ga.status IN ('done', 'failed') AND g.lane IS NOT NULL
+       GROUP BY g.lane`
+    ),
+    pool.query<{ lane: string; cnt: string }>(
+      `SELECT lane, COUNT(*) AS cnt
+       FROM ${SCHEMA}.goal_cycles
+       WHERE status = 'done' AND lane IS NOT NULL
+       GROUP BY lane`
+    ),
+    pool.query<{ lane: string; cnt: string }>(
+      `SELECT lane, COUNT(*) AS cnt
+       FROM ${SCHEMA}.goals
+       WHERE status = 'active' AND lane IS NOT NULL
+       GROUP BY lane`
+    ),
+    listRecentLaneActivity(),
+  ]);
+
+  const zero = () => ({ system: 0, self: 0, craft: 0 } as Record<GoalLane, number>);
+  const actionCounts = zero();
+  const cycleCounts = zero();
+  const activeGoalCounts = zero();
+
+  for (const row of actionRows.rows) {
+    if (row.lane === 'system' || row.lane === 'self' || row.lane === 'craft') {
+      actionCounts[row.lane] = parseInt(row.cnt, 10);
+    }
+  }
+  for (const row of cycleRows.rows) {
+    if (row.lane === 'system' || row.lane === 'self' || row.lane === 'craft') {
+      cycleCounts[row.lane] = parseInt(row.cnt, 10);
+    }
+  }
+  for (const row of activeRows.rows) {
+    if (row.lane === 'system' || row.lane === 'self' || row.lane === 'craft') {
+      activeGoalCounts[row.lane] = parseInt(row.cnt, 10);
+    }
+  }
+
+  return { actionCounts, cycleCounts, lastActivity: activity, activeGoalCounts };
+}
+
+// ---------------------------------------------------------------------------
 // Goal Cycles
 // ---------------------------------------------------------------------------
 
